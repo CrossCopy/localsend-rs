@@ -1,3 +1,5 @@
+#[cfg(feature = "tui")]
+use crate::cli::commands::TuiCommand;
 use crate::cli::commands::{DiscoverCommand, ReceiveCommand, SendCommand};
 use clap::{Parser, Subcommand};
 
@@ -13,4 +15,6 @@ pub enum Commands {
     Discover(DiscoverCommand),
     Receive(ReceiveCommand),
     Send(SendCommand),
+    #[cfg(feature = "tui")]
+    Tui(TuiCommand),
 }

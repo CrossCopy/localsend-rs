@@ -7,6 +7,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     use clap::Parser;
+    #[cfg(feature = "tui")]
+    use localsend_rs::cli::run_tui;
     use localsend_rs::cli::{Cli, Commands};
     use localsend_rs::cli::{run_discover, run_receive, run_send};
 
@@ -21,6 +23,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Send(cmd) => {
             run_send(cmd).await?;
+        }
+        #[cfg(feature = "tui")]
+        Commands::Tui(cmd) => {
+            run_tui(cmd).await?;
         }
     }
 

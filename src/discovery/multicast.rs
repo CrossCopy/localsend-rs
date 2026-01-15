@@ -229,15 +229,16 @@ impl MulticastDiscovery {
         local_device: &DeviceInfo,
         socket: &UdpSocket,
     ) {
-        println!(
+        tracing::debug!(
             "Responding to announcement from {} ({:?})",
-            target_device.alias, target_device.ip
+            target_device.alias,
+            target_device.ip
         );
 
         // Try HTTP registration first
         match client.register(target_device).await {
             Ok(_) => {
-                println!(
+                tracing::debug!(
                     "Successfully registered with {} via HTTP",
                     target_device.alias
                 );
@@ -247,7 +248,7 @@ impl MulticastDiscovery {
                 // If HTTP failed, we just fall back to UDP. This is common if the other device
                 // has a strict firewall or if we couldn't parse their response.
                 // It's not a critical error.
-                println!("HTTP registration failed ({}), falling back to UDP...", e);
+                tracing::debug!("HTTP registration failed ({}), falling back to UDP...", e);
             }
         }
 
@@ -271,9 +272,9 @@ impl MulticastDiscovery {
                 format!("{}:{}", DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT);
             if let Ok(multicast_addr) = multicast_addr_str.parse::<SocketAddr>() {
                 if let Err(e) = socket.send_to(buf, &multicast_addr).await {
-                    println!("Failed to send UDP fallback response: {}", e);
+                    tracing::debug!("Failed to send UDP fallback response: {}", e);
                 } else {
-                    println!("Sent UDP fallback response to multicast group");
+                    tracing::debug!("Sent UDP fallback response to multicast group");
                 }
             }
         }
