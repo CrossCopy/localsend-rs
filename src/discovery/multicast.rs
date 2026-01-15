@@ -8,14 +8,15 @@ use crate::protocol::{
     PROTOCOL_VERSION,
 };
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 
 pub type Result<T> = std::result::Result<T, LocalSendError>;
 
+#[derive(Clone)]
 pub struct MulticastDiscovery {
     local_device: DeviceInfo,
     client: Option<LocalSendClient>,
@@ -223,6 +224,36 @@ impl Discovery for MulticastDiscovery {
 }
 
 impl MulticastDiscovery {
+    pub async fn scan(
+        &mut self,
+        duration: Duration,
+        devices: Arc<RwLock<Vec<DeviceInfo>>>,
+    ) -> Result<()> {
+        if !self.running.load(Ordering::Relaxed) {
+            self.start().await?;
+        }
+
+        // Register a callback to update the devices list during the scan
+        let devices_clone = devices.clone();
+        self.on_discovered(move |device| {
+            let mut guard = devices_clone.write().unwrap();
+            if !guard.iter().any(|d| d.fingerprint == device.fingerprint) {
+                guard.push(device);
+            }
+        });
+
+        // Clear devices
+        devices.write().unwrap().clear();
+
+        // Announce
+        self.announce_presence().await?;
+
+        // Wait for responses
+        tokio::time::sleep(duration).await;
+
+        Ok(())
+    }
+
     async fn respond_to_announcement(
         client: &LocalSendClient,
         target_device: &DeviceInfo,

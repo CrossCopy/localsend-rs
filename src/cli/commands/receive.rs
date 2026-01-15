@@ -101,8 +101,15 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
     println!("Announcing presence to network...");
     discovery.announce_presence().await?;
 
-    let mut server =
-        crate::LocalSendServer::new_with_device(device, command.directory, https_enabled)?;
+    let pending_transfer = std::sync::Arc::new(std::sync::RwLock::new(None));
+    let received_files = std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
+    let mut server = crate::server::LocalSendServer::new_with_device(
+        device,
+        command.directory,
+        https_enabled,
+        pending_transfer,
+        received_files,
+    )?;
 
     #[cfg(feature = "https")]
     if let Some(cert) = tls_cert {

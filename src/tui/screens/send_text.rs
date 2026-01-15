@@ -1,4 +1,4 @@
-//! Send text screen.
+//! Send text screen with device selection.
 
 use crate::protocol::DeviceInfo;
 use crate::tui::theme::THEME;
@@ -6,46 +6,187 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Row, Table, TableState, Widget},
 };
+use std::sync::{Arc, RwLock};
 use tui_input::Input;
+
+/// Stage in send text flow
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendTextStage {
+    SelectDevice,
+    EnterMessage,
+}
 
 /// Send text screen state.
 pub struct SendTextScreen {
-    pub target: Option<DeviceInfo>,
+    pub stage: SendTextStage,
+    pub devices: Arc<RwLock<Vec<DeviceInfo>>>,
+    pub table_state: TableState,
+    pub selected_device: Option<DeviceInfo>,
     pub input: Input,
     pub is_sending: bool,
-}
-
-impl Default for SendTextScreen {
-    fn default() -> Self {
-        Self {
-            target: None,
-            input: Input::default(),
-            is_sending: false,
-        }
-    }
+    pub needs_refresh: bool,
 }
 
 impl SendTextScreen {
-    pub fn set_target(&mut self, device: Option<DeviceInfo>) {
-        self.target = device;
+    pub fn new(devices: Arc<RwLock<Vec<DeviceInfo>>>) -> Self {
+        Self {
+            stage: SendTextStage::SelectDevice,
+            devices,
+            table_state: TableState::default(),
+            selected_device: None,
+            input: Input::default(),
+            is_sending: false,
+            needs_refresh: false,
+        }
     }
 
     pub fn clear(&mut self) {
+        self.stage = SendTextStage::SelectDevice;
+        self.selected_device = None;
         self.input.reset();
         self.is_sending = false;
+        self.table_state = TableState::default();
     }
 
     pub fn message(&self) -> &str {
         self.input.value()
     }
-}
 
-impl Widget for &SendTextScreen {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+    pub fn next_device(&mut self) {
+        let devices = self.devices.read().unwrap();
+        if devices.is_empty() {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => (i + 1) % devices.len(),
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    pub fn previous_device(&mut self) {
+        let devices = self.devices.read().unwrap();
+        if devices.is_empty() {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    devices.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    pub fn select_current_device(&mut self) {
+        let devices = self.devices.read().unwrap();
+        if let Some(i) = self.table_state.selected() {
+            if let Some(device) = devices.get(i) {
+                self.selected_device = Some(device.clone());
+                self.stage = SendTextStage::EnterMessage;
+            }
+        }
+    }
+
+    pub fn request_refresh(&mut self) {
+        self.needs_refresh = true;
+    }
+
+    pub fn consume_refresh(&mut self) -> bool {
+        let result = self.needs_refresh;
+        self.needs_refresh = false;
+        result
+    }
+
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        match self.stage {
+            SendTextStage::SelectDevice => self.render_device_selection(area, buf),
+            SendTextStage::EnterMessage => self.render_message_input(area, buf),
+        }
+    }
+
+    fn render_device_selection(&mut self, area: Rect, buf: &mut Buffer) {
+        let devices = self.devices.read().unwrap();
+
         let block = Block::default()
-            .title(" 📝 Send Text Message ")
+            .title(" 📝 Send Text - Select Device ")
+            .title_style(THEME.title)
+            .borders(Borders::ALL);
+
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let layout = Layout::vertical([
+            Constraint::Min(0),    // Device table
+            Constraint::Length(2), // Help text
+        ])
+        .split(inner);
+
+        if devices.is_empty() {
+            let msg = Paragraph::new("No devices found. Press R to refresh.")
+                .style(THEME.status_info)
+                .centered();
+            msg.render(layout[0], buf);
+        } else {
+            // Ensure selection
+            if self.table_state.selected().is_none() && !devices.is_empty() {
+                self.table_state.select(Some(0));
+            }
+
+            let rows: Vec<Row> = devices
+                .iter()
+                .map(|d| {
+                    Row::new(vec![
+                        d.alias.clone(),
+                        d.ip.clone().unwrap_or_else(|| "Unknown".into()),
+                        d.port.to_string(),
+                        d.device_model.clone().unwrap_or_default(),
+                    ])
+                })
+                .collect();
+
+            let widths = [
+                Constraint::Percentage(30),
+                Constraint::Percentage(25),
+                Constraint::Percentage(15),
+                Constraint::Percentage(30),
+            ];
+
+            let table = Table::new(rows, widths)
+                .header(
+                    Row::new(vec!["Name", "IP", "Port", "Model"])
+                        .style(THEME.title)
+                        .bottom_margin(1),
+                )
+                .highlight_style(THEME.selected)
+                .highlight_symbol("▶ ");
+
+            ratatui::widgets::StatefulWidget::render(table, layout[0], buf, &mut self.table_state);
+        }
+
+        // Help text
+        let help = Line::from(vec![
+            Span::styled(" ↑/k ", THEME.key),
+            Span::styled(" Up ", THEME.key_desc),
+            Span::styled(" ↓/j ", THEME.key),
+            Span::styled(" Down ", THEME.key_desc),
+            Span::styled(" Enter ", THEME.key),
+            Span::styled(" Select ", THEME.key_desc),
+            Span::styled(" R ", THEME.key),
+            Span::styled(" Refresh ", THEME.key_desc),
+        ]);
+        Paragraph::new(help).centered().render(layout[1], buf);
+    }
+
+    fn render_message_input(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default()
+            .title(" 📝 Send Text - Enter Message ")
             .title_style(THEME.title)
             .borders(Borders::ALL);
 
@@ -61,7 +202,7 @@ impl Widget for &SendTextScreen {
         .split(inner);
 
         // Target info
-        let target_text = if let Some(ref device) = self.target {
+        let target_text = if let Some(ref device) = self.selected_device {
             Line::from(vec![
                 Span::raw("Target: "),
                 Span::styled(&device.alias, THEME.device_alias),
@@ -70,10 +211,7 @@ impl Widget for &SendTextScreen {
                 Span::raw(")"),
             ])
         } else {
-            Line::styled(
-                "No device selected! Go to Devices first.",
-                THEME.status_error,
-            )
+            Line::styled("No device selected", THEME.status_error)
         };
         Paragraph::new(target_text).render(layout[0], buf);
 
@@ -90,19 +228,12 @@ impl Widget for &SendTextScreen {
         Paragraph::new(input_text).render(input_inner, buf);
 
         // Help text
-        let help = if self.target.is_some() {
-            Line::from(vec![
-                Span::styled(" Enter ", THEME.key),
-                Span::styled(" Send ", THEME.key_desc),
-                Span::styled(" Esc ", THEME.key),
-                Span::styled(" Back ", THEME.key_desc),
-            ])
-        } else {
-            Line::from(vec![
-                Span::styled(" Esc ", THEME.key),
-                Span::styled(" Back ", THEME.key_desc),
-            ])
-        };
+        let help = Line::from(vec![
+            Span::styled(" Enter ", THEME.key),
+            Span::styled(" Send ", THEME.key_desc),
+            Span::styled(" Esc ", THEME.key),
+            Span::styled(" Back ", THEME.key_desc),
+        ]);
         Paragraph::new(help).centered().render(layout[3], buf);
     }
 }

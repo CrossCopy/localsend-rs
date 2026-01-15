@@ -1,3 +1,3 @@
 pub mod server;
 
-pub use server::LocalSendServer;
+pub use server::{LocalSendServer, PendingTransfer};

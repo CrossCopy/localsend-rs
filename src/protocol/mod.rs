@@ -6,5 +6,5 @@ pub use constants::{
 };
 pub use types::{
     AnnouncementMessage, DeviceInfo, DeviceType, FileMetadata, PrepareUploadRequest,
-    PrepareUploadResponse, RegisterMessage,
+    PrepareUploadResponse, ReceivedFile, RegisterMessage,
 };

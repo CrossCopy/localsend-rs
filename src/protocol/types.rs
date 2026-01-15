@@ -66,6 +66,14 @@ pub struct PrepareUploadResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReceivedFile {
+    pub file_name: String,
+    pub size: u64,
+    pub sender: String,
+    pub time: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnnouncementMessage {
     pub alias: String,
     pub version: String,

@@ -1,4 +1,4 @@
-//! Send file screen.
+//! Send file screen with device selection.
 
 use crate::protocol::DeviceInfo;
 use crate::tui::theme::THEME;
@@ -6,41 +6,54 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Widget},
+    widgets::{Block, Borders, Gauge, Paragraph, Row, Table, TableState, Widget},
 };
+use std::sync::{Arc, RwLock};
 use tui_input::Input;
+
+/// Stage in send file flow
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFileStage {
+    SelectDevice,
+    EnterFilePath,
+}
 
 /// Send file screen state.
 pub struct SendFileScreen {
-    pub target: Option<DeviceInfo>,
+    pub stage: SendFileStage,
+    pub devices: Arc<RwLock<Vec<DeviceInfo>>>,
+    pub table_state: TableState,
+    pub selected_device: Option<DeviceInfo>,
     pub input: Input,
     pub is_sending: bool,
     pub progress: f64,
     pub current_file: Option<String>,
+    pub needs_refresh: bool,
 }
 
-impl Default for SendFileScreen {
-    fn default() -> Self {
+impl SendFileScreen {
+    pub fn new(devices: Arc<RwLock<Vec<DeviceInfo>>>) -> Self {
         Self {
-            target: None,
+            stage: SendFileStage::SelectDevice,
+            devices,
+            table_state: TableState::default(),
+            selected_device: None,
             input: Input::default(),
             is_sending: false,
             progress: 0.0,
             current_file: None,
+            needs_refresh: false,
         }
-    }
-}
-
-impl SendFileScreen {
-    pub fn set_target(&mut self, device: Option<DeviceInfo>) {
-        self.target = device;
     }
 
     pub fn clear(&mut self) {
+        self.stage = SendFileStage::SelectDevice;
+        self.selected_device = None;
         self.input.reset();
         self.is_sending = false;
         self.progress = 0.0;
         self.current_file = None;
+        self.table_state = TableState::default();
     }
 
     pub fn file_path(&self) -> &str {
@@ -51,12 +64,140 @@ impl SendFileScreen {
         self.current_file = Some(file.to_string());
         self.progress = progress;
     }
-}
 
-impl Widget for &SendFileScreen {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+    pub fn next_device(&mut self) {
+        let devices = self.devices.read().unwrap();
+        if devices.is_empty() {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => (i + 1) % devices.len(),
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    pub fn previous_device(&mut self) {
+        let devices = self.devices.read().unwrap();
+        if devices.is_empty() {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    devices.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    pub fn select_current_device(&mut self) {
+        let devices = self.devices.read().unwrap();
+        if let Some(i) = self.table_state.selected() {
+            if let Some(device) = devices.get(i) {
+                self.selected_device = Some(device.clone());
+                self.stage = SendFileStage::EnterFilePath;
+            }
+        }
+    }
+
+    pub fn request_refresh(&mut self) {
+        self.needs_refresh = true;
+    }
+
+    pub fn consume_refresh(&mut self) -> bool {
+        let result = self.needs_refresh;
+        self.needs_refresh = false;
+        result
+    }
+
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        match self.stage {
+            SendFileStage::SelectDevice => self.render_device_selection(area, buf),
+            SendFileStage::EnterFilePath => self.render_file_input(area, buf),
+        }
+    }
+
+    fn render_device_selection(&mut self, area: Rect, buf: &mut Buffer) {
+        let devices = self.devices.read().unwrap();
+
         let block = Block::default()
-            .title(" 📁 Send File ")
+            .title(" 📁 Send File - Select Device ")
+            .title_style(THEME.title)
+            .borders(Borders::ALL);
+
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let layout = Layout::vertical([
+            Constraint::Min(0),    // Device table
+            Constraint::Length(2), // Help text
+        ])
+        .split(inner);
+
+        if devices.is_empty() {
+            let msg = Paragraph::new("No devices found. Press R to refresh.")
+                .style(THEME.status_info)
+                .centered();
+            msg.render(layout[0], buf);
+        } else {
+            // Ensure selection
+            if self.table_state.selected().is_none() && !devices.is_empty() {
+                self.table_state.select(Some(0));
+            }
+
+            let rows: Vec<Row> = devices
+                .iter()
+                .map(|d| {
+                    Row::new(vec![
+                        d.alias.clone(),
+                        d.ip.clone().unwrap_or_else(|| "Unknown".into()),
+                        d.port.to_string(),
+                        d.device_model.clone().unwrap_or_default(),
+                    ])
+                })
+                .collect();
+
+            let widths = [
+                Constraint::Percentage(30),
+                Constraint::Percentage(25),
+                Constraint::Percentage(15),
+                Constraint::Percentage(30),
+            ];
+
+            let table = Table::new(rows, widths)
+                .header(
+                    Row::new(vec!["Name", "IP", "Port", "Model"])
+                        .style(THEME.title)
+                        .bottom_margin(1),
+                )
+                .highlight_style(THEME.selected)
+                .highlight_symbol("▶ ");
+
+            ratatui::widgets::StatefulWidget::render(table, layout[0], buf, &mut self.table_state);
+        }
+
+        // Help text
+        let help = Line::from(vec![
+            Span::styled(" ↑/k ", THEME.key),
+            Span::styled(" Up ", THEME.key_desc),
+            Span::styled(" ↓/j ", THEME.key),
+            Span::styled(" Down ", THEME.key_desc),
+            Span::styled(" Enter ", THEME.key),
+            Span::styled(" Select ", THEME.key_desc),
+            Span::styled(" R ", THEME.key),
+            Span::styled(" Refresh ", THEME.key_desc),
+        ]);
+        Paragraph::new(help).centered().render(layout[1], buf);
+    }
+
+    fn render_file_input(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default()
+            .title(" 📁 Send File - Enter File Path ")
             .title_style(THEME.title)
             .borders(Borders::ALL);
 
@@ -72,7 +213,7 @@ impl Widget for &SendFileScreen {
         .split(inner);
 
         // Target info
-        let target_text = if let Some(ref device) = self.target {
+        let target_text = if let Some(ref device) = self.selected_device {
             Line::from(vec![
                 Span::raw("Target: "),
                 Span::styled(&device.alias, THEME.device_alias),
@@ -81,10 +222,7 @@ impl Widget for &SendFileScreen {
                 Span::raw(")"),
             ])
         } else {
-            Line::styled(
-                "No device selected! Go to Devices first.",
-                THEME.status_error,
-            )
+            Line::styled("No device selected", THEME.status_error)
         };
         Paragraph::new(target_text).render(layout[0], buf);
 
@@ -109,7 +247,7 @@ impl Widget for &SendFileScreen {
         }
 
         // Help text
-        let help = if self.target.is_some() && !self.is_sending {
+        let help = if self.selected_device.is_some() && !self.is_sending {
             Line::from(vec![
                 Span::styled(" Enter ", THEME.key),
                 Span::styled(" Send ", THEME.key_desc),

@@ -9,14 +9,7 @@ use ratatui::{
 };
 use std::sync::{Arc, RwLock};
 
-/// Information about a received file.
-#[derive(Clone, Debug)]
-pub struct ReceivedFile {
-    pub file_name: String,
-    pub size: u64,
-    pub sender: String,
-    pub time: String,
-}
+use crate::protocol::ReceivedFile;
 
 /// Receive screen state.
 pub struct ReceiveScreen {

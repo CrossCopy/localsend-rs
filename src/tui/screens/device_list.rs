@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 pub struct DeviceListScreen {
     pub devices: Arc<RwLock<Vec<DeviceInfo>>>,
     pub table_state: TableState,
+    pub needs_refresh: bool,
 }
 
 impl DeviceListScreen {
@@ -21,7 +22,18 @@ impl DeviceListScreen {
         Self {
             devices,
             table_state: TableState::default(),
+            needs_refresh: false,
         }
+    }
+
+    pub fn request_refresh(&mut self) {
+        self.needs_refresh = true;
+    }
+
+    pub fn consume_refresh(&mut self) -> bool {
+        let result = self.needs_refresh;
+        self.needs_refresh = false;
+        result
     }
 
     pub fn next(&mut self) {
@@ -129,8 +141,8 @@ impl DeviceListScreen {
             Span::styled(" Down ", THEME.key_desc),
             Span::styled(" Enter ", THEME.key),
             Span::styled(" Select ", THEME.key_desc),
-            Span::styled(" Esc ", THEME.key),
-            Span::styled(" Back ", THEME.key_desc),
+            Span::styled(" R ", THEME.key),
+            Span::styled(" Refresh ", THEME.key_desc),
         ]);
         Paragraph::new(help).centered().render(layout[1], buf);
     }

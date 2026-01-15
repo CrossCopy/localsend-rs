@@ -3,14 +3,14 @@
 use crate::client::LocalSendClient;
 use crate::crypto::generate_fingerprint;
 use crate::discovery::{Discovery, MulticastDiscovery};
-use crate::protocol::{DeviceInfo, DeviceType, FileMetadata, PROTOCOL_VERSION};
+use crate::protocol::{DeviceInfo, DeviceType, PROTOCOL_VERSION, ReceivedFile};
 use crate::server::LocalSendServer;
+use crate::server::PendingTransfer;
 
 use super::popup::{MessageLevel, Popup};
-use super::screens::receive::ReceivedFile;
 use super::screens::{
-    Screen, device_list::DeviceListScreen, main_menu::MainMenuScreen, receive::ReceiveScreen,
-    send_file::SendFileScreen, send_text::SendTextScreen, settings::SettingsScreen,
+    Screen, receive::ReceiveScreen, send_file::SendFileScreen, send_text::SendTextScreen,
+    settings::SettingsScreen,
 };
 use super::theme::THEME;
 
@@ -19,23 +19,16 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Layout, Rect},
+    symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Tabs, Widget},
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use strum::IntoEnumIterator;
+use tokio::time::Duration;
 use tui_input::backend::crossterm::EventHandler;
-
-/// Pending incoming transfer request.
-pub struct PendingTransfer {
-    pub sender: DeviceInfo,
-    pub files: HashMap<String, FileMetadata>,
-    pub response_tx: oneshot::Sender<bool>,
-}
 
 /// Main TUI application state.
 pub struct App {
@@ -58,22 +51,17 @@ pub struct App {
     popup: Option<Popup>,
 
     // Screen states
-    main_menu: MainMenuScreen,
-    device_list: DeviceListScreen,
     send_text: SendTextScreen,
     send_file: SendFileScreen,
     receive: ReceiveScreen,
     settings: SettingsScreen,
 
-    // Selected device for sending
-    selected_device: Option<DeviceInfo>,
-
     // Status message
     status_message: Option<(String, MessageLevel)>,
 
-    // Background task handles
-    _discovery_handle: Option<JoinHandle<()>>,
-    _server_handle: Option<JoinHandle<()>>,
+    // Background services
+    discovery: Option<MulticastDiscovery>,
+    server: Option<LocalSendServer>,
 }
 
 impl App {
@@ -102,7 +90,7 @@ impl App {
 
         Ok(Self {
             should_quit: false,
-            screen: Screen::MainMenu,
+            screen: Screen::SendText,
             device_info: device_info.clone(),
             port,
             https,
@@ -111,16 +99,14 @@ impl App {
             received_files: received_files.clone(),
             pending_transfer,
             popup: None,
-            main_menu: MainMenuScreen::default(),
-            device_list: DeviceListScreen::new(devices.clone()),
-            send_text: SendTextScreen::default(),
-            send_file: SendFileScreen::default(),
+
+            send_text: SendTextScreen::new(devices.clone()),
+            send_file: SendFileScreen::new(devices.clone()),
             receive: ReceiveScreen::new(received_files.clone(), port),
             settings: SettingsScreen::new(device_info, save_dir.to_string_lossy().into_owned()),
-            selected_device: None,
             status_message: None,
-            _discovery_handle: None,
-            _server_handle: None,
+            discovery: None,
+            server: None,
         })
     }
 
@@ -178,6 +164,8 @@ impl App {
         discovery.start().await?;
         discovery.announce_presence().await?;
 
+        self.discovery = Some(discovery);
+
         Ok(())
     }
 
@@ -192,6 +180,8 @@ impl App {
             self.device_info.clone(),
             self.save_dir.clone(),
             self.https,
+            self.pending_transfer.clone(),
+            self.received_files.clone(),
         )?;
 
         #[cfg(feature = "https")]
@@ -201,6 +191,8 @@ impl App {
         }
 
         server.start(None).await?;
+
+        self.server = Some(server);
 
         Ok(())
     }
@@ -229,19 +221,99 @@ impl App {
             return;
         }
 
+        // Global keys
+        match key {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                return;
+            }
+            KeyCode::Esc => {
+                let handles_esc = match self.screen {
+                    Screen::SendText => {
+                        self.send_text.stage
+                            == crate::tui::screens::send_text::SendTextStage::EnterMessage
+                    }
+                    Screen::SendFile => {
+                        self.send_file.stage
+                            == crate::tui::screens::send_file::SendFileStage::EnterFilePath
+                    }
+                    _ => false,
+                };
+
+                if !handles_esc {
+                    self.status_message = Some(("Press q to quit".into(), MessageLevel::Info));
+                }
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                // Only allow switching tabs if not in input mode
+                let can_switch = match self.screen {
+                    Screen::SendText => {
+                        self.send_text.stage
+                            == crate::tui::screens::send_text::SendTextStage::SelectDevice
+                    }
+                    Screen::SendFile => {
+                        self.send_file.stage
+                            == crate::tui::screens::send_file::SendFileStage::SelectDevice
+                    }
+                    _ => true,
+                };
+
+                if can_switch {
+                    let screens: Vec<_> = Screen::iter().collect();
+                    let current_index = screens.iter().position(|&s| s == self.screen).unwrap_or(0);
+                    self.screen = screens[(current_index + 1) % screens.len()];
+                    return;
+                }
+            }
+            KeyCode::Left => {
+                let can_switch = match self.screen {
+                    Screen::SendText => {
+                        self.send_text.stage
+                            == crate::tui::screens::send_text::SendTextStage::SelectDevice
+                    }
+                    Screen::SendFile => {
+                        self.send_file.stage
+                            == crate::tui::screens::send_file::SendFileStage::SelectDevice
+                    }
+                    _ => true,
+                };
+
+                if can_switch {
+                    let screens: Vec<_> = Screen::iter().collect();
+                    let current_index = screens.iter().position(|&s| s == self.screen).unwrap_or(0);
+                    self.screen = screens[(current_index + screens.len() - 1) % screens.len()];
+                    return;
+                }
+            }
+            _ => {}
+        }
+
         match self.screen {
-            Screen::MainMenu => self.handle_main_menu_key(key),
-            Screen::DeviceList => self.handle_device_list_key(key),
             Screen::SendText => self.handle_send_text_key(key),
             Screen::SendFile => self.handle_send_file_key(key),
             Screen::Receive => self.handle_receive_key(key),
             Screen::Settings => self.handle_settings_key(key),
         }
+
+        // Check for refresh requests
+        let mut refresh = self.send_text.consume_refresh();
+        refresh |= self.send_file.consume_refresh();
+
+        if refresh {
+            self.devices.write().unwrap().clear();
+            if let Some(ref discovery) = self.discovery {
+                let discovery = discovery.clone();
+                tokio::spawn(async move {
+                    let _ = discovery.announce_presence().await;
+                });
+            }
+            self.status_message = Some(("Refreshing devices...".into(), MessageLevel::Info));
+        }
     }
 
     fn handle_popup_key(&mut self, key: KeyCode) {
         match &mut self.popup {
-            Some(Popup::TransferConfirm { response_tx, .. }) => {
+            Some(Popup::TransferConfirm { .. }) => {
                 match key {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                         // Accept - we need to take ownership of the sender
@@ -272,136 +344,104 @@ impl App {
         }
     }
 
-    fn handle_main_menu_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Up | KeyCode::Char('k') => self.main_menu.previous(),
-            KeyCode::Down | KeyCode::Char('j') => self.main_menu.next(),
-            KeyCode::Enter => match self.main_menu.selected_index {
-                0 => self.screen = Screen::DeviceList,
-                1 => {
-                    self.send_text.set_target(self.selected_device.clone());
-                    self.screen = Screen::SendText;
-                }
-                2 => {
-                    self.send_file.set_target(self.selected_device.clone());
-                    self.screen = Screen::SendFile;
-                }
-                3 => self.screen = Screen::Receive,
-                4 => self.screen = Screen::Settings,
-                5 => self.should_quit = true,
+    fn handle_send_text_key(&mut self, key: KeyCode) {
+        use crate::tui::screens::send_text::SendTextStage;
+
+        match self.send_text.stage {
+            SendTextStage::SelectDevice => match key {
+                KeyCode::Up | KeyCode::Char('k') => self.send_text.previous_device(),
+                KeyCode::Down | KeyCode::Char('j') => self.send_text.next_device(),
+                KeyCode::Enter => self.send_text.select_current_device(),
+                KeyCode::Char('r') | KeyCode::Char('R') => self.send_text.request_refresh(),
                 _ => {}
             },
-            _ => {}
-        }
-    }
+            SendTextStage::EnterMessage => match key {
+                KeyCode::Esc => self.send_text.stage = SendTextStage::SelectDevice,
+                KeyCode::Enter => {
+                    if let Some(target) = &self.send_text.selected_device {
+                        if !self.send_text.message().is_empty() {
+                            let message = self.send_text.message().to_string();
+                            let target = target.clone();
+                            let device_info = self.device_info.clone();
 
-    fn handle_device_list_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Esc => self.screen = Screen::MainMenu,
-            KeyCode::Up | KeyCode::Char('k') => self.device_list.previous(),
-            KeyCode::Down | KeyCode::Char('j') => self.device_list.next(),
-            KeyCode::Enter => {
-                if let Some(device) = self.device_list.selected_device() {
-                    self.selected_device = Some(device);
-                    self.status_message = Some((
-                        format!("Selected: {}", self.selected_device.as_ref().unwrap().alias),
-                        MessageLevel::Success,
-                    ));
-                    self.screen = Screen::MainMenu;
+                            self.send_text.is_sending = true;
+
+                            tokio::spawn(async move {
+                                let client = LocalSendClient::new(device_info);
+                                let _ = send_text_message(&client, &target, &message).await;
+                            });
+
+                            self.send_text.clear();
+                            self.status_message =
+                                Some(("Sending message...".into(), MessageLevel::Info));
+                        }
+                    }
                 }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_send_text_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Esc => {
-                self.send_text.clear();
-                self.screen = Screen::MainMenu;
-            }
-            KeyCode::Enter => {
-                if self.selected_device.is_some() && !self.send_text.message().is_empty() {
-                    let message = self.send_text.message().to_string();
-                    let target = self.selected_device.clone().unwrap();
-                    let device_info = self.device_info.clone();
-
-                    self.send_text.is_sending = true;
-
-                    // Spawn send task
-                    tokio::spawn(async move {
-                        let client = LocalSendClient::new(device_info);
-                        let _ = send_text_message(&client, &target, &message).await;
-                    });
-
-                    self.send_text.clear();
-                    self.status_message = Some(("Sending message...".into(), MessageLevel::Info));
-                    self.screen = Screen::MainMenu;
+                _ => {
+                    self.send_text
+                        .input
+                        .handle_event(&Event::Key(event::KeyEvent::new(
+                            key,
+                            event::KeyModifiers::NONE,
+                        )));
                 }
-            }
-            _ => {
-                // Forward to input handler
-                self.send_text
-                    .input
-                    .handle_event(&Event::Key(event::KeyEvent::new(
-                        key,
-                        event::KeyModifiers::NONE,
-                    )));
-            }
+            },
         }
     }
 
     fn handle_send_file_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Esc => {
-                self.send_file.clear();
-                self.screen = Screen::MainMenu;
-            }
-            KeyCode::Enter => {
-                if self.selected_device.is_some() && !self.send_file.file_path().is_empty() {
-                    let file_path = PathBuf::from(self.send_file.file_path());
-                    if file_path.exists() {
-                        let target = self.selected_device.clone().unwrap();
-                        let device_info = self.device_info.clone();
+        use crate::tui::screens::send_file::SendFileStage;
 
-                        self.send_file.is_sending = true;
+        match self.send_file.stage {
+            SendFileStage::SelectDevice => match key {
+                KeyCode::Up | KeyCode::Char('k') => self.send_file.previous_device(),
+                KeyCode::Down | KeyCode::Char('j') => self.send_file.next_device(),
+                KeyCode::Enter => self.send_file.select_current_device(),
+                KeyCode::Char('r') | KeyCode::Char('R') => self.send_file.request_refresh(),
+                _ => {}
+            },
+            SendFileStage::EnterFilePath => match key {
+                KeyCode::Esc => self.send_file.stage = SendFileStage::SelectDevice,
+                KeyCode::Enter => {
+                    if let Some(target) = &self.send_file.selected_device {
+                        if !self.send_file.file_path().is_empty() {
+                            let file_path = PathBuf::from(self.send_file.file_path());
+                            if file_path.exists() {
+                                let target = target.clone();
+                                let device_info = self.device_info.clone();
 
-                        tokio::spawn(async move {
-                            let client = LocalSendClient::new(device_info);
-                            let _ = send_file(&client, &target, &file_path).await;
-                        });
+                                self.send_file.is_sending = true;
 
-                        self.send_file.clear();
-                        self.status_message = Some(("Sending file...".into(), MessageLevel::Info));
-                        self.screen = Screen::MainMenu;
-                    } else {
-                        self.status_message = Some(("File not found".into(), MessageLevel::Error));
+                                tokio::spawn(async move {
+                                    let client = LocalSendClient::new(device_info);
+                                    let _ = send_file(&client, &target, &file_path).await;
+                                });
+
+                                self.send_file.clear();
+                                self.status_message =
+                                    Some(("Sending file...".into(), MessageLevel::Info));
+                            } else {
+                                self.status_message =
+                                    Some(("File not found".into(), MessageLevel::Error));
+                            }
+                        }
                     }
                 }
-            }
-            _ => {
-                self.send_file
-                    .input
-                    .handle_event(&Event::Key(event::KeyEvent::new(
-                        key,
-                        event::KeyModifiers::NONE,
-                    )));
-            }
+                _ => {
+                    self.send_file
+                        .input
+                        .handle_event(&Event::Key(event::KeyEvent::new(
+                            key,
+                            event::KeyModifiers::NONE,
+                        )));
+                }
+            },
         }
     }
 
-    fn handle_receive_key(&mut self, key: KeyCode) {
-        if let KeyCode::Esc = key {
-            self.screen = Screen::MainMenu;
-        }
-    }
+    fn handle_receive_key(&mut self, _key: KeyCode) {}
 
-    fn handle_settings_key(&mut self, key: KeyCode) {
-        if let KeyCode::Esc = key {
-            self.screen = Screen::MainMenu;
-        }
-    }
+    fn handle_settings_key(&mut self, _key: KeyCode) {}
 
     /// Render the TUI.
     fn render(&mut self, frame: &mut Frame) {
@@ -409,21 +449,19 @@ impl App {
 
         // Main layout: header, content, status bar
         let layout = Layout::vertical([
-            Constraint::Length(3), // Header
+            Constraint::Length(3), // Header/Tabs
             Constraint::Min(0),    // Content
             Constraint::Length(1), // Status bar
         ])
         .split(area);
 
-        // Header
+        // Header with Tabs
         self.render_header(frame, layout[0]);
 
         // Content based on screen
         match self.screen {
-            Screen::MainMenu => frame.render_widget(&self.main_menu, layout[1]),
-            Screen::DeviceList => self.device_list.render(layout[1], frame.buffer_mut()),
-            Screen::SendText => frame.render_widget(&self.send_text, layout[1]),
-            Screen::SendFile => frame.render_widget(&self.send_file, layout[1]),
+            Screen::SendText => self.send_text.render(layout[1], frame.buffer_mut()),
+            Screen::SendFile => self.send_file.render(layout[1], frame.buffer_mut()),
             Screen::Receive => frame.render_widget(&self.receive, layout[1]),
             Screen::Settings => frame.render_widget(&self.settings, layout[1]),
         }
@@ -439,37 +477,47 @@ impl App {
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default().style(THEME.root).borders(Borders::BOTTOM);
-
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let layout = Layout::horizontal([Constraint::Min(0), Constraint::Length(30)]).split(inner);
+        let layout = Layout::horizontal([
+            Constraint::Length(15), // Title
+            Constraint::Min(0),     // Tabs
+        ])
+        .split(inner);
 
         // Title
-        let title = Line::from(vec![
-            Span::styled(" 🌐 LocalSend TUI ", THEME.title),
-            Span::raw("| "),
-            Span::styled(&self.device_info.alias, THEME.device_alias),
-        ]);
+        let title = Line::from(vec![Span::styled(" 🌐 LocalSend ", THEME.title)]);
         frame.render_widget(Paragraph::new(title), layout[0]);
 
-        // Selected device
-        let selected = if let Some(ref device) = self.selected_device {
-            Line::from(vec![
-                Span::raw("Target: "),
-                Span::styled(&device.alias, THEME.device_alias),
-            ])
-        } else {
-            Line::styled("No target selected", THEME.status_info)
-        };
-        frame.render_widget(Paragraph::new(selected).right_aligned(), layout[1]);
+        // Tabs
+        let titles: Vec<String> = Screen::iter()
+            .map(|s| match s {
+                Screen::SendText => "📝 Text".to_string(),
+                Screen::SendFile => "📁 File".to_string(),
+                Screen::Receive => "📥 Inbox".to_string(),
+                Screen::Settings => "⚙️ Settings".to_string(),
+            })
+            .collect();
+
+        let current_index = Screen::iter().position(|s| s == self.screen).unwrap_or(0);
+        let tabs = Tabs::new(titles)
+            .block(Block::default())
+            .select(current_index)
+            .style(THEME.normal)
+            .highlight_style(THEME.selected)
+            .divider(symbols::DOT);
+
+        frame.render_widget(tabs, layout[1]);
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect) {
         let devices_count = self.devices.read().unwrap().len();
 
         let mut spans = vec![
-            Span::styled(format!(" 📱 {} devices ", devices_count), THEME.status_bar),
+            Span::styled(format!("📲 {}", self.device_info.alias), THEME.device_alias),
+            Span::raw(" | "),
+            Span::styled(format!("📱 {} devices ", devices_count), THEME.status_bar),
             Span::raw("| "),
             Span::styled(format!("🟢 Listening on {} ", self.port), THEME.status_bar),
         ];
