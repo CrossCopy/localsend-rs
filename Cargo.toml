@@ -2,6 +2,11 @@
 name = "localsend-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Rust implementation of LocalSend protocol - cross-platform file transfer tool"
+license = "MIT"
+repository = "https://github.com/CrossCopy/localsend-rs"
+documentation = "https://github.com/CrossCopy/localsend-rs#readme"
+homepage = "https://crosscopy.io"
 
 [features]
 default = ["cli", "https"]
