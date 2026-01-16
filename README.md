@@ -1,4 +1,8 @@
-# LocalSend Rust
+# localsend-rs
+
+[![Crates.io](https://img.shields.io/crates/v/localsend-rs)](https://crates.io/crates/localsend-rs)
+
+![LocalSend Rust Banner](localsend-rs.jpg)
 
 A high-performance, type-safe implementation of [LocalSend](https://localsend.org) protocol (v2) in Rust. This project provides both a library and a feature-rich CLI/TUI for secure, local network file and text transfers.
 
