@@ -1,6 +1,6 @@
 # LocalSend Rust
 
-A high-performance, cross-platform implementation of the [LocalSend](https://localsend.org) protocol (v2) in Rust. This project provides both a library and a feature-rich CLI for secure, local network file and text transfers.
+A high-performance, cross-platform implementation of the [LocalSend](https://localsend.org) protocol (v2) in Rust. This project provides both a library and a feature-rich CLI/TUI for secure, local network file and text transfers.
 
 ## Features
 
@@ -9,16 +9,44 @@ A high-performance, cross-platform implementation of the [LocalSend](https://loc
 - **Direct Send**: Transfer files or text directly to an IP address for speed and reliability.
 - **HTTPS Security**: TLS encryption for all transfers using protocol-compliant certificate fingerprinting.
 - **Text Messages**: Support for sending and receiving instant text messages.
-- **CLI Suite**: Intuitive commands for discovering, sending, and receiving.
+- **CLI & TUI**: Intuitive command-line interface with optional terminal-based UI.
 
 ## Installation
+
+### Option 1: Install from Crates.io (Recommended)
+
+Install the CLI version:
+
+```bash
+cargo install localsend-rs
+```
+
+Install with the interactive TUI:
+
+```bash
+cargo install localsend-rs --features tui
+```
+
+Then run with:
+
+```bash
+localsend-rs --help        # CLI mode
+localsend-rs tui           # Launch TUI (if installed with --features tui)
+```
+
+### Option 2: Build from Source
 
 Ensure you have Rust and Cargo installed. Clone the repository and build from source:
 
 ```bash
-git clone https://github.com/LocalSend/localsend-rs.git
+git clone https://github.com/CrossCopy/localsend-rs.git
 cd localsend-rs
-cargo build --release --features https
+
+# CLI only (default)
+cargo build --release
+
+# With TUI support
+cargo build --release --features tui
 ```
 
 ## Quick Start
@@ -85,6 +113,15 @@ Send data to another device.
 - `<FILES...>`: One or more file paths or text strings.
 - `--pin <PIN>`: Optional PIN for protected transfers.
 
+### `tui` (requires `--features tui`)
+
+Launch the interactive terminal-based UI for file transfers.
+
+```bash
+# After installing with --features tui
+localsend-rs tui
+```
+
 ## Architecture
 
 - `src/discovery`: Multicast UDP and HTTP-based discovery logic.
@@ -92,6 +129,8 @@ Send data to another device.
 - `src/client`: Request-based client for initiating transfers.
 - `src/protocol`: Core type definitions and protocol constants.
 - `src/crypto`: Certificate generation and fingerprinting.
+- `src/cli`: Command-line interface definitions.
+- `src/tui`: Terminal-based UI (requires `--features tui`).
 
 ## Development Status
 
@@ -101,8 +140,12 @@ This project is under active development.
 - [x] Receiving (HTTPS/HTTP)
 - [x] Sending Files
 - [x] Sending Text
+- [x] TUI (Terminal UI)
 - [ ] Direct Download (v3 feature)
-- [ ] User Transfer Approval UI (CLI currently auto-accepts metadata)
+
+## About
+
+This is a [CrossCopy](https://crosscopy.io) project - a high-performance Rust implementation of the LocalSend protocol for fast, secure local network file transfers.
 
 ## License
 
