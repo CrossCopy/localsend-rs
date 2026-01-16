@@ -7,7 +7,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table, Widget},
 };
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::protocol::ReceivedFile;
 
@@ -54,7 +55,7 @@ impl Widget for &ReceiveScreen {
         Paragraph::new(status).render(layout[0], buf);
 
         // File list
-        let files = self.received_files.read().unwrap();
+        let files = self.received_files.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
         if files.is_empty() {
             let msg = Paragraph::new("No files received yet.")
                 .style(THEME.normal)

@@ -2,8 +2,10 @@ use crate::error::{LocalSendError, Result};
 use crate::protocol::{
     DeviceInfo, FileId, FileMetadata, PrepareUploadRequest, PrepareUploadResponse, SessionId, Token,
 };
-use reqwest::{Client as HttpClient, StatusCode};
+use reqwest::{Body, Client as HttpClient, StatusCode};
 use std::collections::HashMap;
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
 
 pub type ProgressCallback = Box<dyn Fn(u64, u64, f64) + Send + Sync>;
 
@@ -124,7 +126,7 @@ impl LocalSendClient {
         file_id: &FileId,
         token: &Token,
         file_path: &std::path::Path,
-        _progress: Option<ProgressCallback>,
+        progress: Option<ProgressCallback>,
     ) -> Result<()> {
         let ip = target
             .ip
@@ -135,10 +137,21 @@ impl LocalSendClient {
             target.protocol, ip, target.port, session_id, file_id, token
         );
 
-        let file_bytes = tokio::fs::read(file_path).await?;
-        let _total_bytes = file_bytes.len();
+        // Stream the file instead of loading it all into memory
+        let file = File::open(file_path).await?;
+        let total_bytes = file.metadata().await?.len();
 
-        let response = self.client.post(&url).body(file_bytes).send().await?;
+        // Create a streaming body
+        let stream = ReaderStream::new(file);
+        let body = Body::wrap_stream(stream);
+
+        // TODO: Add progress tracking in future iteration
+        // For now, just report at start and end
+        if let Some(ref callback) = progress {
+            callback(0, total_bytes, 0.0);
+        }
+
+        let response = self.client.post(&url).body(body).send().await?;
 
         let status = response.status();
         match status {

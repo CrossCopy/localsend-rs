@@ -1,6 +1,6 @@
 [package]
 name = "localsend-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Rust implementation of LocalSend protocol - cross-platform file transfer tool"
 license = "MIT"
@@ -13,6 +13,7 @@ default = ["cli", "https"]
 cli = ["dep:clap", "dep:indicatif", "dep:colored", "dep:inquire", "dep:comfy-table"]
 https = ["dep:axum-server", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rcgen"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:color-eyre", "dep:tui-input", "dep:strum", "dep:itertools", "cli"]
+all = ["cli", "https", "tui"]
 
 [dependencies]
 # Core
@@ -37,6 +38,7 @@ rcgen = { version = "0.14", optional = true }
 async-stream = "0.3"
 futures-util = "0.3"
 bytes = "1.11"
+tokio-util = { version = "0.7", features = ["io"] }
 
 # Utilities
 mime_guess = "2.0"
@@ -63,3 +65,4 @@ tui-input = { version = "0.15", optional = true }
 strum = { version = "0.27", features = ["derive"], optional = true }
 itertools = { version = "0.14", optional = true }
 chrono = { version = "0.4.43", features = ["serde"] }
+parking_lot = "0.12"

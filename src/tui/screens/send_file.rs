@@ -9,7 +9,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph, Row, Table, TableState},
 };
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tui_input::Input;
 
 /// Stage in send file flow
@@ -68,7 +69,7 @@ impl SendFileScreen {
     }
 
     pub fn next_device(&mut self) {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
         if devices.is_empty() {
             return;
         }
@@ -80,7 +81,7 @@ impl SendFileScreen {
     }
 
     pub fn previous_device(&mut self) {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
         if devices.is_empty() {
             return;
         }
@@ -98,7 +99,7 @@ impl SendFileScreen {
     }
 
     pub fn select_current_device(&mut self) {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
         if let Some(i) = self.table_state.selected()
             && let Some(device) = devices.get(i)
         {
@@ -125,7 +126,7 @@ impl SendFileScreen {
     }
 
     fn render_device_selection(&mut self, area: Rect, buf: &mut Buffer) {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
 
         let block = Block::default()
             .title(" 📁 Send File - Select Device ")

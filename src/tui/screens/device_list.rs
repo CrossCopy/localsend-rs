@@ -9,7 +9,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table, TableState},
 };
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Device list screen state.
 #[allow(dead_code)]
@@ -40,7 +41,7 @@ impl DeviceListScreen {
     }
 
     pub fn next(&mut self) {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
         if devices.is_empty() {
             return;
         }
@@ -52,7 +53,7 @@ impl DeviceListScreen {
     }
 
     pub fn previous(&mut self) {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
         if devices.is_empty() {
             return;
         }
@@ -70,14 +71,14 @@ impl DeviceListScreen {
     }
 
     pub fn selected_device(&self) -> Option<DeviceInfo> {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
         self.table_state
             .selected()
             .and_then(|i| devices.get(i).cloned())
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
 
         let block = Block::default()
             .title(" 📱 Nearby Devices ")

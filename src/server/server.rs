@@ -14,7 +14,8 @@ use chrono::Local;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -221,7 +222,7 @@ impl LocalSendServer {
 }
 
 async fn handle_info(State(state): State<Arc<RwLock<ServerState>>>) -> Response {
-    let state = state.read().unwrap();
+    let state = state.read().await;
     Json(state.device.clone()).into_response()
 }
 
@@ -230,7 +231,7 @@ async fn handle_register(
     Json(remote_device): Json<DeviceInfo>,
 ) -> Response {
     tracing::debug!("Register request from {:?}", remote_device.alias);
-    let state = state.read().unwrap();
+    let state = state.read().await;
     Json(state.device.clone()).into_response()
 }
 
@@ -263,7 +264,7 @@ async fn handle_prepare_upload(
     }
 
     let (pending_transfer_arc, _sender_info, response_rx) = {
-        let mut state = state_ref.write().unwrap();
+        let mut state = state_ref.write().await;
 
         // Check for existing session timeout (e.g. 5 minutes or session finished)
         if let Some(session) = &state.current_session {
@@ -293,7 +294,7 @@ async fn handle_prepare_upload(
 
         // Notify UI
         {
-            let mut pending_guard = state.pending_transfer.write().unwrap();
+            let mut pending_guard = state.pending_transfer.write().await;
             *pending_guard = Some(pending);
         }
 
@@ -312,10 +313,10 @@ async fn handle_prepare_upload(
     };
 
     if !accepted {
-        let mut pending_guard = pending_transfer_arc.write().unwrap();
+        let mut pending_guard = pending_transfer_arc.write().await;
         *pending_guard = None;
 
-        let mut state = state_ref.write().unwrap();
+        let mut state = state_ref.write().await;
         state.current_session = None;
         tracing::info!("Transfer rejected by user or timeout");
         return StatusCode::FORBIDDEN.into_response();
@@ -323,7 +324,7 @@ async fn handle_prepare_upload(
 
     // Refresh last activity on acceptance
     {
-        let mut state = state_ref.write().unwrap();
+        let mut state = state_ref.write().await;
         if let Some(s) = &mut state.current_session {
             s.last_activity = std::time::Instant::now();
         }
@@ -331,10 +332,10 @@ async fn handle_prepare_upload(
 
     // If it's a message, return 204 No Content
     if is_message {
-        let mut pending_guard = pending_transfer_arc.write().unwrap();
+        let mut pending_guard = pending_transfer_arc.write().await;
         *pending_guard = None;
 
-        let mut state = state_ref.write().unwrap();
+        let mut state = state_ref.write().await;
 
         // Save messages to files and update TUI list
         for file in request.files.values() {
@@ -353,7 +354,7 @@ async fn handle_prepare_upload(
                     tracing::info!("Saved message to {:?}", path);
 
                     // Update TUI list
-                    let mut files_list = state.received_files.write().unwrap();
+                    let mut files_list = state.received_files.write().await;
                     files_list.push(ReceivedFile {
                         file_name: filename,
                         size: content.len() as u64,
@@ -385,12 +386,13 @@ struct UploadParams {
     token: crate::protocol::Token,
 }
 
+#[axum::debug_handler]
 async fn handle_upload(
     State(state_ref): State<Arc<RwLock<ServerState>>>,
     Query(params): Query<UploadParams>,
     body: Bytes,
 ) -> Response {
-    let mut state = state_ref.write().unwrap();
+    let state = state_ref.write().await;
 
     // Verify session
     let (file_name, session_id) = if let Some(session) = &state.current_session {
@@ -427,22 +429,28 @@ async fn handle_upload(
 
     let save_path = state.save_dir.join(&file_name);
 
-    // Ensure parent directory exists
+    // Release the lock before async I/O operations
+    drop(state);
+
+    // Ensure parent directory exists (async)
     if let Some(parent) = save_path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::error!("Failed to create directory {:?}: {}", parent, e);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+        && let Err(e) = tokio::fs::create_dir_all(parent).await {
+            tracing::error!("Failed to create directory {:?}: {}", parent, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
 
     let body_len = body.len() as u64;
 
-    if let Err(e) = std::fs::write(&save_path, body) {
+    // Async file write
+    if let Err(e) = tokio::fs::write(&save_path, body).await {
         tracing::error!("Failed to save file to {:?}: {}", save_path, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     tracing::info!("Received file: {:?} for session {}", save_path, session_id);
+
+    // Reacquire lock for state updates
+    let mut state = state_ref.write().await;
 
     // Update TUI list
     {
@@ -452,7 +460,7 @@ async fn handle_upload(
             .map(|s| s.sender_alias.clone())
             .unwrap_or_else(|| "Unknown".to_string());
         let time_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut files_list = state.received_files.write().unwrap();
+        let mut files_list = state.received_files.write().await;
         files_list.push(ReceivedFile {
             file_name,
             size: body_len,
@@ -484,7 +492,7 @@ async fn handle_cancel(
     State(state_ref): State<Arc<RwLock<ServerState>>>,
     Query(params): Query<CancelParams>,
 ) -> Response {
-    let mut state = state_ref.write().unwrap();
+    let mut state = state_ref.write().await;
 
     if let Some(session) = &state.current_session
         && session.session_id.as_str() == params.session_id.as_str()
