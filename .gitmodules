@@ -1,3 +1,9 @@
 [submodule "reference/ratatui"]
 	path = reference/ratatui
 	url = https://github.com/ratatui/ratatui.git
+[submodule "reference/localsend-protocol"]
+	path = reference/localsend-protocol
+	url = https://github.com/localsend/protocol.git
+[submodule "reference/localsend"]
+	path = reference/localsend
+	url = https://github.com/localsend/localsend.git
