@@ -127,12 +127,11 @@ impl App {
             self.check_pending_transfer();
 
             // Handle events with timeout
-            if event::poll(tick_rate)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.handle_key(key.code);
-                    }
-                }
+            if event::poll(tick_rate)?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_key(key.code);
             }
         }
 
@@ -358,23 +357,23 @@ impl App {
             SendTextStage::EnterMessage => match key {
                 KeyCode::Esc => self.send_text.stage = SendTextStage::SelectDevice,
                 KeyCode::Enter => {
-                    if let Some(target) = &self.send_text.selected_device {
-                        if !self.send_text.message().is_empty() {
-                            let message = self.send_text.message().to_string();
-                            let target = target.clone();
-                            let device_info = self.device_info.clone();
+                    if let Some(target) = &self.send_text.selected_device
+                        && !self.send_text.message().is_empty()
+                    {
+                        let message = self.send_text.message().to_string();
+                        let target = target.clone();
+                        let device_info = self.device_info.clone();
 
-                            self.send_text.is_sending = true;
+                        self.send_text.is_sending = true;
 
-                            tokio::spawn(async move {
-                                let client = LocalSendClient::new(device_info);
-                                let _ = send_text_message(&client, &target, &message).await;
-                            });
+                        tokio::spawn(async move {
+                            let client = LocalSendClient::new(device_info);
+                            let _ = send_text_message(&client, &target, &message).await;
+                        });
 
-                            self.send_text.clear();
-                            self.status_message =
-                                Some(("Sending message...".into(), MessageLevel::Info));
-                        }
+                        self.send_text.clear();
+                        self.status_message =
+                            Some(("Sending message...".into(), MessageLevel::Info));
                     }
                 }
                 _ => {
@@ -403,27 +402,27 @@ impl App {
             SendFileStage::EnterFilePath => match key {
                 KeyCode::Esc => self.send_file.stage = SendFileStage::SelectDevice,
                 KeyCode::Enter => {
-                    if let Some(target) = &self.send_file.selected_device {
-                        if !self.send_file.file_path().is_empty() {
-                            let file_path = PathBuf::from(self.send_file.file_path());
-                            if file_path.exists() {
-                                let target = target.clone();
-                                let device_info = self.device_info.clone();
+                    if let Some(target) = &self.send_file.selected_device
+                        && !self.send_file.file_path().is_empty()
+                    {
+                        let file_path = PathBuf::from(self.send_file.file_path());
+                        if file_path.exists() {
+                            let target = target.clone();
+                            let device_info = self.device_info.clone();
 
-                                self.send_file.is_sending = true;
+                            self.send_file.is_sending = true;
 
-                                tokio::spawn(async move {
-                                    let client = LocalSendClient::new(device_info);
-                                    let _ = send_file(&client, &target, &file_path).await;
-                                });
+                            tokio::spawn(async move {
+                                let client = LocalSendClient::new(device_info);
+                                let _ = send_file(&client, &target, &file_path).await;
+                            });
 
-                                self.send_file.clear();
-                                self.status_message =
-                                    Some(("Sending file...".into(), MessageLevel::Info));
-                            } else {
-                                self.status_message =
-                                    Some(("File not found".into(), MessageLevel::Error));
-                            }
+                            self.send_file.clear();
+                            self.status_message =
+                                Some(("Sending file...".into(), MessageLevel::Info));
+                        } else {
+                            self.status_message =
+                                Some(("File not found".into(), MessageLevel::Error));
                         }
                     }
                 }

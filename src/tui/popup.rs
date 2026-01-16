@@ -2,11 +2,9 @@
 
 use crate::protocol::{DeviceInfo, FileMetadata};
 use ratatui::{
-    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::Stylize,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use std::collections::HashMap;
 use tokio::sync::oneshot;

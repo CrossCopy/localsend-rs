@@ -208,24 +208,24 @@ async fn probe_device(ip: String) -> anyhow::Result<DeviceInfo> {
 
     // Try HTTPS first
     let url = format!("https://{}:53317/api/localsend/v2/info", ip);
-    if let Ok(resp) = client.get(&url).send().await {
-        if resp.status().is_success() {
-            let mut device: DeviceInfo = resp.json().await?;
-            device.ip = Some(ip.clone());
-            device.protocol = "https".to_string(); // Ensure protocol is set matches what we used
-            return Ok(device);
-        }
+    if let Ok(resp) = client.get(&url).send().await
+        && resp.status().is_success()
+    {
+        let mut device: DeviceInfo = resp.json().await?;
+        device.ip = Some(ip.clone());
+        device.protocol = "https".to_string(); // Ensure protocol is set matches what we used
+        return Ok(device);
     }
 
     // Try HTTP
     let url = format!("http://{}:53317/api/localsend/v2/info", ip);
-    if let Ok(resp) = client.get(&url).send().await {
-        if resp.status().is_success() {
-            let mut device: DeviceInfo = resp.json().await?;
-            device.ip = Some(ip.clone());
-            device.protocol = "http".to_string();
-            return Ok(device);
-        }
+    if let Ok(resp) = client.get(&url).send().await
+        && resp.status().is_success()
+    {
+        let mut device: DeviceInfo = resp.json().await?;
+        device.ip = Some(ip.clone());
+        device.protocol = "http".to_string();
+        return Ok(device);
     }
 
     anyhow::bail!("Failed to probe device at {}", ip)

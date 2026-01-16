@@ -169,7 +169,7 @@ impl LocalSendServer {
                 });
 
                 self.handle = Some(handle);
-                return Ok(());
+                Ok(())
             }
             #[cfg(not(feature = "https"))]
             {
@@ -254,7 +254,7 @@ async fn handle_prepare_upload(
             .values()
             .all(|f| f.preview.is_some() && f.size < 1024 * 1024);
 
-    for (file_id, _file_meta) in &request.files {
+    for file_id in request.files.keys() {
         let token = format!("{}_{}", session_id, file_id);
         files_map.insert(file_id.clone(), token);
     }
@@ -425,11 +425,11 @@ async fn handle_upload(
     let save_path = state.save_dir.join(&file_name);
 
     // Ensure parent directory exists
-    if let Some(parent) = save_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::error!("Failed to create directory {:?}: {}", parent, e);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    if let Some(parent) = save_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::error!("Failed to create directory {:?}: {}", parent, e);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     let body_len = body.len() as u64;
@@ -483,11 +483,11 @@ async fn handle_cancel(
 ) -> Response {
     let mut state = state_ref.write().unwrap();
 
-    if let Some(session) = &state.current_session {
-        if session.session_id == params.session_id {
-            state.current_session = None;
-            tracing::info!("Session {} cancelled", params.session_id);
-        }
+    if let Some(session) = &state.current_session
+        && session.session_id == params.session_id
+    {
+        state.current_session = None;
+        tracing::info!("Session {} cancelled", params.session_id);
     }
 
     StatusCode::OK.into_response()

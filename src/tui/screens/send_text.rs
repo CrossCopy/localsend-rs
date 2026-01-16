@@ -86,11 +86,11 @@ impl SendTextScreen {
 
     pub fn select_current_device(&mut self) {
         let devices = self.devices.read().unwrap();
-        if let Some(i) = self.table_state.selected() {
-            if let Some(device) = devices.get(i) {
-                self.selected_device = Some(device.clone());
-                self.stage = SendTextStage::EnterMessage;
-            }
+        if let Some(i) = self.table_state.selected()
+            && let Some(device) = devices.get(i)
+        {
+            self.selected_device = Some(device.clone());
+            self.stage = SendTextStage::EnterMessage;
         }
     }
 

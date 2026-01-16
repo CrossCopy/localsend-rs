@@ -3,18 +3,14 @@ use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum DeviceType {
     Mobile,
+    #[default]
     Desktop,
     Web,
     Headless,
     Server,
-}
-
-impl Default for DeviceType {
-    fn default() -> Self {
-        Self::Desktop
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
