@@ -36,7 +36,7 @@ pub fn generate_tls_certificate() -> Result<TlsCertificate> {
 
     Ok(TlsCertificate {
         cert_pem: cert.cert.pem(),
-        key_pem: cert.key_pair.serialize_pem(),
+        key_pem: cert.signing_key.serialize_pem(),
         fingerprint,
     })
 }
