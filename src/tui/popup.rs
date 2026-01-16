@@ -1,6 +1,6 @@
 //! Popup overlays for transfer confirmations and status messages.
 
-use crate::protocol::{DeviceInfo, FileMetadata};
+use crate::protocol::{DeviceInfo, FileId, FileMetadata};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     text::{Line, Span},
@@ -17,7 +17,7 @@ pub enum Popup {
     /// Confirmation dialog for incoming transfer request.
     TransferConfirm {
         sender: DeviceInfo,
-        files: HashMap<String, FileMetadata>,
+        files: HashMap<FileId, FileMetadata>,
         response_tx: oneshot::Sender<bool>,
     },
     /// Progress indicator for active transfer.
@@ -71,7 +71,7 @@ impl Popup {
         frame: &mut ratatui::Frame,
         area: Rect,
         sender: &DeviceInfo,
-        files: &HashMap<String, FileMetadata>,
+        files: &HashMap<FileId, FileMetadata>,
     ) {
         let block = Block::default()
             .title(" 📥 Incoming Transfer ")

@@ -35,7 +35,7 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
         device_type: Some(DeviceType::Desktop),
         fingerprint: generate_fingerprint(),
         port: 53318,
-        protocol: "https".to_string(), // Default to HTTPS
+        protocol: crate::protocol::Protocol::Https, // Default to HTTPS
         download: false,
         ip: None,
     });
@@ -55,12 +55,12 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
         let path = PathBuf::from(input);
         if path.exists() {
             let file_meta = build_file_metadata(&path).await?;
-            file_metadata_map.insert(file_meta.id.clone(), FileSource::Path(path));
+            file_metadata_map.insert(file_meta.id.as_str().to_string(), FileSource::Path(path));
             files_metadata.insert(file_meta.id.clone(), file_meta);
         } else {
             // Treat as text
             let text = input.clone();
-            let id = uuid::Uuid::new_v4().to_string();
+            let id = crate::protocol::FileId::new();
             let file_meta = FileMetadata {
                 id: id.clone(),
                 file_name: format!("{}.txt", id), // Random name or "message.txt"
@@ -73,7 +73,7 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
                     accessed: None,
                 }),
             };
-            file_metadata_map.insert(id.clone(), FileSource::Text(text));
+            file_metadata_map.insert(id.as_str().to_string(), FileSource::Text(text));
             files_metadata.insert(id.clone(), file_meta);
         }
     }
@@ -84,7 +84,7 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
 
     println!("Session ID: {}", upload_response.session_id);
 
-    if upload_response.session_id.is_empty() {
+    if upload_response.session_id.as_str().is_empty() {
         // 204 No Content - likely text message sent successfully
         println!("Transfer completed successfully (No files needed to be transferred).");
         return Ok(());
@@ -92,7 +92,7 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
 
     for (file_id, token) in &upload_response.files {
         let source = file_metadata_map
-            .get(file_id)
+            .get(file_id.as_str())
             .ok_or_else(|| anyhow::anyhow!("File not found for ID: {}", file_id))?;
 
         match source {
@@ -158,7 +158,7 @@ async fn resolve_target(target: &str) -> anyhow::Result<DeviceInfo> {
     let mut discovery = MulticastDiscovery::new(
         "LocalSend-Rust-Finder".to_string(),
         53317,
-        "https".to_string(),
+        crate::protocol::Protocol::Https,
     )?;
 
     let found_device = std::sync::Arc::new(std::sync::Mutex::new(None as Option<DeviceInfo>));
@@ -213,7 +213,7 @@ async fn probe_device(ip: String) -> anyhow::Result<DeviceInfo> {
     {
         let mut device: DeviceInfo = resp.json().await?;
         device.ip = Some(ip.clone());
-        device.protocol = "https".to_string(); // Ensure protocol is set matches what we used
+        device.protocol = crate::protocol::Protocol::Https; // Ensure protocol is set matches what we used
         return Ok(device);
     }
 
@@ -224,7 +224,7 @@ async fn probe_device(ip: String) -> anyhow::Result<DeviceInfo> {
     {
         let mut device: DeviceInfo = resp.json().await?;
         device.ip = Some(ip.clone());
-        device.protocol = "http".to_string();
+        device.protocol = crate::protocol::Protocol::Http;
         return Ok(device);
     }
 

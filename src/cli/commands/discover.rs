@@ -19,7 +19,7 @@ pub async fn execute(command: DiscoverCommand) -> anyhow::Result<()> {
     let mut discovery = crate::discovery::MulticastDiscovery::new(
         "LocalSend-Rust".to_string(),
         53317,
-        "https".to_string(),
+        crate::protocol::Protocol::Https,
     )?;
 
     let devices = Arc::new(Mutex::new(Vec::<DeviceInfo>::new()));

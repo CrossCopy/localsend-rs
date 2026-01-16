@@ -1,45 +1,147 @@
 use thiserror::Error;
 
+/// Errors that can occur when using LocalSend
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum LocalSendError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    // ============================================================================
+    // I/O and System Errors
+    // ============================================================================
+    #[error("IO error: {source}")]
+    Io {
+        #[from]
+        source: std::io::Error,
+    },
 
-    #[error("Serde JSON error: {0}")]
-    Serde(#[from] serde_json::Error),
+    #[error("Serde JSON error: {source}")]
+    Serde {
+        #[from]
+        source: serde_json::Error,
+    },
 
-    #[error("HTTP client error: {0}")]
-    Reqwest(#[from] reqwest::Error),
+    // ============================================================================
+    // Network Errors
+    // ============================================================================
+    #[error("HTTP client error: {source}")]
+    Reqwest {
+        #[from]
+        source: reqwest::Error,
+    },
 
-    #[error("Address parse error: {0}")]
-    AddrParse(#[from] std::net::AddrParseError),
+    #[error("Address parse error: {source}")]
+    AddrParse {
+        #[from]
+        source: std::net::AddrParseError,
+    },
 
-    #[error("Network error: {0}")]
-    Network(String),
+    #[error("Network error: {message}")]
+    Network { message: String },
 
-    #[error("Invalid device info: {0}")]
-    InvalidDevice(String),
+    #[error("Invalid port: {0}")]
+    InvalidPort(String),
 
-    #[error("Invalid file metadata: {0}")]
-    InvalidFile(String),
+    // ============================================================================
+    // Protocol Errors
+    // ============================================================================
+    #[error("Invalid device info: {message}")]
+    InvalidDevice { message: String },
 
+    #[error("Invalid file metadata: {message}")]
+    InvalidFile { message: String },
+
+    #[error("Protocol version mismatch: expected {expected}, got {actual}")]
+    VersionMismatch { expected: String, actual: String },
+
+    #[error("Invalid state transition: {message}")]
+    InvalidState { message: String },
+
+    // ============================================================================
+    // Transfer Errors
+    // ============================================================================
     #[error("Invalid token or session ID")]
     InvalidToken,
 
-    #[error("Request rejected by receiver (HTTP {0})")]
-    Rejected(u16),
+    #[error("Session {session_id} not found")]
+    SessionNotFound { session_id: String },
 
-    #[error("Request failed with HTTP {0}")]
-    HttpFailed(u16),
+    #[error("File {file_id} not found in session {session_id}")]
+    FileNotFound { file_id: String, session_id: String },
+
+    #[error("Transfer failed: {reason}")]
+    TransferFailed {
+        reason: String,
+        session_id: Option<String>,
+    },
 
     #[error("Session blocked by another transfer")]
     SessionBlocked,
 
+    // ============================================================================
+    // Authentication Errors
+    // ============================================================================
     #[error("Invalid PIN")]
     InvalidPin,
 
+    #[error("PIN required but not provided")]
+    PinRequired,
+
+    // ============================================================================
+    // HTTP Status Errors
+    // ============================================================================
+    #[error("Request rejected by receiver (HTTP {status})")]
+    Rejected { status: u16 },
+
+    #[error("Request failed with HTTP {status}: {message}")]
+    HttpFailed { status: u16, message: String },
+
     #[error("Too many requests")]
     RateLimited,
+}
+
+impl LocalSendError {
+    /// Create a network error with a message
+    pub fn network(msg: impl Into<String>) -> Self {
+        Self::Network {
+            message: msg.into(),
+        }
+    }
+
+    /// Create an invalid device error with a message
+    pub fn invalid_device(msg: impl Into<String>) -> Self {
+        Self::InvalidDevice {
+            message: msg.into(),
+        }
+    }
+
+    /// Create an invalid file error with a message
+    pub fn invalid_file(msg: impl Into<String>) -> Self {
+        Self::InvalidFile {
+            message: msg.into(),
+        }
+    }
+
+    /// Create an invalid state error with a message
+    pub fn invalid_state(msg: impl Into<String>) -> Self {
+        Self::InvalidState {
+            message: msg.into(),
+        }
+    }
+
+    /// Create a transfer failed error
+    pub fn transfer_failed(reason: impl Into<String>, session_id: Option<String>) -> Self {
+        Self::TransferFailed {
+            reason: reason.into(),
+            session_id,
+        }
+    }
+
+    /// Create an HTTP failed error
+    pub fn http_failed(status: u16, message: impl Into<String>) -> Self {
+        Self::HttpFailed {
+            status,
+            message: message.into(),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, LocalSendError>;

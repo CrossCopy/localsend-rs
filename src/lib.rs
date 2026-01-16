@@ -18,11 +18,12 @@ pub use file::{
     build_file_metadata, build_file_metadata_from_bytes, generate_file_id, get_mime_type,
 };
 pub use protocol::{
-    AnnouncementMessage, DeviceInfo, DeviceType, FileMetadata, PrepareUploadRequest,
-    PrepareUploadResponse, RegisterMessage,
+    AnnouncementMessage, DeviceInfo, DeviceType, FileId, FileMetadata, Port, PrepareUploadRequest,
+    PrepareUploadResponse, Protocol, RegisterMessage, SessionId, Token,
 };
 pub use protocol::{
     DEFAULT_HTTP_PORT, DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT, PROTOCOL_VERSION,
+    validate_device_info, validate_file_metadata, validate_protocol_version,
 };
 pub use server::LocalSendServer;
 

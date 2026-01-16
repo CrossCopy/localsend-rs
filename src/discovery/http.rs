@@ -3,7 +3,7 @@ use crate::crypto::generate_fingerprint;
 use crate::device::{get_device_model, get_device_type};
 use crate::discovery::Discovery;
 use crate::error::LocalSendError;
-use crate::protocol::{DEFAULT_HTTP_PORT, DeviceInfo, PROTOCOL_VERSION};
+use crate::protocol::{DEFAULT_HTTP_PORT, DeviceInfo, PROTOCOL_VERSION, Protocol};
 use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +20,7 @@ pub struct HttpDiscovery {
 }
 
 impl HttpDiscovery {
-    pub fn new(alias: String, port: u16, protocol: String) -> Result<Self> {
+    pub fn new(alias: String, port: u16, protocol: Protocol) -> Result<Self> {
         let device = DeviceInfo {
             alias,
             version: PROTOCOL_VERSION.to_string(),
@@ -77,7 +77,7 @@ impl HttpDiscovery {
             device.ip = Some(ip.to_string());
             Ok(device)
         } else {
-            Err(LocalSendError::Network(format!(
+            Err(LocalSendError::network(format!(
                 "Failed to register with {}: {}",
                 ip,
                 response.status()
@@ -90,9 +90,7 @@ impl HttpDiscovery {
 impl Discovery for HttpDiscovery {
     async fn start(&mut self) -> std::result::Result<(), LocalSendError> {
         if self.running.load(Ordering::Relaxed) {
-            return Err(LocalSendError::Network(
-                "Discovery already running".to_string(),
-            ));
+            return Err(LocalSendError::network("Discovery already running"));
         }
 
         self.running.store(true, Ordering::Relaxed);
@@ -120,8 +118,8 @@ impl Discovery for HttpDiscovery {
     }
 
     async fn announce_presence(&self) -> std::result::Result<(), LocalSendError> {
-        Err(LocalSendError::Network(
-            "HTTP discovery doesn't support announce".to_string(),
+        Err(LocalSendError::network(
+            "HTTP discovery doesn't support announce",
         ))
     }
 

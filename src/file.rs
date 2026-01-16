@@ -1,11 +1,11 @@
 use crate::error::Result;
-use crate::protocol::FileMetadata;
+use crate::protocol::{FileId, FileMetadata};
 use mime_guess::from_path;
 use std::path::Path;
 use tokio::fs;
 
-pub fn generate_file_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+pub fn generate_file_id() -> FileId {
+    FileId::new()
 }
 
 pub fn get_mime_type(path: &Path) -> String {
@@ -31,7 +31,7 @@ pub async fn build_file_metadata(path: &Path) -> Result<FileMetadata> {
 }
 
 pub fn build_file_metadata_from_bytes(
-    id: String,
+    id: FileId,
     file_name: String,
     file_type: String,
     bytes: Vec<u8>,

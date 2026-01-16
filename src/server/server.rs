@@ -1,5 +1,6 @@
 use crate::protocol::{
-    DeviceInfo, FileMetadata, PrepareUploadRequest, PrepareUploadResponse, ReceivedFile,
+    DeviceInfo, FileId, FileMetadata, PrepareUploadRequest, PrepareUploadResponse, Protocol,
+    ReceivedFile, SessionId,
 };
 use axum::{
     Json, Router,
@@ -25,7 +26,7 @@ pub type ProgressCallback = Box<dyn Fn(String, u64, u64, f64) + Send + Sync>;
 
 pub struct PendingTransfer {
     pub sender: DeviceInfo,
-    pub files: HashMap<String, FileMetadata>,
+    pub files: HashMap<FileId, FileMetadata>,
     pub response_tx: oneshot::Sender<bool>,
 }
 
@@ -42,8 +43,8 @@ pub struct LocalSendServer {
 }
 
 pub struct ActiveSession {
-    pub session_id: String,
-    pub files: HashMap<String, FileMetadata>,
+    pub session_id: SessionId,
+    pub files: HashMap<FileId, FileMetadata>,
     pub sender_alias: String,
     pub last_activity: std::time::Instant,
 }
@@ -70,7 +71,7 @@ impl LocalSendServer {
             device_type: Some(crate::device::get_device_type()),
             fingerprint: crate::crypto::generate_fingerprint(),
             port,
-            protocol: "http".to_string(),
+            protocol: Protocol::Http,
             download: false,
             ip: None,
         };
@@ -141,14 +142,14 @@ impl LocalSendServer {
                     RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes())
                         .await
                         .map_err(|e| {
-                            crate::error::LocalSendError::Network(format!(
+                            crate::error::LocalSendError::network(format!(
                                 "TLS config error: {}",
                                 e
                             ))
                         })?;
 
                 let socket_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
-                    crate::error::LocalSendError::Network(format!("Failed to parse address: {}", e))
+                    crate::error::LocalSendError::network(format!("Failed to parse address: {}", e))
                 })?;
 
                 let handle = tokio::spawn(async move {
@@ -173,8 +174,8 @@ impl LocalSendServer {
             }
             #[cfg(not(feature = "https"))]
             {
-                return Err(crate::error::LocalSendError::Network(
-                    "HTTPS support not enabled. Please build with --features https".to_string(),
+                return Err(crate::error::LocalSendError::network(
+                    "HTTPS support not enabled. Please build with --features https",
                 ));
             }
         } else {
@@ -244,7 +245,9 @@ async fn handle_prepare_upload(
     Query(_params): Query<PrepareUploadParams>,
     Json(request): Json<PrepareUploadRequest>,
 ) -> Response {
-    let session_id = uuid::Uuid::new_v4().to_string();
+    use crate::protocol::{SessionId, Token};
+
+    let session_id = SessionId::new();
     let mut files_map = HashMap::new();
 
     // Check if it's a text message (all files have non-empty preview and small size)
@@ -255,7 +258,7 @@ async fn handle_prepare_upload(
             .all(|f| f.preview.is_some() && f.size < 1024 * 1024);
 
     for file_id in request.files.keys() {
-        let token = format!("{}_{}", session_id, file_id);
+        let token = Token::new(&session_id, file_id);
         files_map.insert(file_id.clone(), token);
     }
 
@@ -375,11 +378,11 @@ async fn handle_prepare_upload(
 #[derive(Deserialize)]
 struct UploadParams {
     #[serde(rename = "sessionId")]
-    session_id: String,
+    session_id: SessionId,
     #[serde(rename = "fileId")]
-    file_id: String,
+    file_id: FileId,
     #[serde(rename = "token")]
-    token: String,
+    token: crate::protocol::Token,
 }
 
 async fn handle_upload(
@@ -401,8 +404,8 @@ async fn handle_upload(
         }
 
         // Verify token
-        let expected_token = format!("{}_{}", session.session_id, params.file_id);
-        if params.token != expected_token {
+        let expected_token = crate::protocol::Token::new(&session.session_id, &params.file_id);
+        if params.token.as_str() != expected_token.as_str() {
             tracing::warn!("Upload rejected: Token mismatch");
             return StatusCode::FORBIDDEN.into_response();
         }
@@ -474,7 +477,7 @@ async fn handle_upload(
 #[derive(Deserialize)]
 struct CancelParams {
     #[serde(rename = "sessionId")]
-    session_id: String,
+    session_id: SessionId,
 }
 
 async fn handle_cancel(
@@ -484,7 +487,7 @@ async fn handle_cancel(
     let mut state = state_ref.write().unwrap();
 
     if let Some(session) = &state.current_session
-        && session.session_id == params.session_id
+        && session.session_id.as_str() == params.session_id.as_str()
     {
         state.current_session = None;
         tracing::info!("Session {} cancelled", params.session_id);

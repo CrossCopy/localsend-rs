@@ -5,7 +5,7 @@ use crate::discovery::Discovery;
 use crate::error::LocalSendError;
 use crate::protocol::{
     AnnouncementMessage, DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT, DeviceInfo,
-    PROTOCOL_VERSION,
+    PROTOCOL_VERSION, Protocol,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +26,7 @@ pub struct MulticastDiscovery {
 }
 
 impl MulticastDiscovery {
-    pub fn new(alias: String, port: u16, protocol: String) -> Result<Self> {
+    pub fn new(alias: String, port: u16, protocol: Protocol) -> Result<Self> {
         let device = DeviceInfo {
             alias,
             version: PROTOCOL_VERSION.to_string(),
@@ -58,9 +58,7 @@ impl MulticastDiscovery {
 impl Discovery for MulticastDiscovery {
     async fn start(&mut self) -> std::result::Result<(), LocalSendError> {
         if self.running.load(Ordering::Relaxed) {
-            return Err(LocalSendError::Network(
-                "Discovery already running".to_string(),
-            ));
+            return Err(LocalSendError::network("Discovery already running"));
         }
 
         let socket = UdpSocket::bind(
@@ -74,9 +72,7 @@ impl Discovery for MulticastDiscovery {
         let multicast_ipv4 = match multicast_addr.ip() {
             std::net::IpAddr::V4(addr) => addr,
             _ => {
-                return Err(LocalSendError::Network(
-                    "Multicast address must be IPv4".to_string(),
-                ));
+                return Err(LocalSendError::network("Multicast address must be IPv4"));
             }
         };
         socket.join_multicast_v4(multicast_ipv4, std::net::Ipv4Addr::new(0, 0, 0, 0))?;
@@ -121,7 +117,7 @@ impl Discovery for MulticastDiscovery {
                                     device_type: announcement.device_type,
                                     fingerprint: announcement.fingerprint.clone(),
                                     port: announcement.port,
-                                    protocol: announcement.protocol.clone(),
+                                    protocol: announcement.protocol,
                                     download: announcement.download,
                                     ip: Some(src.ip().to_string()),
                                 };
@@ -169,7 +165,7 @@ impl Discovery for MulticastDiscovery {
         let socket = if let Some(ref s) = self.socket {
             s
         } else {
-            return Err(LocalSendError::Network("Discovery not started".to_string()));
+            return Err(LocalSendError::network("Discovery not started"));
         };
 
         let announcement = AnnouncementMessage {
@@ -179,7 +175,7 @@ impl Discovery for MulticastDiscovery {
             device_type: self.local_device.device_type,
             fingerprint: self.local_device.fingerprint.clone(),
             port: self.local_device.port,
-            protocol: self.local_device.protocol.clone(),
+            protocol: self.local_device.protocol,
             download: self.local_device.download,
             announce: true,
             announcement: Some(true),
@@ -291,7 +287,7 @@ impl MulticastDiscovery {
             device_type: local_device.device_type,
             fingerprint: local_device.fingerprint.clone(),
             port: local_device.port,
-            protocol: local_device.protocol.clone(),
+            protocol: local_device.protocol,
             download: local_device.download,
             announce: false,
             announcement: Some(false),

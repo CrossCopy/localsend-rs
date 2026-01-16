@@ -47,8 +47,6 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
     #[cfg(not(feature = "https"))]
     let https_enabled = false;
 
-    let protocol = if https_enabled { "https" } else { "http" };
-
     if https_enabled {
         println!("HTTPS mode ENABLED");
     }
@@ -73,6 +71,12 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
         crate::crypto::generate_fingerprint()
     };
 
+    let protocol_enum = if https_enabled {
+        crate::protocol::Protocol::Https
+    } else {
+        crate::protocol::Protocol::Http
+    };
+
     let device = crate::protocol::DeviceInfo {
         alias: "LocalSend-Rust".to_string(),
         version: crate::protocol::PROTOCOL_VERSION.to_string(),
@@ -80,7 +84,7 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
         device_type: Some(crate::device::get_device_type()),
         fingerprint,
         port: command.port,
-        protocol: protocol.to_string(),
+        protocol: protocol_enum,
         download: false,
         ip: None,
     };

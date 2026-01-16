@@ -6,7 +6,7 @@ pub fn get_local_ip() -> Result<std::net::Ipv4Addr> {
     let local_addr = socket.local_addr()?.ip();
     match local_addr {
         std::net::IpAddr::V4(addr) => Ok(addr),
-        _ => Err(LocalSendError::Network("Local IP is not IPv4".to_string())),
+        _ => Err(LocalSendError::network("Local IP is not IPv4")),
     }
 }
 

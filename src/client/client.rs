@@ -1,5 +1,7 @@
 use crate::error::{LocalSendError, Result};
-use crate::protocol::{DeviceInfo, PrepareUploadRequest, PrepareUploadResponse};
+use crate::protocol::{
+    DeviceInfo, FileId, FileMetadata, PrepareUploadRequest, PrepareUploadResponse, SessionId, Token,
+};
 use reqwest::{Client as HttpClient, StatusCode};
 use std::collections::HashMap;
 
@@ -26,7 +28,7 @@ impl LocalSendClient {
         let ip = target
             .ip
             .as_ref()
-            .ok_or_else(|| LocalSendError::Network("Target IP not provided".to_string()))?;
+            .ok_or_else(|| LocalSendError::network("Target IP not provided"))?;
         let url = format!(
             "{}://{}:{}/api/localsend/v2/register",
             target.protocol, ip, target.port
@@ -51,22 +53,27 @@ impl LocalSendClient {
                 }
             }
         } else if status == 401 || status == 403 {
-            Err(LocalSendError::Rejected(status.as_u16()))
+            Err(LocalSendError::Rejected {
+                status: status.as_u16(),
+            })
         } else {
-            Err(LocalSendError::HttpFailed(status.as_u16()))
+            Err(LocalSendError::http_failed(
+                status.as_u16(),
+                "Registration failed",
+            ))
         }
     }
 
     pub async fn prepare_upload(
         &self,
         target: &DeviceInfo,
-        files: HashMap<String, crate::protocol::FileMetadata>,
+        files: HashMap<FileId, FileMetadata>,
         pin: Option<&str>,
     ) -> Result<PrepareUploadResponse> {
         let ip = target
             .ip
             .as_ref()
-            .ok_or_else(|| LocalSendError::Network("Target IP not provided".to_string()))?;
+            .ok_or_else(|| LocalSendError::network("Target IP not provided"))?;
         let mut url = format!(
             "{}://{}:{}/api/localsend/v2/prepare-upload",
             target.protocol, ip, target.port
@@ -92,34 +99,37 @@ impl LocalSendClient {
             StatusCode::NO_CONTENT => {
                 // This happens when sending text messages or if the receiver accepted the metadata but needs no file transfer
                 Ok(PrepareUploadResponse {
-                    session_id: String::new(),
+                    session_id: SessionId::from_string(String::new()),
                     files: HashMap::new(),
                 })
             }
             StatusCode::UNAUTHORIZED => Err(LocalSendError::InvalidPin),
-            StatusCode::FORBIDDEN => Err(LocalSendError::Rejected(status.as_u16())),
+            StatusCode::FORBIDDEN => Err(LocalSendError::Rejected {
+                status: status.as_u16(),
+            }),
             StatusCode::CONFLICT => Err(LocalSendError::SessionBlocked),
             StatusCode::TOO_MANY_REQUESTS => Err(LocalSendError::RateLimited),
-            StatusCode::INTERNAL_SERVER_ERROR => {
-                Err(LocalSendError::Network("Server error".to_string()))
-            }
-            _ => Err(LocalSendError::HttpFailed(status.as_u16())),
+            StatusCode::INTERNAL_SERVER_ERROR => Err(LocalSendError::network("Server error")),
+            _ => Err(LocalSendError::http_failed(
+                status.as_u16(),
+                "Prepare upload failed",
+            )),
         }
     }
 
     pub async fn upload_file(
         &self,
         target: &DeviceInfo,
-        session_id: &str,
-        file_id: &str,
-        token: &str,
+        session_id: &SessionId,
+        file_id: &FileId,
+        token: &Token,
         file_path: &std::path::Path,
         _progress: Option<ProgressCallback>,
     ) -> Result<()> {
         let ip = target
             .ip
             .as_ref()
-            .ok_or_else(|| LocalSendError::Network("Target IP not provided".to_string()))?;
+            .ok_or_else(|| LocalSendError::network("Target IP not provided"))?;
         let url = format!(
             "{}://{}:{}/api/localsend/v2/upload?sessionId={}&fileId={}&token={}",
             target.protocol, ip, target.port, session_id, file_id, token
@@ -133,7 +143,10 @@ impl LocalSendClient {
         let status = response.status();
         match status {
             StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
-            _ => Err(LocalSendError::HttpFailed(status.as_u16())),
+            _ => Err(LocalSendError::http_failed(
+                status.as_u16(),
+                "File upload failed",
+            )),
         }
     }
 }

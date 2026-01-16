@@ -28,7 +28,7 @@ pub fn generate_tls_certificate() -> Result<TlsCertificate> {
     use rcgen::generate_simple_self_signed;
 
     let cert = generate_simple_self_signed(vec!["localhost".to_string()]).map_err(|e| {
-        crate::error::LocalSendError::Network(format!("Failed to generate TLS certificate: {}", e))
+        crate::error::LocalSendError::network(format!("Failed to generate TLS certificate: {}", e))
     })?;
 
     let cert_der = cert.cert.der();

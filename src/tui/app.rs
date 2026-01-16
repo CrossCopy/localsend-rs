@@ -3,7 +3,7 @@
 use crate::client::LocalSendClient;
 use crate::crypto::generate_fingerprint;
 use crate::discovery::{Discovery, MulticastDiscovery};
-use crate::protocol::{DeviceInfo, DeviceType, PROTOCOL_VERSION, ReceivedFile};
+use crate::protocol::{DeviceInfo, DeviceType, PROTOCOL_VERSION, Protocol, ReceivedFile};
 use crate::server::LocalSendServer;
 use crate::server::PendingTransfer;
 
@@ -78,7 +78,11 @@ impl App {
             device_type: Some(DeviceType::Desktop),
             fingerprint: generate_fingerprint(),
             port,
-            protocol: if https { "https" } else { "http" }.to_string(),
+            protocol: if https {
+                Protocol::Https
+            } else {
+                Protocol::Http
+            },
             download: false,
             ip: None,
         };

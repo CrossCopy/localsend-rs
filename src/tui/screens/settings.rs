@@ -55,7 +55,7 @@ impl Widget for &SettingsScreen {
             Line::raw(""),
             Line::from(vec![
                 Span::styled("Protocol:      ", THEME.normal),
-                Span::raw(&self.device_info.protocol),
+                Span::raw(self.device_info.protocol.to_string()),
             ]),
             Line::raw(""),
             Line::from(vec![
