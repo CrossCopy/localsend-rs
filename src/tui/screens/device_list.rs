@@ -5,18 +5,21 @@ use crate::tui::theme::THEME;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
+    prelude::Widget,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row, Table, TableState, Widget},
+    widgets::{Block, Borders, Paragraph, Row, Table, TableState},
 };
 use std::sync::{Arc, RwLock};
 
 /// Device list screen state.
+#[allow(dead_code)]
 pub struct DeviceListScreen {
     pub devices: Arc<RwLock<Vec<DeviceInfo>>>,
     pub table_state: TableState,
     pub needs_refresh: bool,
 }
 
+#[allow(dead_code)]
 impl DeviceListScreen {
     pub fn new(devices: Arc<RwLock<Vec<DeviceInfo>>>) -> Self {
         Self {
@@ -126,7 +129,7 @@ impl DeviceListScreen {
                         .style(THEME.title)
                         .bottom_margin(1),
                 )
-                .highlight_style(THEME.selected)
+                .row_highlight_style(THEME.selected)
                 .highlight_symbol("▶ ");
 
             // We need to use StatefulWidget render, so do it manually

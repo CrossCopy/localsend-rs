@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use super::theme::THEME;
 
 /// Types of popup overlays.
+#[allow(dead_code)]
 pub enum Popup {
     /// Confirmation dialog for incoming transfer request.
     TransferConfirm {
@@ -30,6 +31,7 @@ pub enum Popup {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum MessageLevel {
     Success,
     Error,

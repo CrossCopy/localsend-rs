@@ -5,8 +5,9 @@ use crate::tui::theme::THEME;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
+    prelude::Widget,
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Row, Table, TableState, Widget},
+    widgets::{Block, Borders, Gauge, Paragraph, Row, Table, TableState},
 };
 use std::sync::{Arc, RwLock};
 use tui_input::Input;
@@ -60,6 +61,7 @@ impl SendFileScreen {
         self.input.value()
     }
 
+    #[allow(dead_code)]
     pub fn set_progress(&mut self, file: &str, progress: f64) {
         self.current_file = Some(file.to_string());
         self.progress = progress;
@@ -175,7 +177,7 @@ impl SendFileScreen {
                         .style(THEME.title)
                         .bottom_margin(1),
                 )
-                .highlight_style(THEME.selected)
+                .row_highlight_style(THEME.selected)
                 .highlight_symbol("▶ ");
 
             ratatui::widgets::StatefulWidget::render(table, layout[0], buf, &mut self.table_state);

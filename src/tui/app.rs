@@ -21,10 +21,10 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Tabs, Widget},
+    widgets::{Block, Borders, Paragraph, Tabs},
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use strum::IntoEnumIterator;
 use tokio::time::Duration;
@@ -591,7 +591,7 @@ async fn send_text_message(
 async fn send_file(
     client: &LocalSendClient,
     target: &DeviceInfo,
-    file_path: &PathBuf,
+    file_path: &Path,
 ) -> anyhow::Result<()> {
     use crate::file::build_file_metadata;
 
