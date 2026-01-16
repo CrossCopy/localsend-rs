@@ -1,6 +1,6 @@
 use crate::client::LocalSendClient;
 use crate::crypto::generate_fingerprint;
-use crate::device::{get_device_model, get_device_type};
+use crate::core::device::{get_device_model, get_device_type};
 use crate::discovery::Discovery;
 use crate::error::LocalSendError;
 use crate::protocol::{

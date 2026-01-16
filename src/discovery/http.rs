@@ -1,6 +1,6 @@
 #![allow(dead_code)]
+use crate::core::device::{get_device_model, get_device_type};
 use crate::crypto::generate_fingerprint;
-use crate::device::{get_device_model, get_device_type};
 use crate::discovery::Discovery;
 use crate::error::LocalSendError;
 use crate::protocol::{DEFAULT_HTTP_PORT, DeviceInfo, PROTOCOL_VERSION, Protocol};

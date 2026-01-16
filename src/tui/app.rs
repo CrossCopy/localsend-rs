@@ -74,7 +74,7 @@ impl App {
         let device_info = DeviceInfo {
             alias: device_name,
             version: PROTOCOL_VERSION.to_string(),
-            device_model: Some(crate::device::get_device_model()),
+            device_model: Some(crate::core::device::get_device_model()),
             device_type: Some(DeviceType::Desktop),
             fingerprint: generate_fingerprint(),
             port,
@@ -545,7 +545,7 @@ async fn send_text_message(
     target: &DeviceInfo,
     message: &str,
 ) -> anyhow::Result<()> {
-    use crate::file::{build_file_metadata_from_bytes, generate_file_id};
+    use crate::core::file::{build_file_metadata_from_bytes, generate_file_id};
 
     let file_data = message.as_bytes().to_vec();
     let file_name = "message.txt".to_string();
@@ -597,7 +597,7 @@ async fn send_file(
     target: &DeviceInfo,
     file_path: &Path,
 ) -> anyhow::Result<()> {
-    use crate::file::build_file_metadata;
+    use crate::core::file::build_file_metadata;
 
     let metadata = build_file_metadata(file_path).await?;
 

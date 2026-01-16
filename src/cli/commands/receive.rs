@@ -80,8 +80,8 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
     let device = crate::protocol::DeviceInfo {
         alias: "LocalSend-Rust".to_string(),
         version: crate::protocol::PROTOCOL_VERSION.to_string(),
-        device_model: Some(crate::device::get_device_model()),
-        device_type: Some(crate::device::get_device_type()),
+        device_model: Some(crate::core::device::get_device_model()),
+        device_type: Some(crate::core::device::get_device_type()),
         fingerprint,
         port: command.port,
         protocol: protocol_enum,

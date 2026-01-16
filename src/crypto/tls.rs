@@ -1,20 +1,5 @@
-use sha2::Digest;
-
+#[cfg(feature = "https")]
 use crate::error::Result;
-
-pub fn generate_fingerprint() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-pub fn sha256_from_bytes(data: &[u8]) -> String {
-    let hash = sha2::Sha256::digest(data);
-    format!("{:x}", hash)
-}
-
-pub async fn sha256_from_file(path: &std::path::Path) -> Result<String> {
-    let contents = tokio::fs::read(path).await?;
-    Ok(sha256_from_bytes(&contents))
-}
 
 #[cfg(feature = "https")]
 pub struct TlsCertificate {
@@ -32,7 +17,7 @@ pub fn generate_tls_certificate() -> Result<TlsCertificate> {
     })?;
 
     let cert_der = cert.cert.der();
-    let fingerprint = sha256_from_bytes(cert_der);
+    let fingerprint = super::hash::sha256_from_bytes(cert_der);
 
     Ok(TlsCertificate {
         cert_pem: cert.cert.pem(),

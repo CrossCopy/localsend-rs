@@ -1,8 +1,8 @@
 use crate::DeviceInfo;
 use crate::client::LocalSendClient;
+use crate::core::file::build_file_metadata;
 use crate::crypto::generate_fingerprint;
 use crate::discovery::{Discovery, MulticastDiscovery};
-use crate::file::build_file_metadata;
 use crate::protocol::types::FileMetadataDetails;
 use crate::protocol::{DeviceType, FileMetadata};
 use clap::Parser;

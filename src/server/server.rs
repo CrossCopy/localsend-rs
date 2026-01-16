@@ -67,8 +67,8 @@ impl LocalSendServer {
         let device = DeviceInfo {
             alias,
             version: crate::protocol::PROTOCOL_VERSION.to_string(),
-            device_model: Some(crate::device::get_device_model()),
-            device_type: Some(crate::device::get_device_type()),
+            device_model: Some(crate::core::device::get_device_model()),
+            device_type: Some(crate::core::device::get_device_type()),
             fingerprint: crate::crypto::generate_fingerprint(),
             port,
             protocol: Protocol::Http,
