@@ -1,6 +1,6 @@
 use crate::core::device::{get_device_model, get_device_type};
 use crate::crypto::generate_fingerprint;
-use crate::protocol::{DeviceInfo, DeviceType, Protocol, PROTOCOL_VERSION};
+use crate::protocol::{DeviceInfo, DeviceType, PROTOCOL_VERSION, Protocol};
 
 /// Builder for DeviceInfo with sensible defaults
 #[derive(Clone, Debug)]

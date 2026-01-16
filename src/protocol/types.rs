@@ -82,7 +82,7 @@ impl Default for SessionId {
 /// File identifier for individual files in a transfer
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct FileId(String);
+pub struct FileId(pub String);
 
 impl FileId {
     pub fn new() -> Self {

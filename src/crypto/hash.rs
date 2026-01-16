@@ -1,5 +1,5 @@
-use sha2::Digest;
 use crate::error::Result;
+use sha2::Digest;
 
 /// Compute SHA-256 hash of bytes
 pub fn sha256_from_bytes(data: &[u8]) -> String {

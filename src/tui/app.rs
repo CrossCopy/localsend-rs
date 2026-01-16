@@ -26,8 +26,8 @@ use ratatui::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use strum::IntoEnumIterator;
+use tokio::sync::RwLock;
 use tokio::time::Duration;
 use tui_input::backend::crossterm::EventHandler;
 
@@ -156,7 +156,9 @@ impl App {
                 return;
             }
 
-            let mut devices_guard = devices.try_write().unwrap_or_else(|_| panic!("Lock poisoned"));
+            let mut devices_guard = devices
+                .try_write()
+                .unwrap_or_else(|_| panic!("Lock poisoned"));
             let exists = devices_guard.iter().any(|d| {
                 d.fingerprint == device.fingerprint || (d.ip == device.ip && d.port == device.port)
             });
@@ -207,7 +209,10 @@ impl App {
             return; // Already showing a popup
         }
 
-        let mut pending = self.pending_transfer.try_write().unwrap_or_else(|_| panic!("Lock poisoned"));
+        let mut pending = self
+            .pending_transfer
+            .try_write()
+            .unwrap_or_else(|_| panic!("Lock poisoned"));
         if let Some(transfer) = pending.take() {
             self.popup = Some(Popup::TransferConfirm {
                 sender: transfer.sender,
@@ -304,7 +309,10 @@ impl App {
         refresh |= self.send_file.consume_refresh();
 
         if refresh {
-            self.devices.try_write().unwrap_or_else(|_| panic!("Lock poisoned")).clear();
+            self.devices
+                .try_write()
+                .unwrap_or_else(|_| panic!("Lock poisoned"))
+                .clear();
             if let Some(ref discovery) = self.discovery {
                 let discovery = discovery.clone();
                 tokio::spawn(async move {
@@ -516,7 +524,11 @@ impl App {
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect) {
-        let devices_count = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned")).len();
+        let devices_count = self
+            .devices
+            .try_read()
+            .unwrap_or_else(|_| panic!("Lock poisoned"))
+            .len();
 
         let mut spans = vec![
             Span::styled(format!("📲 {}", self.device_info.alias), THEME.device_alias),

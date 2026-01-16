@@ -15,8 +15,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -434,10 +434,11 @@ async fn handle_upload(
 
     // Ensure parent directory exists (async)
     if let Some(parent) = save_path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await {
-            tracing::error!("Failed to create directory {:?}: {}", parent, e);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        tracing::error!("Failed to create directory {:?}: {}", parent, e);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     let body_len = body.len() as u64;
 

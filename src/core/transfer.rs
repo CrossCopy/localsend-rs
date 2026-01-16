@@ -8,14 +8,14 @@ use std::time::Instant;
 pub enum TransferState {
     /// No active transfer
     Idle,
-    
+
     /// Waiting for user to accept/reject the transfer
     WaitingForAcceptance {
         sender: DeviceInfo,
         files: HashMap<FileId, FileMetadata>,
         timeout: Instant,
     },
-    
+
     /// Transfer is actively in progress
     Transferring {
         session_id: SessionId,
@@ -23,17 +23,15 @@ pub enum TransferState {
         files: HashMap<FileId, FileMetadata>,
         completed: HashSet<FileId>,
     },
-    
+
     /// Transfer completed successfully
     Completed {
         session_id: SessionId,
         total_files: usize,
     },
-    
+
     /// Transfer was cancelled
-    Cancelled {
-        reason: String,
-    },
+    Cancelled { reason: String },
 }
 
 impl TransferState {
@@ -49,14 +47,12 @@ impl TransferState {
     /// Accept the transfer and transition to Transferring state
     pub fn accept(self, session_id: SessionId) -> Result<Self> {
         match self {
-            Self::WaitingForAcceptance { sender, files, .. } => {
-                Ok(Self::Transferring {
-                    session_id,
-                    sender: sender.alias,
-                    files,
-                    completed: HashSet::new(),
-                })
-            }
+            Self::WaitingForAcceptance { sender, files, .. } => Ok(Self::Transferring {
+                session_id,
+                sender: sender.alias,
+                files,
+                completed: HashSet::new(),
+            }),
             _ => Err(LocalSendError::invalid_state(
                 "Cannot accept transfer from current state",
             )),
@@ -66,11 +62,9 @@ impl TransferState {
     /// Reject the transfer
     pub fn reject(self, reason: impl Into<String>) -> Result<Self> {
         match self {
-            Self::WaitingForAcceptance { .. } => {
-                Ok(Self::Cancelled {
-                    reason: reason.into(),
-                })
-            }
+            Self::WaitingForAcceptance { .. } => Ok(Self::Cancelled {
+                reason: reason.into(),
+            }),
             _ => Err(LocalSendError::invalid_state(
                 "Cannot reject transfer from current state",
             )),
@@ -87,7 +81,7 @@ impl TransferState {
                 ..
             } => {
                 completed.insert(file_id);
-                
+
                 // Check if all files are completed
                 if completed.len() == files.len() {
                     return Ok(Self::Completed {
@@ -95,7 +89,7 @@ impl TransferState {
                         total_files: files.len(),
                     });
                 }
-                
+
                 Ok(self)
             }
             _ => Err(LocalSendError::invalid_state(

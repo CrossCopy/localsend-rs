@@ -57,7 +57,10 @@ impl SendTextScreen {
     }
 
     pub fn next_device(&mut self) {
-        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
+        let devices = self
+            .devices
+            .try_read()
+            .unwrap_or_else(|_| panic!("Lock poisoned"));
         if devices.is_empty() {
             return;
         }
@@ -69,7 +72,10 @@ impl SendTextScreen {
     }
 
     pub fn previous_device(&mut self) {
-        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
+        let devices = self
+            .devices
+            .try_read()
+            .unwrap_or_else(|_| panic!("Lock poisoned"));
         if devices.is_empty() {
             return;
         }
@@ -87,7 +93,10 @@ impl SendTextScreen {
     }
 
     pub fn select_current_device(&mut self) {
-        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
+        let devices = self
+            .devices
+            .try_read()
+            .unwrap_or_else(|_| panic!("Lock poisoned"));
         if let Some(i) = self.table_state.selected()
             && let Some(device) = devices.get(i)
         {
@@ -114,7 +123,10 @@ impl SendTextScreen {
     }
 
     fn render_device_selection(&mut self, area: Rect, buf: &mut Buffer) {
-        let devices = self.devices.try_read().unwrap_or_else(|_| panic!("Lock poisoned"));
+        let devices = self
+            .devices
+            .try_read()
+            .unwrap_or_else(|_| panic!("Lock poisoned"));
 
         let block = Block::default()
             .title(" 📝 Send Text - Select Device ")

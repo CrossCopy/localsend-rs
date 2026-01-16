@@ -1,5 +1,5 @@
-pub mod traits;
 pub mod tokio_fs;
+pub mod traits;
 
-pub use traits::FileSystem;
 pub use tokio_fs::TokioFileSystem;
+pub use traits::FileSystem;

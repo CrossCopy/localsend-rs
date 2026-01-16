@@ -105,12 +105,12 @@ mod tests {
     fn test_token_verification() {
         let files = create_test_files();
         let session = Session::new("Test".to_string(), files.clone());
-        
+
         let file_id = files.keys().next().unwrap();
         let valid_token = session.get_token(file_id).unwrap();
-        
+
         assert!(session.verify_token(file_id, valid_token));
-        
+
         // Invalid token
         let invalid_token = Token::from_string("invalid".to_string());
         assert!(!session.verify_token(file_id, &invalid_token));

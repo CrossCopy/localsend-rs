@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn test_validate_file_metadata() {
         let mut metadata = FileMetadata {
-            id: "file123".to_string(),
+            id: crate::protocol::FileId("file123".to_string()),
             file_name: "test.txt".to_string(),
             size: 1024,
             file_type: "text/plain".to_string(),
@@ -137,9 +137,9 @@ mod tests {
         assert!(validate_file_metadata(&metadata).is_ok());
 
         // Empty ID
-        metadata.id = "".to_string();
+        metadata.id = crate::protocol::FileId("".to_string());
         assert!(validate_file_metadata(&metadata).is_err());
-        metadata.id = "file123".to_string();
+        metadata.id = crate::protocol::FileId("file123".to_string());
 
         // Empty file name
         metadata.file_name = "".to_string();
