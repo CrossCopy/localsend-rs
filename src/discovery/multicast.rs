@@ -7,6 +7,7 @@ use crate::protocol::{
     AnnouncementMessage, DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT, DeviceInfo,
     PROTOCOL_VERSION, Protocol,
 };
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -61,12 +62,8 @@ impl Discovery for MulticastDiscovery {
             return Err(LocalSendError::network("Discovery already running"));
         }
 
-        let socket = UdpSocket::bind(
-            format!("0.0.0.0:{}", DEFAULT_MULTICAST_PORT)
-                .as_str()
-                .parse::<SocketAddr>()?,
-        )
-        .await?;
+        let bind_addr: SocketAddr = format!("0.0.0.0:{}", DEFAULT_MULTICAST_PORT).parse()?;
+        let socket = create_reusable_udp_socket(&bind_addr)?;
         let multicast_addr: SocketAddr =
             format!("{}:{}", DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT).parse()?;
         let multicast_ipv4 = match multicast_addr.ip() {
@@ -306,4 +303,49 @@ impl MulticastDiscovery {
             }
         }
     }
+}
+
+/// Creates a UDP socket with port reuse enabled.
+///
+/// This is critical for LocalSend discovery because:
+/// 1. The protocol uses a fixed multicast port (53317).
+/// 2. Multiple instances (e.g., a background receiver and a short-lived discovery command)
+///    need to join the same multicast group simultaneously.
+///
+/// By enabling SO_REUSEADDR (and SO_REUSEPORT on Unix), the OS allows multiple
+/// processes to bind to the same UDP port. For multicast traffic, the OS will
+/// clone incoming packets and deliver them to all participating sockets.
+fn create_reusable_udp_socket(bind_addr: &SocketAddr) -> Result<UdpSocket> {
+    let domain = if bind_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+
+    let socket = Socket::new(domain, Type::DGRAM, Some(SocketProtocol::UDP))
+        .map_err(|e| LocalSendError::network(format!("Failed to create socket: {}", e)))?;
+
+    // Enable address reuse (supported on most platforms including Windows)
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| LocalSendError::network(format!("Failed to set reuse_address: {}", e)))?;
+
+    // Enable port reuse on Unix platforms to allow multiple processes to bind exactly to the same port
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    socket
+        .set_reuse_port(true)
+        .map_err(|e| LocalSendError::network(format!("Failed to set reuse_port: {}", e)))?;
+
+    socket
+        .bind(&(*bind_addr).into())
+        .map_err(|e| LocalSendError::network(format!("Failed to bind to {}: {}", bind_addr, e)))?;
+
+    // Convert to tokio UdpSocket
+    let std_socket: std::net::UdpSocket = socket.into();
+    std_socket
+        .set_nonblocking(true)
+        .map_err(|e| LocalSendError::network(format!("Failed to set non-blocking: {}", e)))?;
+
+    UdpSocket::from_std(std_socket)
+        .map_err(|e| LocalSendError::network(format!("Failed to convert to tokio socket: {}", e)))
 }
