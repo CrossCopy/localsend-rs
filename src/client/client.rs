@@ -18,7 +18,11 @@ pub struct LocalSendClient {
 impl LocalSendClient {
     pub fn new(device: DeviceInfo) -> Self {
         Self {
+            // With rustls backend, both use_rustls_tls() and danger_accept_invalid_certs()
+            // are required to accept self-signed certificates.
+            // See: https://github.com/seanmonstar/reqwest/issues/1554
             client: HttpClient::builder()
+                // .use_rustls_tls()
                 .danger_accept_invalid_certs(true)
                 .build()
                 .unwrap_or_else(|_| HttpClient::new()),
