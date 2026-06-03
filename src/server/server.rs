@@ -18,8 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, RwLock, oneshot};
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "https")]
@@ -42,6 +41,7 @@ pub struct LocalSendServer {
     #[cfg(feature = "https")]
     tls_cert: Option<crate::crypto::TlsCertificate>,
     pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
+    pending_transfer_notify: Option<Arc<Notify>>,
     received_files: Arc<RwLock<Vec<ReceivedFile>>>,
 }
 
@@ -58,6 +58,7 @@ pub struct ServerState {
     pub save_dir: PathBuf,
     pub _progress_callback: Option<ProgressCallback>,
     pub pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
+    pub pending_transfer_notify: Option<Arc<Notify>>,
     pub received_files: Arc<RwLock<Vec<ReceivedFile>>>,
 }
 
@@ -74,6 +75,21 @@ async fn write_body_to_file(body: Body, path: &Path) -> std::io::Result<u64> {
 
     file.flush().await?;
     Ok(bytes_written)
+}
+
+async fn publish_pending_transfer(
+    pending_transfer: &Arc<RwLock<Option<PendingTransfer>>>,
+    pending_transfer_notify: Option<&Arc<Notify>>,
+    pending: PendingTransfer,
+) {
+    {
+        let mut pending_guard = pending_transfer.write().await;
+        *pending_guard = Some(pending);
+    }
+
+    if let Some(notify) = pending_transfer_notify {
+        notify.notify_one();
+    }
 }
 
 impl LocalSendServer {
@@ -118,8 +134,13 @@ impl LocalSendServer {
             #[cfg(feature = "https")]
             tls_cert: None,
             pending_transfer,
+            pending_transfer_notify: None,
             received_files,
         })
+    }
+
+    pub fn set_pending_transfer_notify(&mut self, notify: Arc<Notify>) {
+        self.pending_transfer_notify = Some(notify);
     }
 
     #[cfg(feature = "https")]
@@ -137,6 +158,7 @@ impl LocalSendServer {
             save_dir: self.save_dir.clone(),
             _progress_callback: progress_callback,
             pending_transfer: self.pending_transfer.clone(),
+            pending_transfer_notify: self.pending_transfer_notify.clone(),
             received_files: self.received_files.clone(),
         }));
 
@@ -280,7 +302,7 @@ async fn handle_prepare_upload(
         files_map.insert(file_id.clone(), token);
     }
 
-    let (pending_transfer_arc, _sender_info, response_rx) = {
+    let (pending_transfer_arc, pending_transfer_notify, _sender_info, response_rx, pending) = {
         let mut state = state_ref.write().await;
 
         // Check for existing session timeout (e.g. 5 minutes or session finished)
@@ -309,18 +331,21 @@ async fn handle_prepare_upload(
             response_tx,
         };
 
-        // Notify UI
-        {
-            let mut pending_guard = state.pending_transfer.write().await;
-            *pending_guard = Some(pending);
-        }
-
         (
             state.pending_transfer.clone(),
+            state.pending_transfer_notify.clone(),
             request.info.clone(),
             response_rx,
+            pending,
         )
     };
+
+    publish_pending_transfer(
+        &pending_transfer_arc,
+        pending_transfer_notify.as_ref(),
+        pending,
+    )
+    .await;
 
     // Wait for user or timeout
     let accepted = match tokio::time::timeout(std::time::Duration::from_secs(60), response_rx).await
@@ -536,8 +561,11 @@ async fn handle_cancel(
 
 #[cfg(test)]
 mod tests {
-    use super::write_body_to_file;
+    use super::{PendingTransfer, publish_pending_transfer, write_body_to_file};
     use axum::body::Body;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{RwLock, oneshot};
 
     #[tokio::test]
     async fn write_body_to_file_writes_stream_and_returns_size() {
@@ -558,5 +586,24 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn publish_pending_transfer_sets_pending_and_notifies_listener() {
+        let pending_transfer = Arc::new(RwLock::new(None));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (response_tx, _response_rx) = oneshot::channel();
+        let pending = PendingTransfer {
+            sender: crate::DeviceInfo::new("sender".to_string(), 53317, crate::Protocol::Http),
+            files: HashMap::new(),
+            response_tx,
+        };
+
+        publish_pending_transfer(&pending_transfer, Some(&notify), pending).await;
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+            .await
+            .expect("pending transfer notification should wake listener");
+        assert!(pending_transfer.read().await.is_some());
     }
 }
