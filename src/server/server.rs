@@ -4,17 +4,19 @@ use crate::protocol::{
 };
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::Body,
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::Local;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot;
@@ -57,6 +59,21 @@ pub struct ServerState {
     pub _progress_callback: Option<ProgressCallback>,
     pub pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
     pub received_files: Arc<RwLock<Vec<ReceivedFile>>>,
+}
+
+async fn write_body_to_file(body: Body, path: &Path) -> std::io::Result<u64> {
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut bytes_written = 0u64;
+    let mut stream = body.into_data_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
+        bytes_written += chunk.len() as u64;
+        file.write_all(&chunk).await?;
+    }
+
+    file.flush().await?;
+    Ok(bytes_written)
 }
 
 impl LocalSendServer {
@@ -396,7 +413,7 @@ struct UploadParams {
 async fn handle_upload(
     State(state_ref): State<Arc<RwLock<ServerState>>>,
     Query(params): Query<UploadParams>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let state = state_ref.write().await;
 
@@ -452,13 +469,13 @@ async fn handle_upload(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    let body_len = body.len() as u64;
-
-    // Async file write
-    if let Err(e) = tokio::fs::write(&save_path, body).await {
-        tracing::error!("Failed to save file to {:?}: {}", save_path, e);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    let body_len = match write_body_to_file(body, &save_path).await {
+        Ok(bytes_written) => bytes_written,
+        Err(e) => {
+            tracing::error!("Failed to save file to {:?}: {}", save_path, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     tracing::info!("Received file: {:?} for session {}", save_path, session_id);
 
@@ -515,4 +532,31 @@ async fn handle_cancel(
     }
 
     StatusCode::OK.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_body_to_file;
+    use axum::body::Body;
+
+    #[tokio::test]
+    async fn write_body_to_file_writes_stream_and_returns_size() {
+        let path = std::env::temp_dir().join(format!(
+            "localsend-stream-upload-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        let body = Body::from("streamed upload content");
+
+        let bytes_written = write_body_to_file(body, &path)
+            .await
+            .expect("body should stream to file");
+
+        assert_eq!(bytes_written, 23);
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("file should exist"),
+            b"streamed upload content"
+        );
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
 }
