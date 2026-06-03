@@ -347,7 +347,13 @@ async fn handle_prepare_upload(
                     now.format("%Y%m%d_%H%M%S"),
                     file.file_name.replace("/", "_")
                 );
-                let path = state.save_dir.join(filename.clone());
+                let path = match crate::path_safety::safe_join(&state.save_dir, &filename) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        tracing::warn!("Rejected unsafe message file name: {}", e);
+                        continue;
+                    }
+                };
                 if let Err(e) = std::fs::write(&path, content) {
                     tracing::error!("Failed to save message to {:?}: {}", path, e);
                 } else {
@@ -427,7 +433,13 @@ async fn handle_upload(
         return StatusCode::FORBIDDEN.into_response();
     };
 
-    let save_path = state.save_dir.join(&file_name);
+    let save_path = match crate::path_safety::safe_join(&state.save_dir, &file_name) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("Upload rejected: {}", e);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
 
     // Release the lock before async I/O operations
     drop(state);

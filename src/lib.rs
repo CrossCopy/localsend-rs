@@ -3,6 +3,7 @@ pub mod core;
 pub mod crypto;
 pub mod discovery;
 pub mod error;
+mod path_safety;
 pub mod prelude;
 pub mod protocol;
 pub mod server;
