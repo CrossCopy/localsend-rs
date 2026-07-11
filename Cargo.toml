@@ -11,9 +11,28 @@ exclude = ["reference/", ".github/"]
 
 [features]
 default = ["cli", "https"]
-cli = ["dep:clap", "dep:indicatif", "dep:colored", "dep:inquire", "dep:comfy-table"]
-https = ["dep:axum-server", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rcgen"]
-tui = ["dep:ratatui", "dep:crossterm", "dep:color-eyre", "dep:tui-input", "dep:strum", "dep:itertools", "cli"]
+cli = [
+    "dep:clap",
+    "dep:indicatif",
+    "dep:colored",
+    "dep:inquire",
+    "dep:comfy-table",
+]
+https = [
+    "dep:axum-server",
+    "dep:tokio-rustls",
+    "dep:rustls-pemfile",
+    "dep:rcgen",
+]
+tui = [
+    "dep:ratatui",
+    "dep:crossterm",
+    "dep:color-eyre",
+    "dep:tui-input",
+    "dep:strum",
+    "dep:itertools",
+    "cli",
+]
 all = ["cli", "https", "tui"]
 
 [dependencies]
@@ -40,6 +59,7 @@ async-stream = "0.3"
 futures-util = "0.3"
 bytes = "1.11"
 tokio-util = { version = "0.7", features = ["io"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 # Utilities
 mime_guess = "2.0"
@@ -49,7 +69,7 @@ base64 = "0.22"
 # CLI (only with cli feature)
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
 indicatif = { version = "0.18", optional = true }
-colored = { version = "3.0", optional = true }
+colored = { version = "3.1", optional = true }
 inquire = { version = "0.9", optional = true }
 comfy-table = { version = "7.2", optional = true }
 
