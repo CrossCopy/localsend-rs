@@ -1,11 +1,11 @@
-//! Receive screen showing received files.
+//! Receive screen showing received files, with selection + reveal.
 
 use crate::tui::theme::THEME;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row, Table, Widget},
+    widgets::{Block, Borders, Paragraph, Row, StatefulWidget, Table, TableState, Widget, Wrap},
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,9 +16,10 @@ use crate::protocol::ReceivedFile;
 /// Receive screen state.
 pub struct ReceiveScreen {
     pub received_files: Arc<RwLock<Vec<ReceivedFile>>>,
-    pub is_listening: bool,
     pub port: u16,
     pub save_dir: PathBuf,
+    /// Selection over the display order (most-recent first).
+    pub table_state: TableState,
 }
 
 impl ReceiveScreen {
@@ -29,15 +30,54 @@ impl ReceiveScreen {
     ) -> Self {
         Self {
             received_files,
-            is_listening: true, // Always on
             port,
             save_dir,
+            table_state: TableState::default(),
         }
     }
-}
 
-impl Widget for &ReceiveScreen {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+    /// Snapshot of received files in display order (most-recent first).
+    /// Empty if the writer holds the lock this instant.
+    fn snapshot(&self) -> Vec<ReceivedFile> {
+        match self.received_files.try_read() {
+            Ok(files) => files.iter().rev().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn next(&mut self) {
+        let len = self.snapshot().len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => (i + 1) % len,
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    pub fn previous(&mut self) {
+        let len = self.snapshot().len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(0) => len - 1,
+            Some(i) => i - 1,
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+    }
+
+    /// The on-disk path of the currently selected received item, if any.
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        let files = self.snapshot();
+        let i = self.table_state.selected()?;
+        files.get(i).map(|f| f.path.clone())
+    }
+
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .title(" 📥 Received Files ")
             .title_style(THEME.title)
@@ -46,10 +86,21 @@ impl Widget for &ReceiveScreen {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        let files = self.snapshot();
+
+        // Reserve a preview pane only when the selected item is a text message.
+        let selected_message = self
+            .table_state
+            .selected()
+            .and_then(|i| files.get(i))
+            .and_then(|f| f.message_text.clone());
+        let preview_height: u16 = if selected_message.is_some() { 4 } else { 0 };
+
         let layout = Layout::vertical([
-            Constraint::Length(3), // Status (2 lines + margin)
-            Constraint::Min(0),    // File list
-            Constraint::Length(2), // Help
+            Constraint::Length(3),              // Status (2 lines + margin)
+            Constraint::Min(0),                 // File list
+            Constraint::Length(preview_height), // Message preview (optional)
+            Constraint::Length(2),              // Help
         ])
         .split(inner);
 
@@ -67,31 +118,38 @@ impl Widget for &ReceiveScreen {
         ];
         Paragraph::new(status).render(layout[0], buf);
 
-        // File list
-        let files = self
-            .received_files
-            .try_read()
-            .unwrap_or_else(|_| panic!("Lock poisoned"));
         if files.is_empty() {
+            // A dangling selection from a cleared list would be confusing.
+            self.table_state.select(None);
             let msg = Paragraph::new("No files received yet.")
                 .style(THEME.normal)
                 .centered();
             msg.render(layout[1], buf);
         } else {
+            // Clamp a stale selection (list can shrink) but leave it unset until
+            // the user navigates, so new arrivals don't yank the highlight.
+            if let Some(i) = self.table_state.selected()
+                && i >= files.len()
+            {
+                self.table_state.select(Some(files.len() - 1));
+            }
+
             let rows: Vec<Row> = files
                 .iter()
-                .rev() // Most recent first
-                .take(20)
                 .map(|f| {
-                    // The saved name may differ from the offered one after a
-                    // collision rename; show what actually landed on disk.
-                    let saved_name = f
-                        .path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| f.file_name.clone());
+                    // A text message shows its body inline (💬); a file shows the
+                    // actual saved name (which may differ after a collision
+                    // rename).
+                    let label = if let Some(text) = &f.message_text {
+                        format!("💬 {}", one_line(text, 48))
+                    } else {
+                        f.path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| f.file_name.clone())
+                    };
                     Row::new(vec![
-                        saved_name,
+                        label,
                         format_size(f.size),
                         f.sender.clone(),
                         f.time.clone(),
@@ -106,22 +164,53 @@ impl Widget for &ReceiveScreen {
                 Constraint::Percentage(20),
             ];
 
-            let table = Table::new(rows, widths).header(
-                Row::new(vec!["File", "Size", "From", "Time"])
-                    .style(THEME.title)
-                    .bottom_margin(1),
-            );
-            table.render(layout[1], buf);
+            let table = Table::new(rows, widths)
+                .header(
+                    Row::new(vec!["File / Message", "Size", "From", "Time"])
+                        .style(THEME.title)
+                        .bottom_margin(1),
+                )
+                .row_highlight_style(THEME.selected)
+                .highlight_symbol("▶ ");
+
+            StatefulWidget::render(table, layout[1], buf, &mut self.table_state);
         }
 
-        // Help — Tab/number keys switch tabs, q quits (handled globally).
+        // Message preview pane for the selected text message.
+        if let Some(text) = selected_message {
+            let preview = Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .title(" 💬 Message ")
+                        .title_style(THEME.title)
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false });
+            preview.render(layout[2], buf);
+        }
+
+        // Help — navigation + reveal; Tab/q handled globally.
         let help = Line::from(vec![
-            Span::styled(" Tab ", THEME.key),
-            Span::styled(" switch tabs ", THEME.key_desc),
+            Span::styled(" ↑/↓ ", THEME.key),
+            Span::styled(" Select ", THEME.key_desc),
+            Span::styled(" Enter ", THEME.key),
+            Span::styled(" Reveal in file manager ", THEME.key_desc),
             Span::styled(" q ", THEME.key),
-            Span::styled(" quit ", THEME.key_desc),
+            Span::styled(" Quit ", THEME.key_desc),
         ]);
-        Paragraph::new(help).centered().render(layout[2], buf);
+        Paragraph::new(help).centered().render(layout[3], buf);
+    }
+}
+
+/// Collapse newlines/whitespace and truncate for a single-line table cell.
+fn one_line(text: &str, max: usize) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max {
+        let mut s: String = flat.chars().take(max.saturating_sub(1)).collect();
+        s.push('…');
+        s
+    } else {
+        flat
     }
 }
 

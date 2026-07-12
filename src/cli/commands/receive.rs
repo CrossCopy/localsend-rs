@@ -105,15 +105,23 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
                     path,
                     size,
                     sender_alias,
+                    message_text,
                     ..
                 } => {
-                    println!(
-                        "Received '{}' ({} bytes) from {} -> {}",
-                        file_name,
-                        size,
-                        sender_alias,
-                        path.display()
-                    );
+                    if let Some(text) = message_text {
+                        // A text message: show the body inline instead of just
+                        // pointing at the .txt on disk.
+                        println!("Message from {}: {}", sender_alias, text);
+                        println!("  (saved to {})", path.display());
+                    } else {
+                        println!(
+                            "Received '{}' ({} bytes) from {} -> {}",
+                            file_name,
+                            size,
+                            sender_alias,
+                            path.display()
+                        );
+                    }
                 }
                 crate::server::ServerEvent::SessionDone { session_id } => {
                     println!("Session {} complete", session_id);

@@ -96,7 +96,7 @@ pub(crate) async fn handle_prepare_upload(
 
         (
             state.events_tx.clone(),
-            state.auto_accept,
+            state.auto_accept.load(std::sync::atomic::Ordering::Relaxed),
             state.accept_timeout,
         )
     };
@@ -209,6 +209,9 @@ pub(crate) async fn handle_prepare_upload(
                             path,
                             size: content.len() as u64,
                             sender_alias: request.info.alias.clone(),
+                            // This is the text-message path: carry the body so
+                            // consumers can show it inline in an inbox/log.
+                            message_text: Some(content.clone()),
                         },
                     );
                 }
@@ -416,6 +419,8 @@ pub(crate) async fn handle_upload(
             path: save_path,
             size: body_len,
             sender_alias,
+            // A real binary upload has no inline text body.
+            message_text: None,
         });
 
     if still_current && all_done {

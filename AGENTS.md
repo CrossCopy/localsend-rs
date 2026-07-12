@@ -67,13 +67,18 @@ let (mut server, mut events) = LocalSendServer::builder()
 while let Some(ev) = events.recv().await {
     match ev {
         ServerEvent::TransferRequest(req) => { req.accept(); /* or req.decline() / req.accept_files(ids) */ }
-        ServerEvent::FileReceived { path, .. } => { /* a file (or text message) landed */ }
+        // `message_text` is `Some(body)` when the "file" is a text message, else `None`.
+        ServerEvent::FileReceived { path, message_text, .. } => { /* a file (or text message) landed */ }
         ServerEvent::SessionDone { .. } => {}
     }
 }
 ```
 Dropping the `PendingRequest` or letting the accept-timeout elapse declines the transfer (403). The CLI
 (`src/cli/commands/receive.rs`) and TUI (`src/tui/app.rs`) are both just consumers of this event stream.
+
+**Live auto-accept**: `LocalSendServer::set_auto_accept(&self, bool)` flips a shared `Arc<AtomicBool>` that
+the request handler reads per-request, so toggling it on a running server takes effect immediately (the TUI
+Settings toggle relies on this). `server.auto_accept()` reads it back.
 
 ## Architecture / where to look
 

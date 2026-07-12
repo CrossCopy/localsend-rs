@@ -13,6 +13,14 @@ pub struct TuiCommand {
     #[arg(short, long)]
     pub alias: Option<String>,
 
+    /// Require this PIN from senders before a transfer is offered.
+    #[arg(long)]
+    pub pin: Option<String>,
+
+    /// Accept every incoming transfer without prompting.
+    #[arg(long)]
+    pub auto_accept: bool,
+
     /// Use plain HTTP instead of HTTPS. LocalSend uses HTTPS by default (matching
     /// the official app); pass this for easy interop/testing with HTTP-only peers.
     #[cfg(feature = "https")]
@@ -26,9 +34,15 @@ pub async fn execute(command: TuiCommand) -> anyhow::Result<()> {
     #[cfg(not(feature = "https"))]
     let https = false;
 
-    crate::tui::run_tui(command.port, command.alias, https)
-        .await
-        .map_err(|e| anyhow::anyhow!("TUI error: {}", e))
+    crate::tui::run_tui(
+        command.port,
+        command.alias,
+        https,
+        command.pin,
+        command.auto_accept,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("TUI error: {}", e))
 }
 
 #[cfg(all(test, feature = "https"))]

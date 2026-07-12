@@ -252,6 +252,9 @@ pub struct ReceivedFile {
     pub time: String,
     /// Absolute path the file was written to (post-collision-rename).
     pub path: std::path::PathBuf,
+    /// Present when the item is a text message; the inbox shows this inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_text: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
