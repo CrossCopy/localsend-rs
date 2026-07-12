@@ -262,7 +262,12 @@ impl SendFileScreen {
         }
 
         // Help text
-        let help = if self.selected_device.is_some() && !self.is_sending {
+        let help = if self.is_sending {
+            Line::from(vec![
+                Span::styled(" Esc ", THEME.key),
+                Span::styled(" Cancel ", THEME.key_desc),
+            ])
+        } else if self.selected_device.is_some() {
             Line::from(vec![
                 Span::styled(" Enter ", THEME.key),
                 Span::styled(" Send ", THEME.key_desc),
