@@ -1,7 +1,5 @@
 use super::state::{ServerState, write_body_to_file};
-use crate::protocol::{
-    DeviceInfo, FileId, PrepareUploadRequest, PrepareUploadResponse, ReceivedFile, SessionId,
-};
+use crate::protocol::{DeviceInfo, FileId, PrepareUploadRequest, PrepareUploadResponse, SessionId};
 use axum::{
     Json,
     body::Body,
@@ -164,14 +162,19 @@ pub(crate) async fn handle_prepare_upload(
     if is_message {
         let mut state = state_ref.write().await;
 
-        // Save accepted messages to files and update TUI list
+        // Save accepted messages to files. M1 fix: this branch used to save
+        // the message with no ServerEvent at all, so a received text
+        // message was written to disk but never reached the CLI event loop
+        // or the TUI Inbox. Emit the same FileReceived/SessionDone pair
+        // `handle_upload` emits for real files, against the session built
+        // above for this request, so consumers see text messages the same
+        // way they see file transfers.
         for (file_id, file) in &request.files {
             if !accepted_ids.contains(file_id) {
                 continue;
             }
             if let Some(content) = &file.preview {
                 let now = Local::now();
-                let time_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
                 let filename = format!(
                     "message_{}_{}.txt",
                     now.format("%Y%m%d_%H%M%S"),
@@ -189,17 +192,34 @@ pub(crate) async fn handle_prepare_upload(
                 } else {
                     tracing::info!("Saved message to {:?}", path);
 
-                    // Update TUI list
-                    let mut files_list = state.received_files.write().await;
-                    files_list.push(ReceivedFile {
-                        file_name: filename,
-                        size: content.len() as u64,
-                        sender: request.info.alias.clone(),
-                        time: time_str,
-                    });
+                    // Events must never block the request path: `try_send`,
+                    // not `.send().await` (matches handle_upload). Report
+                    // the *final* on-disk name -- unique_save_path may have
+                    // renamed the file on collision, and a consumer needs
+                    // to see where the bytes actually went.
+                    let final_file_name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| filename.clone());
+                    let _ = state.events_tx.try_send(
+                        crate::server::events::ServerEvent::FileReceived {
+                            session_id: session_id.clone(),
+                            file_id: file_id.clone(),
+                            file_name: final_file_name,
+                            path,
+                            size: content.len() as u64,
+                            sender_alias: request.info.alias.clone(),
+                        },
+                    );
                 }
             }
         }
+
+        let _ = state
+            .events_tx
+            .try_send(crate::server::events::ServerEvent::SessionDone {
+                session_id: session_id.clone(),
+            });
 
         state.current_session = None;
         return StatusCode::NO_CONTENT.into_response();
@@ -298,18 +318,6 @@ pub(crate) async fn handle_upload(
 
     // Reacquire lock for state updates
     let mut state = state_ref.write().await;
-
-    // Update TUI list
-    {
-        let time_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut files_list = state.received_files.write().await;
-        files_list.push(ReceivedFile {
-            file_name: file_name.clone(),
-            size: body_len,
-            sender: sender_alias.clone(),
-            time: time_str,
-        });
-    }
 
     // The write above was lock-free and may have taken a long time (large /
     // multi-GB files). The session validated before the write started may

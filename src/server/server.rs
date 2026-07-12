@@ -1,6 +1,6 @@
 use super::events::ServerEvent;
 use super::state::{ProgressCallback, ServerState};
-use crate::protocol::{DeviceInfo, Protocol, ReceivedFile};
+use crate::protocol::{DeviceInfo, Protocol};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +20,6 @@ pub struct LocalSendServer {
     https: bool,
     #[cfg(feature = "https")]
     tls_cert: Option<crate::crypto::TlsCertificate>,
-    received_files: Arc<RwLock<Vec<ReceivedFile>>>,
     events_rx: Option<mpsc::Receiver<ServerEvent>>,
     auto_accept: bool,
     accept_timeout: Duration,
@@ -47,7 +46,6 @@ impl LocalSendServer {
             https,
             #[cfg(feature = "https")]
             tls_cert: None,
-            received_files: Arc::new(RwLock::new(Vec::new())),
             events_rx: None,
             auto_accept,
             accept_timeout,
@@ -135,7 +133,6 @@ impl LocalSendServer {
                     current_session: None,
                     save_dir: self.save_dir.clone(),
                     _progress_callback: progress_callback,
-                    received_files: self.received_files.clone(),
                     events_tx,
                     auto_accept: self.auto_accept,
                     accept_timeout: self.accept_timeout,
@@ -190,7 +187,6 @@ impl LocalSendServer {
                 current_session: None,
                 save_dir: self.save_dir.clone(),
                 _progress_callback: progress_callback,
-                received_files: self.received_files.clone(),
                 events_tx,
                 auto_accept: self.auto_accept,
                 accept_timeout: self.accept_timeout,
