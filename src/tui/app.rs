@@ -31,7 +31,7 @@ use tokio::time::Duration;
 use tui_input::backend::crossterm::EventHandler;
 
 /// Which send flow a background task belongs to, so its result updates the right screen.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendKind {
     File,
     Text,
@@ -324,13 +324,20 @@ impl App {
         while let Ok(ev) = rx.try_recv() {
             self.dirty = true; // any server event may change what's on screen
             match ev {
-                ServerEvent::TransferRequest(request) => {
-                    if self.popup.is_none() {
+                ServerEvent::TransferRequest(request) => match self.popup {
+                    // Free slot: show the confirm dialog.
+                    None => self.popup = Some(Popup::confirm(request)),
+                    // A PIN prompt is deferrable — an incoming transfer takes the
+                    // slot so we don't decline a peer just because our own send
+                    // is waiting on a PIN. The PIN prompt reopens via
+                    // `maybe_open_pin_prompt` once this dialog is answered.
+                    Some(Popup::PinEntry { .. }) => {
                         self.popup = Some(Popup::confirm(request));
-                    } else {
-                        request.decline(); // busy with another dialog
                     }
-                }
+                    // Already showing another dialog (an incoming confirm, a
+                    // message): stay busy and decline the new request.
+                    Some(_) => request.decline(),
+                },
                 ServerEvent::FileReceived {
                     file_name,
                     path,
@@ -1180,6 +1187,38 @@ mod tests {
         app.pending_pin_kind = None;
         app.maybe_open_pin_prompt();
         assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn incoming_transfer_preempts_an_open_pin_prompt() {
+        use crate::protocol::{DeviceInfo, Protocol};
+        use crate::server::events::{PendingRequest, ServerEvent};
+        use std::collections::HashMap;
+
+        let mut app = test_app();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        app.events_rx = Some(rx);
+        // A PIN prompt is up (our own send is waiting on a PIN).
+        app.pending_pin_kind = Some(SendKind::File);
+        app.popup = Some(Popup::PinEntry {
+            input: tui_input::Input::default(),
+        });
+
+        let sender = DeviceInfo::new("peer".to_string(), 53317, Protocol::Http);
+        let (req, mut decision_rx) = PendingRequest::new(sender, HashMap::new());
+        tx.try_send(ServerEvent::TransferRequest(req)).unwrap();
+
+        app.poll_server_events();
+
+        // The incoming confirm dialog takes the slot instead of being declined,
+        // and the deferred PIN is still pending (reopens once this is answered).
+        assert!(matches!(app.popup, Some(Popup::TransferConfirm(_))));
+        assert_eq!(app.pending_pin_kind, Some(SendKind::File));
+        // The request was NOT answered (no decision delivered yet).
+        assert!(matches!(
+            decision_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
