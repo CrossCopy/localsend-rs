@@ -17,9 +17,11 @@ pub struct ReceiveCommand {
     #[arg(long)]
     auto_accept: bool,
 
+    /// Use plain HTTP instead of HTTPS. LocalSend uses HTTPS by default (matching
+    /// the official app); pass this for easy interop/testing with HTTP-only peers.
     #[cfg(feature = "https")]
     #[arg(long)]
-    https: bool,
+    no_https: bool,
 }
 
 pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
@@ -43,13 +45,14 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "https")]
-    let https_enabled = command.https;
+    let https_enabled = !command.no_https;
     #[cfg(not(feature = "https"))]
     let https_enabled = false;
 
-    if https_enabled {
-        println!("HTTPS mode ENABLED");
-    }
+    println!(
+        "Transport: {}",
+        if https_enabled { "HTTPS" } else { "HTTP" }
+    );
 
     let protocol_enum = if https_enabled {
         crate::protocol::Protocol::Https
