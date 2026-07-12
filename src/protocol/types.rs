@@ -250,6 +250,8 @@ pub struct ReceivedFile {
     pub size: u64,
     pub sender: String,
     pub time: String,
+    /// Absolute path the file was written to (post-collision-rename).
+    pub path: std::path::PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

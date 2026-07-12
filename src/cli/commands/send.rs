@@ -15,6 +15,8 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(name = "send", about = "Send files to a LocalSend device")]
 pub struct SendCommand {
+    /// Target device: an IP or hostname (default port 53317), `host:port`,
+    /// `[ipv6]:port`, or a discovered device alias.
     target: String,
 
     #[arg(required = true)]
@@ -144,11 +146,52 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Split a `host` / `host:port` target into its host and optional explicit port.
+///
+/// Bracketed IPv6 (`[::1]:53317`) is supported. A bare, unbracketed string with
+/// more than one `:` is treated as a host with no port (so raw IPv6 literals like
+/// `fe80::1` aren't mis-split on their internal colons).
+fn split_host_port(target: &str) -> (String, Option<u16>) {
+    // Bracketed IPv6: [host] or [host]:port
+    if let Some(rest) = target.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            return (host.to_string(), port);
+        }
+        return (target.to_string(), None);
+    }
+
+    match target.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => {
+            if port.is_empty() {
+                // Trailing colon ("host:") → host with no port.
+                (host.to_string(), None)
+            } else {
+                match port.parse::<u16>() {
+                    // Exactly one colon and a numeric tail → host:port.
+                    Ok(p) => (host.to_string(), Some(p)),
+                    // Non-numeric tail: keep the whole string as the host (it may
+                    // be an alias that legitimately contains a colon).
+                    Err(_) => (target.to_string(), None),
+                }
+            }
+        }
+        // Zero colons, or a bare IPv6 literal (multiple colons) → host only.
+        _ => (target.to_string(), None),
+    }
+}
+
 async fn resolve_target(target: &str) -> anyhow::Result<DeviceInfo> {
-    // 1. Try if target is an IP address
-    if let Ok(ip) = target.parse::<IpAddr>() {
-        println!("Target is an IP address, probing directly...");
-        if let Ok(device) = probe_device(ip.to_string()).await {
+    let (host, explicit_port) = split_host_port(target);
+    let port = explicit_port.unwrap_or(crate::protocol::constants::DEFAULT_HTTP_PORT);
+
+    // 1. Try if host is an IP address
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        println!(
+            "Target is an IP address, probing {}:{} directly...",
+            ip, port
+        );
+        if let Ok(device) = probe_device(ip.to_string(), port).await {
             return Ok(device);
         }
         println!("Direct probe failed, falling back to discovery...");
@@ -163,13 +206,15 @@ async fn resolve_target(target: &str) -> anyhow::Result<DeviceInfo> {
 
     let found_device = std::sync::Arc::new(std::sync::Mutex::new(None as Option<DeviceInfo>));
     let found_device_clone = found_device.clone();
-    let target_owned = target.to_string();
+    let host_owned = host.clone();
 
     discovery.on_discovered(move |device: DeviceInfo| {
-        let matches_alias = device.alias == target_owned;
-        let matches_ip = device.ip.as_deref() == Some(&target_owned);
+        let matches_alias = device.alias == host_owned;
+        let matches_ip = device.ip.as_deref() == Some(host_owned.as_str());
+        // If the user pinned a port, require it too; otherwise match on alias/ip alone.
+        let matches_port = explicit_port.is_none_or(|p| device.port == p);
 
-        if matches_alias || matches_ip {
+        if (matches_alias || matches_ip) && matches_port {
             let mut found = found_device_clone.lock().unwrap();
             if found.is_none() {
                 *found = Some(device);
@@ -200,33 +245,86 @@ async fn resolve_target(target: &str) -> anyhow::Result<DeviceInfo> {
     }
 }
 
-async fn probe_device(ip: String) -> anyhow::Result<DeviceInfo> {
+async fn probe_device(ip: String, port: u16) -> anyhow::Result<DeviceInfo> {
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(2))
         .build()?;
 
     // Try HTTPS first
-    let url = format!("https://{}:53317/api/localsend/v2/info", ip);
+    let url = format!("https://{}:{}/api/localsend/v2/info", ip, port);
     if let Ok(resp) = client.get(&url).send().await
         && resp.status().is_success()
     {
         let mut device: DeviceInfo = resp.json().await?;
         device.ip = Some(ip.clone());
+        device.port = port;
         device.protocol = crate::protocol::Protocol::Https; // Ensure protocol is set matches what we used
         return Ok(device);
     }
 
     // Try HTTP
-    let url = format!("http://{}:53317/api/localsend/v2/info", ip);
+    let url = format!("http://{}:{}/api/localsend/v2/info", ip, port);
     if let Ok(resp) = client.get(&url).send().await
         && resp.status().is_success()
     {
         let mut device: DeviceInfo = resp.json().await?;
         device.ip = Some(ip.clone());
+        device.port = port;
         device.protocol = crate::protocol::Protocol::Http;
         return Ok(device);
     }
 
-    anyhow::bail!("Failed to probe device at {}", ip)
+    anyhow::bail!("Failed to probe device at {}:{}", ip, port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_host_port;
+
+    #[test]
+    fn bare_ipv4_has_no_port() {
+        assert_eq!(split_host_port("127.0.0.1"), ("127.0.0.1".into(), None));
+    }
+
+    #[test]
+    fn ipv4_with_port() {
+        assert_eq!(
+            split_host_port("127.0.0.1:53666"),
+            ("127.0.0.1".into(), Some(53666))
+        );
+    }
+
+    #[test]
+    fn bare_hostname_and_hostname_with_port() {
+        assert_eq!(split_host_port("mybox"), ("mybox".into(), None));
+        assert_eq!(split_host_port("mybox:1234"), ("mybox".into(), Some(1234)));
+    }
+
+    #[test]
+    fn non_numeric_port_is_treated_as_host() {
+        // Not a valid port → keep the whole string as the host, no port.
+        assert_eq!(split_host_port("host:abc"), ("host:abc".into(), None));
+    }
+
+    #[test]
+    fn trailing_colon_drops_to_host() {
+        assert_eq!(split_host_port("host:"), ("host".into(), None));
+    }
+
+    #[test]
+    fn out_of_range_port_is_treated_as_host() {
+        assert_eq!(split_host_port("host:99999"), ("host:99999".into(), None));
+    }
+
+    #[test]
+    fn bare_ipv6_is_not_split_on_internal_colons() {
+        assert_eq!(split_host_port("fe80::1"), ("fe80::1".into(), None));
+    }
+
+    #[test]
+    fn bracketed_ipv6_with_and_without_port() {
+        assert_eq!(split_host_port("[::1]:53317"), ("::1".into(), Some(53317)));
+        assert_eq!(split_host_port("[::1]"), ("::1".into(), None));
+    }
 }

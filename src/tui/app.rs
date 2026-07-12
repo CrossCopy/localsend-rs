@@ -30,6 +30,33 @@ use tokio::sync::RwLock;
 use tokio::time::Duration;
 use tui_input::backend::crossterm::EventHandler;
 
+/// Which send flow a background task belongs to, so its result updates the right screen.
+#[derive(Debug, Clone, Copy)]
+enum SendKind {
+    File,
+    Text,
+}
+
+/// Progress and completion reported by a spawned send task back to the UI loop.
+/// Send tasks run detached; without this channel a failure was silently swallowed
+/// (`let _ = send_file(...).await`) and the progress gauge never moved.
+#[derive(Debug)]
+enum SendUpdate {
+    /// Cumulative bytes sent for the in-flight file upload.
+    Progress {
+        generation: u64,
+        sent: u64,
+        total: u64,
+    },
+    /// The send finished. `error` is `None` on success, or the failure reason.
+    Finished {
+        generation: u64,
+        kind: SendKind,
+        label: String,
+        error: Option<String>,
+    },
+}
+
 /// Main TUI application state.
 pub struct App {
     // Mode
@@ -62,6 +89,14 @@ pub struct App {
     // Background services
     discovery: Option<MulticastDiscovery>,
     server: Option<LocalSendServer>,
+
+    // Back-channel from spawned send tasks (progress + result).
+    send_tx: tokio::sync::mpsc::UnboundedSender<SendUpdate>,
+    send_rx: tokio::sync::mpsc::UnboundedReceiver<SendUpdate>,
+    // Bumped whenever a send starts or is cancelled; updates from an older
+    // generation (a cancelled/abandoned task) are ignored so they can't clobber
+    // a newer send or wedge `is_sending`.
+    send_generation: u64,
 }
 
 impl App {
@@ -90,6 +125,7 @@ impl App {
         let save_dir = PathBuf::from("./downloads");
         let devices = Arc::new(RwLock::new(Vec::new()));
         let received_files = Arc::new(RwLock::new(Vec::new()));
+        let (send_tx, send_rx) = tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
             should_quit: false,
@@ -105,11 +141,14 @@ impl App {
 
             send_text: SendTextScreen::new(devices.clone()),
             send_file: SendFileScreen::new(devices.clone()),
-            receive: ReceiveScreen::new(received_files.clone(), port),
+            receive: ReceiveScreen::new(received_files.clone(), port, save_dir.clone()),
             settings: SettingsScreen::new(device_info, save_dir.to_string_lossy().into_owned()),
             status_message: None,
             discovery: None,
             server: None,
+            send_tx,
+            send_rx,
+            send_generation: 0,
         })
     }
 
@@ -128,6 +167,9 @@ impl App {
 
             // Check for pending transfers (popup trigger)
             self.poll_server_events();
+
+            // Apply progress/results from background send tasks.
+            self.poll_send_updates();
 
             // Handle events with timeout
             if event::poll(tick_rate)?
@@ -217,6 +259,7 @@ impl App {
                 }
                 ServerEvent::FileReceived {
                     file_name,
+                    path,
                     size,
                     sender_alias,
                     ..
@@ -229,9 +272,55 @@ impl App {
                             size,
                             sender: sender_alias,
                             time: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                            path,
                         });
                 }
-                ServerEvent::SessionDone { .. } => {}
+                ServerEvent::SessionDone { .. } => {
+                    self.status_message =
+                        Some(("✓ Transfer complete".to_string(), MessageLevel::Success));
+                }
+            }
+        }
+    }
+
+    /// Drain progress/results from background send tasks and reflect them in the UI.
+    /// Updates from a superseded generation (a cancelled send) are dropped.
+    fn poll_send_updates(&mut self) {
+        while let Ok(update) = self.send_rx.try_recv() {
+            match update {
+                SendUpdate::Progress {
+                    generation,
+                    sent,
+                    total,
+                } => {
+                    if generation != self.send_generation {
+                        continue;
+                    }
+                    let ratio = if total > 0 {
+                        (sent as f64 / total as f64).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    self.send_file.progress = ratio;
+                }
+                SendUpdate::Finished {
+                    generation,
+                    kind,
+                    label,
+                    error,
+                } => {
+                    if generation != self.send_generation {
+                        continue; // a cancelled/superseded send — ignore its result
+                    }
+                    match kind {
+                        SendKind::File => self.send_file.clear(),
+                        SendKind::Text => self.send_text.clear(),
+                    }
+                    self.status_message = Some(match error {
+                        None => (format!("✓ Sent {label}"), MessageLevel::Success),
+                        Some(reason) => (format!("✗ Send failed: {reason}"), MessageLevel::Error),
+                    });
+                }
             }
         }
     }
@@ -380,25 +469,43 @@ impl App {
                 _ => {}
             },
             SendTextStage::EnterMessage => match key {
-                KeyCode::Esc => self.send_text.stage = SendTextStage::SelectDevice,
+                KeyCode::Esc => {
+                    // Leaving cancels any in-flight send (its result is ignored).
+                    if self.send_text.is_sending {
+                        self.send_generation = self.send_generation.wrapping_add(1);
+                        self.send_text.is_sending = false;
+                        self.status_message = Some(("Send cancelled".into(), MessageLevel::Info));
+                    }
+                    self.send_text.stage = SendTextStage::SelectDevice;
+                }
                 KeyCode::Enter => {
+                    if self.send_text.is_sending {
+                        return; // a send is already in flight
+                    }
                     if let Some(target) = &self.send_text.selected_device
                         && !self.send_text.message().is_empty()
                     {
                         let message = self.send_text.message().to_string();
                         let target = target.clone();
                         let device_info = self.device_info.clone();
+                        let tx = self.send_tx.clone();
+                        self.send_generation = self.send_generation.wrapping_add(1);
+                        let generation = self.send_generation;
 
                         self.send_text.is_sending = true;
+                        self.status_message =
+                            Some(("Sending message...".into(), MessageLevel::Info));
 
                         tokio::spawn(async move {
                             let client = LocalSendClient::new(device_info);
-                            let _ = send_text_message(&client, &target, &message).await;
+                            let result = send_text_message(&client, &target, &message).await;
+                            let _ = tx.send(SendUpdate::Finished {
+                                generation,
+                                kind: SendKind::Text,
+                                label: "message".to_string(),
+                                error: result.err().map(|e| e.to_string()),
+                            });
                         });
-
-                        self.send_text.clear();
-                        self.status_message =
-                            Some(("Sending message...".into(), MessageLevel::Info));
                     }
                 }
                 _ => {
@@ -425,8 +532,19 @@ impl App {
                 _ => {}
             },
             SendFileStage::EnterFilePath => match key {
-                KeyCode::Esc => self.send_file.stage = SendFileStage::SelectDevice,
+                KeyCode::Esc => {
+                    // Leaving cancels any in-flight send (its result is ignored),
+                    // so a stalled upload never wedges the screen.
+                    if self.send_file.is_sending {
+                        self.send_generation = self.send_generation.wrapping_add(1);
+                        self.status_message = Some(("Send cancelled".into(), MessageLevel::Info));
+                    }
+                    self.send_file.clear();
+                }
                 KeyCode::Enter => {
+                    if self.send_file.is_sending {
+                        return; // a send is already in flight
+                    }
                     if let Some(target) = &self.send_file.selected_device
                         && !self.send_file.file_path().is_empty()
                     {
@@ -434,24 +552,49 @@ impl App {
                         if file_path.exists() {
                             let target = target.clone();
                             let device_info = self.device_info.clone();
+                            let tx = self.send_tx.clone();
+                            self.send_generation = self.send_generation.wrapping_add(1);
+                            let generation = self.send_generation;
+                            let label = file_path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "file".to_string());
 
+                            // Keep the sending screen (with the gauge) up; the Finished
+                            // update clears it. Don't clear() here or the gauge never shows.
                             self.send_file.is_sending = true;
+                            self.send_file.progress = 0.0;
+                            self.send_file.current_file = Some(label.clone());
+                            self.status_message =
+                                Some((format!("Sending {label}..."), MessageLevel::Info));
 
                             tokio::spawn(async move {
                                 let client = LocalSendClient::new(device_info);
-                                let _ = send_file(&client, &target, &file_path).await;
+                                let tx_prog = tx.clone();
+                                let cb: crate::client::client::ProgressCallback =
+                                    Box::new(move |sent, total, _elapsed| {
+                                        let _ = tx_prog.send(SendUpdate::Progress {
+                                            generation,
+                                            sent,
+                                            total,
+                                        });
+                                    });
+                                let result =
+                                    send_file(&client, &target, &file_path, Some(cb)).await;
+                                let _ = tx.send(SendUpdate::Finished {
+                                    generation,
+                                    kind: SendKind::File,
+                                    label,
+                                    error: result.err().map(|e| e.to_string()),
+                                });
                             });
-
-                            self.send_file.clear();
-                            self.status_message =
-                                Some(("Sending file...".into(), MessageLevel::Info));
                         } else {
                             self.status_message =
                                 Some(("File not found".into(), MessageLevel::Error));
                         }
                     }
                 }
-                _ => {
+                _ if !self.send_file.is_sending => {
                     self.send_file
                         .input
                         .handle_event(&Event::Key(event::KeyEvent::new(
@@ -459,6 +602,7 @@ impl App {
                             event::KeyModifiers::NONE,
                         )));
                 }
+                _ => {}
             },
         }
     }
@@ -616,11 +760,12 @@ async fn send_text_message(
     Ok(())
 }
 
-/// Send a file to a device.
+/// Send a file to a device, reporting per-chunk progress through `progress`.
 async fn send_file(
     client: &LocalSendClient,
     target: &DeviceInfo,
     file_path: &Path,
+    progress: Option<crate::client::client::ProgressCallback>,
 ) -> anyhow::Result<()> {
     use crate::core::file::build_file_metadata;
 
@@ -631,18 +776,20 @@ async fn send_file(
 
     let response = client.prepare_upload(target, files, None).await?;
 
-    if let Some(token) = response.files.get(&metadata.id) {
-        client
-            .upload_file(
-                target,
-                &response.session_id,
-                &metadata.id,
-                token,
-                file_path,
-                None,
-            )
-            .await?;
-    }
+    let token = response.files.get(&metadata.id).ok_or_else(|| {
+        anyhow::anyhow!("receiver declined the file (no upload token was issued)")
+    })?;
+
+    client
+        .upload_file(
+            target,
+            &response.session_id,
+            &metadata.id,
+            token,
+            file_path,
+            progress,
+        )
+        .await?;
 
     Ok(())
 }

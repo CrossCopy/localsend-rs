@@ -251,41 +251,44 @@ pub(crate) async fn handle_upload(
     let state = state_ref.write().await;
 
     // Verify session
-    let (file_name, session_id, sender_alias) = if let Some(session) = &state.current_session {
-        if session.id != params.session_id {
-            tracing::warn!(
-                "Upload rejected: Session ID mismatch. Expected {}, got {}",
-                session.id,
-                params.session_id
-            );
-            return StatusCode::FORBIDDEN.into_response();
-        }
+    let (file_name, session_id, sender_alias, declared_size, declared_sha) =
+        if let Some(session) = &state.current_session {
+            if session.id != params.session_id {
+                tracing::warn!(
+                    "Upload rejected: Session ID mismatch. Expected {}, got {}",
+                    session.id,
+                    params.session_id
+                );
+                return StatusCode::FORBIDDEN.into_response();
+            }
 
-        // Verify token against the session's random per-file token (R6) --
-        // never re-derive it, only compare against what was issued.
-        if !session.verify_token(&params.file_id, &params.token) {
-            tracing::warn!("Upload rejected: Token mismatch");
-            return StatusCode::FORBIDDEN.into_response();
-        }
+            // Verify token against the session's random per-file token (R6) --
+            // never re-derive it, only compare against what was issued.
+            if !session.verify_token(&params.file_id, &params.token) {
+                tracing::warn!("Upload rejected: Token mismatch");
+                return StatusCode::FORBIDDEN.into_response();
+            }
 
-        // Find file metadata
-        if let Some(meta) = session.files.get(&params.file_id) {
-            (
-                meta.file_name.clone(),
-                session.id.clone(),
-                session.sender_alias.clone(),
-            )
+            // Find file metadata
+            if let Some(meta) = session.files.get(&params.file_id) {
+                (
+                    meta.file_name.clone(),
+                    session.id.clone(),
+                    session.sender_alias.clone(),
+                    meta.size,
+                    meta.sha256.clone(),
+                )
+            } else {
+                tracing::warn!(
+                    "Upload rejected: File ID {} not found in session",
+                    params.file_id
+                );
+                return StatusCode::NOT_FOUND.into_response();
+            }
         } else {
-            tracing::warn!(
-                "Upload rejected: File ID {} not found in session",
-                params.file_id
-            );
-            return StatusCode::NOT_FOUND.into_response();
-        }
-    } else {
-        tracing::warn!("Upload rejected: No active session");
-        return StatusCode::FORBIDDEN.into_response();
-    };
+            tracing::warn!("Upload rejected: No active session");
+            return StatusCode::FORBIDDEN.into_response();
+        };
 
     let save_path = match crate::core::unique_save_path(&state.save_dir, &file_name) {
         Ok(path) => path,
@@ -313,6 +316,49 @@ pub(crate) async fn handle_upload(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+
+    // Validate the received bytes against the metadata declared in
+    // prepare-upload. A truncated body (network cut, or a misbehaving client
+    // that illegally splits the upload into multiple POSTs) would otherwise
+    // be saved as a partial file and the session wrongly marked complete.
+    // On any mismatch: discard the partial, return 500 ("Unknown error by
+    // receiver", per the LocalSend v2.1 spec's upload error table), and leave
+    // the session untouched so it is neither recorded nor completed -- the
+    // sender can retry the same file id against the still-open session.
+    if body_len != declared_size {
+        tracing::warn!(
+            "Upload size mismatch for {:?}: declared {} bytes, received {} bytes; discarding partial",
+            save_path,
+            declared_size,
+            body_len
+        );
+        let _ = tokio::fs::remove_file(&save_path).await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // When the sender advertised a sha256, verify the bytes on disk match it
+    // (case-insensitive hex). Size can be right while the contents are
+    // corrupt; reject those the same way.
+    if let Some(expected_sha) = declared_sha {
+        match crate::sha256_from_file(&save_path).await {
+            Ok(actual) if actual.eq_ignore_ascii_case(&expected_sha) => {}
+            Ok(actual) => {
+                tracing::warn!(
+                    "Upload sha256 mismatch for {:?}: declared {}, computed {}; discarding",
+                    save_path,
+                    expected_sha,
+                    actual
+                );
+                let _ = tokio::fs::remove_file(&save_path).await;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Err(e) => {
+                tracing::error!("Failed to hash uploaded file {:?}: {}", save_path, e);
+                let _ = tokio::fs::remove_file(&save_path).await;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
 
     tracing::info!("Received file: {:?} for session {}", save_path, session_id);
 

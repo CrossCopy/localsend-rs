@@ -76,11 +76,14 @@ cargo run --features https -- discover
 
 ### 2. Receive Files
 
-Start the receiver server (HTTPS recommended for compatibility):
+Start the receiver server (HTTPS is the default, matching the official app):
 
 ```bash
-# Start receiving on default port (53317)
-cargo run --features https -- receive --https
+# Start receiving on default port (53317), HTTPS by default
+cargo run --features https -- receive
+
+# Use plain HTTP for interop/testing with HTTP-only peers
+cargo run --features https -- receive --no-https
 ```
 
 ### 3. Send Files
@@ -91,8 +94,9 @@ Send a file to a device by its alias or IP:
 # Send by alias
 cargo run --features https -- send "My Phone" ./photos/vacation.jpg
 
-# Send by IP address (bypasses discovery)
+# Send by IP address (bypasses discovery); host:port for a non-default port
 cargo run --features https -- send 192.168.1.50 ./documents/report.pdf
+cargo run --features https -- send 192.168.1.50:53318 ./documents/report.pdf
 ```
 
 ### 4. Send Text Messages
@@ -125,7 +129,7 @@ Find devices on the local network.
 Start a LocalSend server to accept incoming transfers.
 
 - `--port <PORT>`: Custom port (default: 53317).
-- `--https`: Enable TLS encryption (highly recommended).
+- `--no-https`: Use plain HTTP instead of the default HTTPS.
 - `--alias <NAME>`: Custom device name shown to others.
 - `--directory <PATH>`: Save directory for received files (default: `./downloads`).
 
@@ -141,8 +145,12 @@ Send data to another device.
 
 Launch the interactive terminal-based UI for file transfers.
 
+- `--port <PORT>`: Custom port (default: 53317).
+- `--no-https`: Use plain HTTP instead of the default HTTPS.
+- `--alias <NAME>`: Custom device name shown to others.
+
 ```bash
-# With all features enabled
+# With all features enabled (HTTPS by default)
 cargo run --features all -- tui
 ```
 
