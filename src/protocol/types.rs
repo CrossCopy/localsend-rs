@@ -116,8 +116,9 @@ impl Default for FileId {
 pub struct Token(String);
 
 impl Token {
-    pub fn new(session_id: &SessionId, file_id: &FileId) -> Self {
-        Self(format!("{}_{}", session_id.as_str(), file_id.as_str()))
+    /// Random per-file upload token (128-bit, hex).
+    pub fn random() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
     }
 
     pub fn from_string(s: String) -> Self {

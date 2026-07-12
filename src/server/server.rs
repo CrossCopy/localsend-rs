@@ -15,6 +15,7 @@ pub struct LocalSendServer {
     device: DeviceInfo,
     save_dir: PathBuf,
     handle: Option<JoinHandle<()>>,
+    sweep_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     https: bool,
     #[cfg(feature = "https")]
@@ -41,6 +42,7 @@ impl LocalSendServer {
             device,
             save_dir,
             handle: None,
+            sweep_handle: None,
             shutdown_tx: None,
             https,
             #[cfg(feature = "https")]
@@ -166,6 +168,7 @@ impl LocalSendServer {
                 });
 
                 self.handle = Some(handle);
+                self.sweep_handle = Some(spawn_session_sweep(state));
                 Ok(())
             }
             #[cfg(not(feature = "https"))]
@@ -210,6 +213,7 @@ impl LocalSendServer {
             });
 
             self.handle = Some(handle);
+            self.sweep_handle = Some(spawn_session_sweep(state));
             Ok(())
         }
     }
@@ -218,10 +222,33 @@ impl LocalSendServer {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(handle) = self.sweep_handle.take() {
+            handle.abort();
+        }
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
     }
+}
+
+/// Every 60s, reclaim a session that's been idle past its 300s TTL (R5: a
+/// sender that vanishes mid-transfer must not permanently wedge the single
+/// upload slot). The lock is only held for the duration of the check itself
+/// -- no `.await` happens while it's held.
+fn spawn_session_sweep(state: Arc<RwLock<ServerState>>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let mut s = state.write().await;
+            if let Some(session) = &s.current_session
+                && session.is_timed_out(300)
+            {
+                tracing::info!("Sweeping timed-out session {}", session.id);
+                s.current_session = None;
+            }
+        }
+    })
 }
 
 /// Builder for [`LocalSendServer`]; the canonical construction path.

@@ -1,5 +1,5 @@
 use crate::protocol::{FileId, FileMetadata, SessionId, Token};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 /// Active file transfer session
@@ -8,6 +8,7 @@ pub struct Session {
     pub id: SessionId,
     pub files: HashMap<FileId, FileMetadata>,
     pub tokens: HashMap<FileId, Token>,
+    pub received: HashSet<FileId>,
     pub sender_alias: String,
     pub created_at: Instant,
     pub last_activity: Instant,
@@ -19,16 +20,18 @@ impl Session {
         let id = SessionId::new();
         let now = Instant::now();
 
-        // Generate tokens for each file
+        // Generate a random, per-file token -- must not be derivable from the
+        // session/file ids (guessable tokens would let anyone upload).
         let tokens = files
             .keys()
-            .map(|file_id| (file_id.clone(), Token::new(&id, file_id)))
+            .map(|file_id| (file_id.clone(), Token::random()))
             .collect();
 
         Self {
             id,
             files,
             tokens,
+            received: HashSet::new(),
             sender_alias,
             created_at: now,
             last_activity: now,
@@ -58,10 +61,11 @@ impl Session {
         self.tokens.get(file_id)
     }
 
-    /// Check if all files have been uploaded
-    pub fn is_complete(&self, uploaded_files: &[FileId]) -> bool {
-        self.files.len() == uploaded_files.len()
-            && uploaded_files.iter().all(|id| self.files.contains_key(id))
+    /// Record a completed file. Returns true when every file has arrived.
+    pub fn mark_received(&mut self, file_id: &FileId) -> bool {
+        self.received.insert(file_id.clone());
+        self.last_activity = Instant::now();
+        self.received.len() == self.files.len()
     }
 }
 
@@ -136,20 +140,27 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_check() {
+    fn tokens_are_random_not_derived() {
         let files = create_test_files();
-        let file_ids: Vec<FileId> = files.keys().cloned().collect();
-        let session = Session::new("Test".to_string(), files);
+        let s1 = Session::new("A".to_string(), files.clone());
+        let s2 = Session::new("A".to_string(), files.clone());
+        let id = files.keys().next().unwrap();
+        // Different sessions must produce different tokens for the same file id,
+        // and a token must not embed the session/file ids.
+        let t1 = s1.get_token(id).unwrap().as_str().to_string();
+        let t2 = s2.get_token(id).unwrap().as_str().to_string();
+        assert_ne!(t1, t2);
+        assert!(!t1.contains(id.as_str()));
+    }
 
-        // Not complete with empty list
-        assert!(!session.is_complete(&[]));
-
-        // Complete with all files
-        assert!(session.is_complete(&file_ids));
-
-        // Not complete with extra file
-        let mut extra_ids = file_ids.clone();
-        extra_ids.push(FileId::new());
-        assert!(!session.is_complete(&extra_ids));
+    #[test]
+    fn mark_received_reports_all_done() {
+        let mut files = create_test_files();
+        let second = FileId::new();
+        files.insert(second.clone(), files.values().next().unwrap().clone());
+        let ids: Vec<FileId> = files.keys().cloned().collect();
+        let mut s = Session::new("A".to_string(), files);
+        assert!(!s.mark_received(&ids[0]));
+        assert!(s.mark_received(&ids[1]));
     }
 }

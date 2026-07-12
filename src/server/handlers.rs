@@ -1,4 +1,4 @@
-use super::state::{ActiveSession, ServerState, write_body_to_file};
+use super::state::{ServerState, write_body_to_file};
 use crate::protocol::{
     DeviceInfo, FileId, PrepareUploadRequest, PrepareUploadResponse, ReceivedFile, SessionId,
 };
@@ -41,8 +41,6 @@ pub(crate) async fn handle_prepare_upload(
     Query(params): Query<PrepareUploadParams>,
     Json(request): Json<PrepareUploadRequest>,
 ) -> Response {
-    use crate::protocol::{SessionId, Token};
-
     // PIN gate runs first, before any session/event work -- a locked-out or
     // unauthenticated peer must never reach the accept flow (which would
     // otherwise answer with 403/409 instead of the correct 401/429).
@@ -59,8 +57,6 @@ pub(crate) async fn handle_prepare_upload(
         }
     }
 
-    let session_id = SessionId::new();
-
     // Check if it's a text message (all files have non-empty preview and small size)
     let is_message = !request.files.is_empty()
         && request
@@ -68,16 +64,19 @@ pub(crate) async fn handle_prepare_upload(
             .values()
             .all(|f| f.preview.is_some() && f.size < 1024 * 1024);
 
-    // Short lock: reject a conflicting session, reserve this one, and pull out
-    // the config needed to make the accept decision. Never hold this guard
-    // across the `timeout(...).await` below -- that would deadlock every other
-    // concurrent request (including the upload that follows acceptance).
+    // Short lock: reject a conflicting session, reserve this one with a
+    // placeholder session over the *offered* files (replaced below with the
+    // real session, built from the accepted files only, once the accept
+    // decision is in), and pull out the config needed to make that decision.
+    // Never hold this guard across the `timeout(...).await` below -- that
+    // would deadlock every other concurrent request (including the upload
+    // that follows acceptance).
     let (events_tx, auto_accept, accept_timeout) = {
         let mut state = state_ref.write().await;
 
         // Check for existing session timeout (e.g. 5 minutes or session finished)
         if let Some(session) = &state.current_session {
-            if session.last_activity.elapsed().as_secs() > 300 {
+            if session.is_timed_out(300) {
                 state.current_session = None;
             } else {
                 tracing::warn!("Session already exists, rejecting new session");
@@ -85,14 +84,10 @@ pub(crate) async fn handle_prepare_upload(
             }
         }
 
-        let session = ActiveSession {
-            session_id: session_id.clone(),
-            files: request.files.clone(),
-            sender_alias: request.info.alias.clone(),
-            last_activity: std::time::Instant::now(),
-        };
-
-        state.current_session = Some(session);
+        state.current_session = Some(crate::core::Session::new(
+            request.info.alias.clone(),
+            request.files.clone(),
+        ));
 
         (
             state.events_tx.clone(),
@@ -140,20 +135,22 @@ pub(crate) async fn handle_prepare_upload(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // Build the response token map from the accepted files only, and narrow
-    // the stored session down to the same set.
-    let mut files_map = HashMap::new();
-    for file_id in &accepted_ids {
-        let token = Token::new(&session_id, file_id);
-        files_map.insert(file_id.clone(), token);
-    }
+    // Build the real session from the accepted files only -- this replaces
+    // the placeholder reservation above and generates fresh, random,
+    // per-file tokens (R6: no longer derivable from session/file ids).
+    let accepted_files: HashMap<FileId, crate::protocol::FileMetadata> = request
+        .files
+        .iter()
+        .filter(|(id, _)| accepted_ids.contains(id))
+        .map(|(id, meta)| (id.clone(), meta.clone()))
+        .collect();
+    let session = crate::core::Session::new(request.info.alias.clone(), accepted_files);
+    let session_id = session.id.clone();
+    let files_map = session.tokens.clone();
 
     {
         let mut state = state_ref.write().await;
-        if let Some(s) = &mut state.current_session {
-            s.files.retain(|id, _| accepted_ids.contains(id));
-            s.last_activity = std::time::Instant::now();
-        }
+        state.current_session = Some(session);
     }
 
     // If it's a message, return 204 No Content
@@ -227,26 +224,30 @@ pub(crate) async fn handle_upload(
     let state = state_ref.write().await;
 
     // Verify session
-    let (file_name, session_id) = if let Some(session) = &state.current_session {
-        if session.session_id != params.session_id {
+    let (file_name, session_id, sender_alias) = if let Some(session) = &state.current_session {
+        if session.id != params.session_id {
             tracing::warn!(
                 "Upload rejected: Session ID mismatch. Expected {}, got {}",
-                session.session_id,
+                session.id,
                 params.session_id
             );
             return StatusCode::FORBIDDEN.into_response();
         }
 
-        // Verify token
-        let expected_token = crate::protocol::Token::new(&session.session_id, &params.file_id);
-        if params.token.as_str() != expected_token.as_str() {
+        // Verify token against the session's random per-file token (R6) --
+        // never re-derive it, only compare against what was issued.
+        if !session.verify_token(&params.file_id, &params.token) {
             tracing::warn!("Upload rejected: Token mismatch");
             return StatusCode::FORBIDDEN.into_response();
         }
 
         // Find file metadata
         if let Some(meta) = session.files.get(&params.file_id) {
-            (meta.file_name.clone(), session.session_id.clone())
+            (
+                meta.file_name.clone(),
+                session.id.clone(),
+                session.sender_alias.clone(),
+            )
         } else {
             tracing::warn!(
                 "Upload rejected: File ID {} not found in session",
@@ -293,29 +294,43 @@ pub(crate) async fn handle_upload(
 
     // Update TUI list
     {
-        let sender = state
-            .current_session
-            .as_ref()
-            .map(|s| s.sender_alias.clone())
-            .unwrap_or_else(|| "Unknown".to_string());
         let time_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let mut files_list = state.received_files.write().await;
         files_list.push(ReceivedFile {
-            file_name,
+            file_name: file_name.clone(),
             size: body_len,
-            sender,
+            sender: sender_alias.clone(),
             time: time_str,
         });
     }
 
-    // Update last activity and check if session is complete (simple heuristic: 1 file for now)
-    // In a real LocalSend implementation, we'd wait for all files.
-    if let Some(s) = &mut state.current_session {
-        s.last_activity = std::time::Instant::now();
-        // For simplicity, we clear session after one file if it was the only one
-        if s.files.len() <= 1 {
-            state.current_session = None;
-        }
+    // Record this file as received on the (still-current) session; a
+    // multi-file transfer only closes once every accepted file has arrived,
+    // not after the first one (R5).
+    let all_done = state
+        .current_session
+        .as_mut()
+        .map(|session| session.mark_received(&params.file_id))
+        .unwrap_or(false);
+
+    // Events must never block the upload path: `try_send`, not `.send().await`
+    // -- a slow or absent event consumer must not stall the transfer.
+    let _ = state
+        .events_tx
+        .try_send(crate::server::events::ServerEvent::FileReceived {
+            session_id: session_id.clone(),
+            file_id: params.file_id.clone(),
+            file_name,
+            path: save_path,
+            size: body_len,
+            sender_alias,
+        });
+
+    if all_done {
+        let _ = state
+            .events_tx
+            .try_send(crate::server::events::ServerEvent::SessionDone { session_id });
+        state.current_session = None;
     }
 
     StatusCode::OK.into_response()
@@ -334,8 +349,13 @@ pub(crate) async fn handle_cancel(
     let mut state = state_ref.write().await;
 
     if let Some(session) = &state.current_session
-        && session.session_id.as_str() == params.session_id.as_str()
+        && session.id.as_str() == params.session_id.as_str()
     {
+        let _ = state
+            .events_tx
+            .try_send(crate::server::events::ServerEvent::SessionDone {
+                session_id: params.session_id.clone(),
+            });
         state.current_session = None;
         tracing::info!("Session {} cancelled", params.session_id);
     }

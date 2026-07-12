@@ -1,7 +1,6 @@
-use crate::protocol::{DeviceInfo, FileId, FileMetadata, ReceivedFile, SessionId};
+use crate::protocol::{DeviceInfo, ReceivedFile};
 use axum::body::Body;
 use futures_util::StreamExt;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -9,16 +8,9 @@ use tokio::sync::RwLock;
 
 pub type ProgressCallback = Box<dyn Fn(String, u64, u64, f64) + Send + Sync>;
 
-pub struct ActiveSession {
-    pub session_id: SessionId,
-    pub files: HashMap<FileId, FileMetadata>,
-    pub sender_alias: String,
-    pub last_activity: std::time::Instant,
-}
-
 pub struct ServerState {
     pub device: DeviceInfo,
-    pub current_session: Option<ActiveSession>,
+    pub current_session: Option<crate::core::Session>,
     pub save_dir: PathBuf,
     pub _progress_callback: Option<ProgressCallback>,
     pub received_files: Arc<RwLock<Vec<ReceivedFile>>>,
