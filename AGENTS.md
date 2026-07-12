@@ -98,6 +98,7 @@ Dropping the `PendingRequest` or letting the accept-timeout elapse declines the 
 ## Conventions
 
 - **Protocol**: v2.1, routes under `/api/localsend/v2/`. Upload = the **entire file in ONE POST** — never invent `Content-Range`/chunking headers. Multicast `224.0.0.167:53317`, default port `53317`.
+- **Transport default is HTTPS**, matching the official LocalSend app. Both `tui` and `receive` default to HTTPS with a `--no-https` opt-out (the e2e keeps `--no-https` so the http healthcheck works). `send` probes HTTPS-then-HTTP and adapts to the peer. Targets accept `host:port` (see `split_host_port` in `send.rs`); a bare host uses `DEFAULT_HTTP_PORT`.
 - **Constants only**: never hardcode ports/addresses — use `src/protocol/constants.rs`.
 - **Feature gates**: `default = ["cli","https"]`; guard https-only code with `#[cfg(feature = "https")]` so `--no-default-features --lib` still builds.
 - **Errors**: `thiserror` (`LocalSendError`) in the library; `anyhow` in CLI/bin.
