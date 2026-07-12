@@ -228,9 +228,27 @@ impl App {
                 self.handle_key(key.code);
                 self.dirty = true;
             }
+
+            // Open a deferred PIN prompt once the screen is free of any other
+            // popup (e.g. an incoming transfer the user just answered), so the
+            // prompt never clobbers a live `TransferConfirm`.
+            self.maybe_open_pin_prompt();
         }
 
         Ok(())
+    }
+
+    /// Show the PIN entry popup when a send is waiting on a PIN and no other
+    /// popup is currently displayed. Called every loop iteration so a PIN
+    /// prompt that had to wait behind an incoming-transfer dialog appears as
+    /// soon as that dialog is dismissed.
+    fn maybe_open_pin_prompt(&mut self) {
+        if self.pending_pin_kind.is_some() && self.popup.is_none() {
+            self.popup = Some(Popup::PinEntry {
+                input: tui_input::Input::default(),
+            });
+            self.dirty = true;
+        }
     }
 
     /// Start multicast discovery in background.
@@ -387,15 +405,16 @@ impl App {
                         continue; // superseded/cancelled attempt
                     }
                     // The attempt ended at prepare-upload; drop the sending
-                    // state and prompt for the PIN, then retry on submit.
+                    // state and record that a PIN is needed. The prompt itself
+                    // is opened by `maybe_open_pin_prompt` only once no other
+                    // popup is up — overwriting `self.popup` here would drop an
+                    // open incoming `TransferConfirm` (and its `PendingRequest`),
+                    // silently declining a peer's transfer.
                     match kind {
                         SendKind::File => self.send_file.is_sending = false,
                         SendKind::Text => self.send_text.is_sending = false,
                     }
                     self.pending_pin_kind = Some(kind);
-                    self.popup = Some(Popup::PinEntry {
-                        input: tui_input::Input::default(),
-                    });
                     self.status_message =
                         Some(("PIN required by receiver".into(), MessageLevel::Info));
                 }
@@ -1123,7 +1142,45 @@ pub async fn run_tui(
 
 #[cfg(test)]
 mod tests {
-    use super::{SendKind, SendUpdate, send_update_from_result};
+    use super::{App, SendKind, SendUpdate, send_update_from_result};
+    use crate::tui::popup::{MessageLevel, Popup};
+
+    // App::new does no I/O (it binds nothing until run()), so it's safe to build
+    // one for pure state-machine assertions.
+    fn test_app() -> App {
+        App::new(0, Some("t".to_string()), false, None, false).expect("build app")
+    }
+
+    #[test]
+    fn pin_prompt_opens_when_no_popup_is_shown() {
+        let mut app = test_app();
+        app.pending_pin_kind = Some(SendKind::File);
+        app.maybe_open_pin_prompt();
+        assert!(matches!(app.popup, Some(Popup::PinEntry { .. })));
+    }
+
+    #[test]
+    fn pin_prompt_defers_behind_an_open_popup() {
+        let mut app = test_app();
+        app.pending_pin_kind = Some(SendKind::File);
+        // Another popup (e.g. an incoming TransferConfirm) is already up. The PIN
+        // prompt must NOT replace it, or it would drop that popup's PendingRequest
+        // and silently decline the peer's transfer.
+        app.popup = Some(Popup::Message {
+            text: "busy".into(),
+            level: MessageLevel::Info,
+        });
+        app.maybe_open_pin_prompt();
+        assert!(matches!(app.popup, Some(Popup::Message { .. })));
+    }
+
+    #[test]
+    fn no_pin_prompt_without_a_pending_kind() {
+        let mut app = test_app();
+        app.pending_pin_kind = None;
+        app.maybe_open_pin_prompt();
+        assert!(app.popup.is_none());
+    }
 
     #[test]
     fn invalid_pin_error_maps_to_needs_pin() {
