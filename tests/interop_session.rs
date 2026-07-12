@@ -120,3 +120,75 @@ async fn same_filename_twice_keeps_both_copies() {
     assert!(save.path().join("dup.bin").exists());
     assert!(save.path().join("dup (1).bin").exists());
 }
+
+#[tokio::test]
+async fn cancel_frees_the_session_slot() {
+    let save = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let (_server, port) = receiver(save.path()).await;
+    let c = client();
+    let target = common::target_device(port);
+
+    let (p, _) = common::make_random_file(src.path(), "c.bin", 128);
+    let m = build_file_metadata(&p).await.unwrap();
+    let mut f = HashMap::new();
+    f.insert(m.id.clone(), m);
+    let prep = c.prepare_upload(&target, f, None).await.unwrap();
+
+    c.cancel(&target, &prep.session_id)
+        .await
+        .expect("cancel ok");
+
+    // Slot is free again
+    let (p2, _) = common::make_random_file(src.path(), "c2.bin", 128);
+    let m2 = build_file_metadata(&p2).await.unwrap();
+    let mut f2 = HashMap::new();
+    f2.insert(m2.id.clone(), m2);
+    assert!(c.prepare_upload(&target, f2, None).await.is_ok());
+}
+
+#[tokio::test]
+async fn upload_reports_monotonic_progress_up_to_total() {
+    let save = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let (_server, port) = receiver(save.path()).await;
+    let c = client();
+    let target = common::target_device(port);
+
+    const SIZE: usize = 4 * 1024 * 1024; // several chunks
+    let (p, _) = common::make_random_file(src.path(), "p.bin", SIZE);
+    let m = build_file_metadata(&p).await.unwrap();
+    let id = m.id.clone();
+    let mut f = HashMap::new();
+    f.insert(id.clone(), m);
+    let prep = c.prepare_upload(&target, f, None).await.unwrap();
+    let token = prep.files.get(&id).unwrap().clone();
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+    let seen_cb = seen.clone();
+    c.upload_file(
+        &target,
+        &prep.session_id,
+        &id,
+        &token,
+        &p,
+        Some(Box::new(move |sent, total, _elapsed| {
+            seen_cb.lock().unwrap().push((sent, total));
+        })),
+    )
+    .await
+    .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.len() >= 2,
+        "expected multiple progress callbacks, got {}",
+        seen.len()
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0].0 <= w[1].0),
+        "progress must be monotonic"
+    );
+    assert_eq!(seen.last().unwrap().0, SIZE as u64);
+    assert!(seen.iter().all(|(_, t)| *t == SIZE as u64));
+}
