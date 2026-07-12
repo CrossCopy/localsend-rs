@@ -4,7 +4,7 @@
 
 // Core types
 pub use crate::core::{
-    DeviceInfoBuilder, Session, TransferState, build_file_metadata, build_file_metadata_from_bytes,
+    DeviceInfoBuilder, Session, build_file_metadata, build_file_metadata_from_bytes,
     generate_file_id, get_device_model, get_device_type, get_local_ip, get_mime_type,
 };
 
@@ -28,9 +28,6 @@ pub use crate::server::LocalSendServer;
 
 // Discovery
 pub use crate::discovery::{Discovery, HttpDiscovery, MulticastDiscovery};
-
-// Storage
-pub use crate::storage::{FileSystem, TokioFileSystem};
 
 // Error handling
 pub use crate::error::{LocalSendError, Result};
