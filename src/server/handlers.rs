@@ -5,7 +5,7 @@ use crate::protocol::{
 use axum::{
     Json,
     body::Body,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -32,15 +32,32 @@ pub(crate) async fn handle_register(
 #[derive(Deserialize)]
 pub(crate) struct PrepareUploadParams {
     #[serde(rename = "pin")]
-    _pin: Option<String>,
+    pin: Option<String>,
 }
 
 pub(crate) async fn handle_prepare_upload(
     State(state_ref): State<Arc<RwLock<ServerState>>>,
-    Query(_params): Query<PrepareUploadParams>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    Query(params): Query<PrepareUploadParams>,
     Json(request): Json<PrepareUploadRequest>,
 ) -> Response {
     use crate::protocol::{SessionId, Token};
+
+    // PIN gate runs first, before any session/event work -- a locked-out or
+    // unauthenticated peer must never reach the accept flow (which would
+    // otherwise answer with 403/409 instead of the correct 401/429).
+    {
+        let mut state = state_ref.write().await;
+        match state.pin_gate.check(params.pin.as_deref(), peer.ip()) {
+            crate::server::pin::PinVerdict::Ok => {}
+            crate::server::pin::PinVerdict::Unauthorized => {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            crate::server::pin::PinVerdict::LockedOut => {
+                return StatusCode::TOO_MANY_REQUESTS.into_response();
+            }
+        }
+    }
 
     let session_id = SessionId::new();
 

@@ -23,14 +23,12 @@ pub struct LocalSendServer {
     events_rx: Option<mpsc::Receiver<ServerEvent>>,
     auto_accept: bool,
     accept_timeout: Duration,
-    /// Stored now; enforcement lands in Task 2.6.
-    #[allow(dead_code)]
+    /// Receiver-side PIN, enforced by `pin::PinGate` in the request handler.
     pin: Option<String>,
 }
 
 impl LocalSendServer {
     /// Private constructor used by [`LocalSendServerBuilder::build`].
-    /// `pin` is stored now; enforcement lands in Task 2.6.
     fn from_parts(
         device: DeviceInfo,
         save_dir: PathBuf,
@@ -139,6 +137,7 @@ impl LocalSendServer {
                     events_tx,
                     auto_accept: self.auto_accept,
                     accept_timeout: self.accept_timeout,
+                    pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
                 }));
                 let router = super::routes::create_router(state.clone());
 
@@ -149,7 +148,7 @@ impl LocalSendServer {
                             e
                         ))
                     })?
-                    .serve(router.into_make_service());
+                    .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>());
 
                 let handle = tokio::spawn(async move {
                     tracing::info!("Starting HTTPS server on port {}", bound_port);
@@ -192,11 +191,16 @@ impl LocalSendServer {
                 events_tx,
                 auto_accept: self.auto_accept,
                 accept_timeout: self.accept_timeout,
+                pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
             }));
             let router = super::routes::create_router(state.clone());
 
             let handle = tokio::spawn(async move {
-                let server = axum::serve(listener, router).with_graceful_shutdown(async {
+                let server = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async {
                     let _ = shutdown_rx.await;
                 });
 

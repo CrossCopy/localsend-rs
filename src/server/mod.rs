@@ -4,6 +4,7 @@ pub mod events;
 pub mod server;
 
 pub(crate) mod handlers;
+pub(crate) mod pin;
 pub(crate) mod routes;
 pub(crate) mod state;
 

@@ -25,6 +25,7 @@ pub struct ServerState {
     pub events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
     pub auto_accept: bool,
     pub accept_timeout: std::time::Duration,
+    pub pin_gate: crate::server::pin::PinGate,
 }
 
 pub(crate) async fn write_body_to_file(body: Body, path: &Path) -> std::io::Result<u64> {
