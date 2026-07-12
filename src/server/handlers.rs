@@ -177,7 +177,7 @@ pub(crate) async fn handle_prepare_upload(
                     now.format("%Y%m%d_%H%M%S"),
                     file.file_name.replace("/", "_")
                 );
-                let path = match crate::path_safety::safe_join(&state.save_dir, &filename) {
+                let path = match crate::core::unique_save_path(&state.save_dir, &filename) {
                     Ok(path) => path,
                     Err(e) => {
                         tracing::warn!("Rejected unsafe message file name: {}", e);
@@ -267,7 +267,7 @@ pub(crate) async fn handle_upload(
         return StatusCode::FORBIDDEN.into_response();
     };
 
-    let save_path = match crate::path_safety::safe_join(&state.save_dir, &file_name) {
+    let save_path = match crate::core::unique_save_path(&state.save_dir, &file_name) {
         Ok(path) => path,
         Err(e) => {
             tracing::warn!("Upload rejected: {}", e);
@@ -345,13 +345,20 @@ pub(crate) async fn handle_upload(
     // Events must never block the upload path: `try_send`, not `.send().await`
     // -- a slow or absent event consumer must not stall the transfer.
     // The bytes genuinely landed on disk, so FileReceived is still accurate
-    // to emit even if the owning session has since changed.
+    // to emit even if the owning session has since changed. Report the
+    // *final* on-disk name -- unique_save_path may have renamed the file on
+    // collision, and a consumer needs to see where the bytes actually went,
+    // not the name originally requested by the sender.
+    let final_file_name = save_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or(file_name);
     let _ = state
         .events_tx
         .try_send(crate::server::events::ServerEvent::FileReceived {
             session_id: session_id.clone(),
             file_id: params.file_id.clone(),
-            file_name,
+            file_name: final_file_name,
             path: save_path,
             size: body_len,
             sender_alias,

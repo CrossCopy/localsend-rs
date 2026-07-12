@@ -94,3 +94,29 @@ async fn concurrent_second_session_is_blocked_with_409() {
         .expect_err("blocked");
     assert!(matches!(err, localsend_rs::LocalSendError::SessionBlocked));
 }
+
+#[tokio::test]
+async fn same_filename_twice_keeps_both_copies() {
+    let save = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let (_server, port) = receiver(save.path()).await;
+    let c = client();
+    let target = common::target_device(port);
+
+    for round in 0..2 {
+        let sub = src.path().join(format!("r{round}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        let (p, _) = common::make_random_file(&sub, "dup.bin", 64 + round);
+        let m = build_file_metadata(&p).await.unwrap();
+        let id = m.id.clone();
+        let mut f = HashMap::new();
+        f.insert(id.clone(), m);
+        let prep = c.prepare_upload(&target, f, None).await.unwrap();
+        let token = prep.files.get(&id).unwrap().clone();
+        c.upload_file(&target, &prep.session_id, &id, &token, &p, None)
+            .await
+            .unwrap();
+    }
+    assert!(save.path().join("dup.bin").exists());
+    assert!(save.path().join("dup (1).bin").exists());
+}
