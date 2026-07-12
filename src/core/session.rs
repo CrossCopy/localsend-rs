@@ -62,7 +62,15 @@ impl Session {
     }
 
     /// Record a completed file. Returns true when every file has arrived.
+    ///
+    /// A file id that does not belong to this session (e.g. a stale upload
+    /// from a session that was cancelled/timed out and replaced mid-write)
+    /// is ignored entirely -- it must never be recorded and must never
+    /// count toward "all files received" for a session it doesn't belong to.
     pub fn mark_received(&mut self, file_id: &FileId) -> bool {
+        if !self.files.contains_key(file_id) {
+            return false;
+        }
         self.received.insert(file_id.clone());
         self.last_activity = Instant::now();
         self.received.len() == self.files.len()
@@ -162,5 +170,15 @@ mod tests {
         let mut s = Session::new("A".to_string(), files);
         assert!(!s.mark_received(&ids[0]));
         assert!(s.mark_received(&ids[1]));
+    }
+
+    #[test]
+    fn mark_received_ignores_foreign_file_id() {
+        let files = create_test_files();
+        let mut s = Session::new("A".to_string(), files);
+        let foreign = FileId::new();
+        assert!(!s.mark_received(&foreign)); // foreign id must NOT complete the session
+        let real = s.files.keys().next().unwrap().clone();
+        assert!(s.mark_received(&real)); // the real file completes it
     }
 }

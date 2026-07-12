@@ -304,17 +304,41 @@ pub(crate) async fn handle_upload(
         });
     }
 
+    // The write above was lock-free and may have taken a long time (large /
+    // multi-GB files). The session validated before the write started may
+    // have since been cancelled or timed out and replaced by a brand-new
+    // session. Re-validate identity before touching session state: a stale
+    // upload must never be recorded against a different session's
+    // accounting, since a foreign file id could otherwise push an unrelated
+    // session to "all done".
+    let still_current = state
+        .current_session
+        .as_ref()
+        .map(|session| session.id == session_id)
+        .unwrap_or(false);
+
     // Record this file as received on the (still-current) session; a
     // multi-file transfer only closes once every accepted file has arrived,
     // not after the first one (R5).
-    let all_done = state
-        .current_session
-        .as_mut()
-        .map(|session| session.mark_received(&params.file_id))
-        .unwrap_or(false);
+    let all_done = if still_current {
+        state
+            .current_session
+            .as_mut()
+            .map(|session| session.mark_received(&params.file_id))
+            .unwrap_or(false)
+    } else {
+        tracing::warn!(
+            "Upload for session {} completed after the session was replaced; \
+             file saved to disk but not recorded against the new session",
+            session_id
+        );
+        false
+    };
 
     // Events must never block the upload path: `try_send`, not `.send().await`
     // -- a slow or absent event consumer must not stall the transfer.
+    // The bytes genuinely landed on disk, so FileReceived is still accurate
+    // to emit even if the owning session has since changed.
     let _ = state
         .events_tx
         .try_send(crate::server::events::ServerEvent::FileReceived {
@@ -326,7 +350,7 @@ pub(crate) async fn handle_upload(
             sender_alias,
         });
 
-    if all_done {
+    if still_current && all_done {
         let _ = state
             .events_tx
             .try_send(crate::server::events::ServerEvent::SessionDone { session_id });
