@@ -1,7 +1,5 @@
 //! Screen modules for TUI.
 
-pub mod device_list;
-pub mod main_menu;
 pub mod receive;
 pub mod send_file;
 pub mod send_text;

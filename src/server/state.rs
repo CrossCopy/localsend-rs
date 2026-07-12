@@ -2,6 +2,8 @@ use crate::protocol::DeviceInfo;
 use axum::body::Body;
 use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncWriteExt;
 
 pub type ProgressCallback = Box<dyn Fn(String, u64, u64, f64) + Send + Sync>;
@@ -12,7 +14,9 @@ pub struct ServerState {
     pub save_dir: PathBuf,
     pub _progress_callback: Option<ProgressCallback>,
     pub events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
-    pub auto_accept: bool,
+    /// Shared with [`crate::server::LocalSendServer`] so a live
+    /// `set_auto_accept` toggle is observed by the request handler.
+    pub auto_accept: Arc<AtomicBool>,
     pub accept_timeout: std::time::Duration,
     pub pin_gate: crate::server::pin::PinGate,
 }

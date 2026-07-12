@@ -63,9 +63,18 @@ impl Widget for &SettingsScreen {
                 Span::raw(&self.save_directory),
             ]),
             Line::raw(""),
+            // The one interactive setting: always highlighted so it reads as
+            // the focused control; Space/Enter flips it.
             Line::from(vec![
-                Span::styled("Auto Accept:   ", THEME.normal),
-                Span::raw(if self.auto_accept { "Yes" } else { "No" }),
+                Span::styled("▶ Auto Accept: ", THEME.selected),
+                Span::styled(
+                    if self.auto_accept {
+                        "[x] On"
+                    } else {
+                        "[ ] Off"
+                    },
+                    THEME.selected,
+                ),
             ]),
         ];
 
@@ -73,6 +82,8 @@ impl Widget for &SettingsScreen {
 
         // Help
         let help = Line::from(vec![
+            Span::styled(" Space ", THEME.key),
+            Span::styled(" Toggle auto-accept ", THEME.key_desc),
             Span::styled(" Esc ", THEME.key),
             Span::styled(" Back ", THEME.key_desc),
         ]);

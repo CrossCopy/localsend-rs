@@ -3,6 +3,7 @@ use super::state::{ProgressCallback, ServerState};
 use crate::protocol::{DeviceInfo, Protocol};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, mpsc, oneshot};
@@ -21,7 +22,9 @@ pub struct LocalSendServer {
     #[cfg(feature = "https")]
     tls_cert: Option<crate::crypto::TlsCertificate>,
     events_rx: Option<mpsc::Receiver<ServerEvent>>,
-    auto_accept: bool,
+    /// Shared with the running [`ServerState`] so `set_auto_accept` takes
+    /// effect on in-flight requests, not just at `start()` time.
+    auto_accept: Arc<AtomicBool>,
     accept_timeout: Duration,
     /// Receiver-side PIN, enforced by `pin::PinGate` in the request handler.
     pin: Option<String>,
@@ -47,7 +50,7 @@ impl LocalSendServer {
             #[cfg(feature = "https")]
             tls_cert: None,
             events_rx: None,
-            auto_accept,
+            auto_accept: Arc::new(AtomicBool::new(auto_accept)),
             accept_timeout,
             pin,
         })
@@ -81,8 +84,15 @@ impl LocalSendServer {
         self.events_rx.take()
     }
 
-    pub fn set_auto_accept(&mut self, yes: bool) {
-        self.auto_accept = yes;
+    /// Toggle auto-accept on a running server. Because the flag is shared with
+    /// the live [`ServerState`], this affects requests that arrive afterward.
+    pub fn set_auto_accept(&self, yes: bool) {
+        self.auto_accept.store(yes, Ordering::Relaxed);
+    }
+
+    /// Current auto-accept setting.
+    pub fn auto_accept(&self) -> bool {
+        self.auto_accept.load(Ordering::Relaxed)
     }
 
     #[cfg(feature = "https")]
@@ -134,7 +144,7 @@ impl LocalSendServer {
                     save_dir: self.save_dir.clone(),
                     _progress_callback: progress_callback,
                     events_tx,
-                    auto_accept: self.auto_accept,
+                    auto_accept: self.auto_accept.clone(),
                     accept_timeout: self.accept_timeout,
                     pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
                 }));
@@ -188,7 +198,7 @@ impl LocalSendServer {
                 save_dir: self.save_dir.clone(),
                 _progress_callback: progress_callback,
                 events_tx,
-                auto_accept: self.auto_accept,
+                auto_accept: self.auto_accept.clone(),
                 accept_timeout: self.accept_timeout,
                 pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
             }));

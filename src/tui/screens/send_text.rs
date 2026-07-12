@@ -29,6 +29,9 @@ pub struct SendTextScreen {
     pub input: Input,
     pub is_sending: bool,
     pub needs_refresh: bool,
+    /// Set by the app while discovery is still warming up, to show "Scanning…"
+    /// instead of "No devices found".
+    pub scanning: bool,
 }
 
 impl SendTextScreen {
@@ -41,6 +44,7 @@ impl SendTextScreen {
             input: Input::default(),
             is_sending: false,
             needs_refresh: false,
+            scanning: false,
         }
     }
 
@@ -57,10 +61,9 @@ impl SendTextScreen {
     }
 
     pub fn next_device(&mut self) {
-        let devices = self
-            .devices
-            .try_read()
-            .unwrap_or_else(|_| panic!("Lock poisoned"));
+        let Ok(devices) = self.devices.try_read() else {
+            return;
+        };
         if devices.is_empty() {
             return;
         }
@@ -72,10 +75,9 @@ impl SendTextScreen {
     }
 
     pub fn previous_device(&mut self) {
-        let devices = self
-            .devices
-            .try_read()
-            .unwrap_or_else(|_| panic!("Lock poisoned"));
+        let Ok(devices) = self.devices.try_read() else {
+            return;
+        };
         if devices.is_empty() {
             return;
         }
@@ -93,10 +95,9 @@ impl SendTextScreen {
     }
 
     pub fn select_current_device(&mut self) {
-        let devices = self
-            .devices
-            .try_read()
-            .unwrap_or_else(|_| panic!("Lock poisoned"));
+        let Ok(devices) = self.devices.try_read() else {
+            return;
+        };
         if let Some(i) = self.table_state.selected()
             && let Some(device) = devices.get(i)
         {
@@ -123,11 +124,6 @@ impl SendTextScreen {
     }
 
     fn render_device_selection(&mut self, area: Rect, buf: &mut Buffer) {
-        let devices = self
-            .devices
-            .try_read()
-            .unwrap_or_else(|_| panic!("Lock poisoned"));
-
         let block = Block::default()
             .title(" 📝 Send Text - Select Device ")
             .title_style(THEME.title)
@@ -142,10 +138,23 @@ impl SendTextScreen {
         ])
         .split(inner);
 
-        if devices.is_empty() {
-            let msg = Paragraph::new("No devices found. Press R to refresh.")
+        // If the discovery writer holds the lock this frame, show a brief
+        // placeholder rather than crash; the next frame renders the table.
+        let Ok(devices) = self.devices.try_read() else {
+            Paragraph::new("…")
                 .style(THEME.status_info)
-                .centered();
+                .centered()
+                .render(layout[0], buf);
+            return;
+        };
+
+        if devices.is_empty() {
+            let text = if self.scanning {
+                "🔍 Scanning for devices…"
+            } else {
+                "No devices found. Press R to refresh."
+            };
+            let msg = Paragraph::new(text).style(THEME.status_info).centered();
             msg.render(layout[0], buf);
         } else {
             // Ensure selection

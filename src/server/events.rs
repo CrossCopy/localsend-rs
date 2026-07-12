@@ -19,6 +19,10 @@ pub enum ServerEvent {
         path: PathBuf,
         size: u64,
         sender_alias: String,
+        /// The text body when this "file" is a LocalSend text message
+        /// (the sender put the content in `preview`), else `None`. Lets a
+        /// consumer render the message inline instead of opening the `.txt`.
+        message_text: Option<String>,
     },
     /// All accepted files of a session arrived (or the session was cancelled).
     SessionDone { session_id: SessionId },

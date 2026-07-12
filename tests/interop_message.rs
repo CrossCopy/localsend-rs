@@ -83,8 +83,9 @@ async fn message_path_emits_file_received_and_session_done() {
                     path,
                     size,
                     sender_alias,
+                    message_text,
                     ..
-                }) => return (file_name, path, size, sender_alias),
+                }) => return (file_name, path, size, sender_alias, message_text),
                 Some(_) => continue,
                 None => panic!("event channel closed before FileReceived"),
             }
@@ -93,13 +94,20 @@ async fn message_path_emits_file_received_and_session_done() {
     .await
     .expect("timed out waiting for FileReceived");
 
-    let (recv_file_name, recv_path, recv_size, recv_sender) = file_received;
+    let (recv_file_name, recv_path, recv_size, recv_sender, recv_message_text) = file_received;
     assert!(
         recv_file_name.ends_with(".txt"),
         "message file_name should end in .txt, got {recv_file_name}"
     );
     assert_eq!(recv_size, message_text.len() as u64);
     assert_eq!(recv_sender, "Test Sender");
+    // The event must carry the message body inline so an inbox can render it
+    // without re-reading the .txt off disk.
+    assert_eq!(
+        recv_message_text.as_deref(),
+        Some(message_text),
+        "FileReceived for a text message must carry message_text"
+    );
 
     // The FileReceived path must be the FINAL on-disk name -- read it back
     // and assert the saved content matches the message, not just that a

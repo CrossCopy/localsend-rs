@@ -148,11 +148,22 @@ Launch the interactive terminal-based UI for file transfers.
 - `--port <PORT>`: Custom port (default: 53317).
 - `--no-https`: Use plain HTTP instead of the default HTTPS.
 - `--alias <NAME>`: Custom device name shown to others.
+- `--pin <PIN>`: Require this PIN from senders before a transfer is offered.
+- `--auto-accept`: Accept every incoming transfer without prompting.
 
 ```bash
 # With all features enabled (HTTPS by default)
 cargo run --features all -- tui
 ```
+
+The TUI supports:
+
+- **Inbox** — arrow keys select a received item, `Enter` reveals it in the OS
+  file manager; text messages show a `💬` preview inline.
+- **Incoming transfer dialog** — `↑/↓` move, `Space` toggles a file, `a` toggles
+  all, `Enter` accepts the selected subset, `y` accepts all, `n`/`Esc` declines.
+- **Settings** — `Space` toggles auto-accept live (applies to the next request).
+- **Sending to a PIN-protected peer** — a `401` prompts for the PIN and retries.
 
 ## Architecture
 
