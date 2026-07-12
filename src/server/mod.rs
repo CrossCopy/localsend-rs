@@ -8,5 +8,5 @@ pub(crate) mod routes;
 pub(crate) mod state;
 
 pub use events::{PendingRequest, ServerEvent, TransferDecision};
-pub use server::LocalSendServer;
+pub use server::{LocalSendServer, LocalSendServerBuilder};
 pub use state::{PendingTransfer, ProgressCallback};
