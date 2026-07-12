@@ -118,6 +118,9 @@ pub struct App {
     // Which send flow is waiting on a PIN entry, so submitting the PIN retries
     // the right one.
     pending_pin_kind: Option<SendKind>,
+    // Previous scanning state, so the scanning→done edge forces one repaint
+    // (otherwise the last "Scanning…" frame lingers when nothing else changes).
+    was_scanning: bool,
 }
 
 impl App {
@@ -186,6 +189,7 @@ impl App {
             scan_deadline: std::time::Instant::now() + Duration::from_secs(3),
             dirty: true,
             pending_pin_kind: None,
+            was_scanning: true,
         })
     }
 
@@ -410,9 +414,14 @@ impl App {
                 self.dirty = true;
             }
         }
-        if std::time::Instant::now() < self.scan_deadline {
+        // Keep repainting while scanning, and force one repaint on the
+        // scanning→done edge so the placeholder updates from "Scanning…" to
+        // "No devices found" even if nothing else changes afterward.
+        let scanning = self.is_scanning();
+        if scanning || scanning != self.was_scanning {
             self.dirty = true;
         }
+        self.was_scanning = scanning;
     }
 
     /// True while discovery is still warming up and nothing has been found yet.

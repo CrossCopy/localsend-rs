@@ -18,8 +18,13 @@ pub struct ReceiveScreen {
     pub received_files: Arc<RwLock<Vec<ReceivedFile>>>,
     pub port: u16,
     pub save_dir: PathBuf,
-    /// Selection over the display order (most-recent first).
+    /// Used only to drive the table highlight during a frame; the persistent
+    /// selection lives in `selected_key`.
     pub table_state: TableState,
+    /// The selected item's on-disk path (its stable identity). Selecting by
+    /// path — not by row index — keeps the highlight on the same item when a
+    /// new arrival prepends to the most-recent-first list.
+    selected_key: Option<PathBuf>,
 }
 
 impl ReceiveScreen {
@@ -33,6 +38,7 @@ impl ReceiveScreen {
             port,
             save_dir,
             table_state: TableState::default(),
+            selected_key: None,
         }
     }
 
@@ -45,36 +51,40 @@ impl ReceiveScreen {
         }
     }
 
+    /// Index of the current selection within `files`, if it still exists.
+    fn current_index(&self, files: &[ReceivedFile]) -> Option<usize> {
+        let key = self.selected_key.as_ref()?;
+        files.iter().position(|f| &f.path == key)
+    }
+
     pub fn next(&mut self) {
-        let len = self.snapshot().len();
-        if len == 0 {
+        let files = self.snapshot();
+        if files.is_empty() {
             return;
         }
-        let i = match self.table_state.selected() {
-            Some(i) => (i + 1) % len,
+        let i = match self.current_index(&files) {
+            Some(i) => (i + 1) % files.len(),
             None => 0,
         };
-        self.table_state.select(Some(i));
+        self.selected_key = Some(files[i].path.clone());
     }
 
     pub fn previous(&mut self) {
-        let len = self.snapshot().len();
-        if len == 0 {
+        let files = self.snapshot();
+        if files.is_empty() {
             return;
         }
-        let i = match self.table_state.selected() {
-            Some(0) => len - 1,
+        let i = match self.current_index(&files) {
+            Some(0) => files.len() - 1,
             Some(i) => i - 1,
             None => 0,
         };
-        self.table_state.select(Some(i));
+        self.selected_key = Some(files[i].path.clone());
     }
 
     /// The on-disk path of the currently selected received item, if any.
     pub fn selected_path(&self) -> Option<PathBuf> {
-        let files = self.snapshot();
-        let i = self.table_state.selected()?;
-        files.get(i).map(|f| f.path.clone())
+        self.selected_key.clone()
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
@@ -88,10 +98,12 @@ impl ReceiveScreen {
 
         let files = self.snapshot();
 
+        // Resolve the persistent selection to a row index for this frame.
+        let selected_index = self.current_index(&files);
+        self.table_state.select(selected_index);
+
         // Reserve a preview pane only when the selected item is a text message.
-        let selected_message = self
-            .table_state
-            .selected()
+        let selected_message = selected_index
             .and_then(|i| files.get(i))
             .and_then(|f| f.message_text.clone());
         let preview_height: u16 = if selected_message.is_some() { 4 } else { 0 };
@@ -119,21 +131,11 @@ impl ReceiveScreen {
         Paragraph::new(status).render(layout[0], buf);
 
         if files.is_empty() {
-            // A dangling selection from a cleared list would be confusing.
-            self.table_state.select(None);
             let msg = Paragraph::new("No files received yet.")
                 .style(THEME.normal)
                 .centered();
             msg.render(layout[1], buf);
         } else {
-            // Clamp a stale selection (list can shrink) but leave it unset until
-            // the user navigates, so new arrivals don't yank the highlight.
-            if let Some(i) = self.table_state.selected()
-                && i >= files.len()
-            {
-                self.table_state.select(Some(files.len() - 1));
-            }
-
             let rows: Vec<Row> = files
                 .iter()
                 .map(|f| {
