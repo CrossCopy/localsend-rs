@@ -4,7 +4,7 @@ use localsend_rs::server::{LocalSendServer, PendingTransfer};
 use localsend_rs::{DeviceInfo, LocalSendClient, Protocol, build_file_metadata, sha256_from_file};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 
 #[tokio::test]
 async fn uploads_a_file_byte_for_byte_rs_to_rs() {
@@ -12,30 +12,23 @@ async fn uploads_a_file_byte_for_byte_rs_to_rs() {
     let save_dir = tempfile::tempdir().expect("save dir");
     let src_dir = tempfile::tempdir().expect("src dir");
 
-    // --- receiver (current API; rendezvous hack, removed in Phase 2) ---
+    // --- receiver ---
     let mut device = DeviceInfo::new("Test Receiver".to_string(), port, Protocol::Http);
     device.fingerprint = "receiver-fp".to_string();
+    // Constructing the dummy pending/received Arcs is still required until
+    // Task 2.5 removes those `new_with_device` params.
     let pending: Arc<RwLock<Option<PendingTransfer>>> = Arc::new(RwLock::new(None));
     let received = Arc::new(RwLock::new(Vec::new()));
     let mut server = LocalSendServer::new_with_device(
         device,
         save_dir.path().to_path_buf(),
         false,
-        pending.clone(),
+        pending,
         received,
     )
     .expect("server");
-    let notify = Arc::new(Notify::new());
-    server.set_pending_transfer_notify(notify.clone());
+    server.set_auto_accept(true);
     server.start(None).await.expect("start");
-
-    let pending_for_task = pending.clone();
-    tokio::spawn(async move {
-        notify.notified().await;
-        if let Some(t) = pending_for_task.write().await.take() {
-            let _ = t.response_tx.send(true);
-        }
-    });
 
     common::wait_for_http_info(port).await;
 

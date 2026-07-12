@@ -1,6 +1,4 @@
-use super::state::{
-    ActiveSession, PendingTransfer, ServerState, publish_pending_transfer, write_body_to_file,
-};
+use super::state::{ActiveSession, ServerState, write_body_to_file};
 use crate::protocol::{
     DeviceInfo, FileId, PrepareUploadRequest, PrepareUploadResponse, ReceivedFile, SessionId,
 };
@@ -15,7 +13,7 @@ use chrono::Local;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::RwLock;
 
 pub(crate) async fn handle_info(State(state): State<Arc<RwLock<ServerState>>>) -> Response {
     let state = state.read().await;
@@ -45,7 +43,6 @@ pub(crate) async fn handle_prepare_upload(
     use crate::protocol::{SessionId, Token};
 
     let session_id = SessionId::new();
-    let mut files_map = HashMap::new();
 
     // Check if it's a text message (all files have non-empty preview and small size)
     let is_message = !request.files.is_empty()
@@ -54,12 +51,11 @@ pub(crate) async fn handle_prepare_upload(
             .values()
             .all(|f| f.preview.is_some() && f.size < 1024 * 1024);
 
-    for file_id in request.files.keys() {
-        let token = Token::new(&session_id, file_id);
-        files_map.insert(file_id.clone(), token);
-    }
-
-    let (pending_transfer_arc, pending_transfer_notify, _sender_info, response_rx, pending) = {
+    // Short lock: reject a conflicting session, reserve this one, and pull out
+    // the config needed to make the accept decision. Never hold this guard
+    // across the `timeout(...).await` below -- that would deadlock every other
+    // concurrent request (including the upload that follows acceptance).
+    let (events_tx, auto_accept, accept_timeout) = {
         let mut state = state_ref.write().await;
 
         // Check for existing session timeout (e.g. 5 minutes or session finished)
@@ -81,63 +77,77 @@ pub(crate) async fn handle_prepare_upload(
 
         state.current_session = Some(session);
 
-        let (response_tx, response_rx) = oneshot::channel();
-        let pending = PendingTransfer {
-            sender: request.info.clone(),
-            files: request.files.clone(),
-            response_tx,
-        };
-
         (
-            state.pending_transfer.clone(),
-            state.pending_transfer_notify.clone(),
-            request.info.clone(),
-            response_rx,
-            pending,
+            state.events_tx.clone(),
+            state.auto_accept,
+            state.accept_timeout,
         )
     };
 
-    publish_pending_transfer(
-        &pending_transfer_arc,
-        pending_transfer_notify.as_ref(),
-        pending,
-    )
-    .await;
-
-    // Wait for user or timeout
-    let accepted = match tokio::time::timeout(std::time::Duration::from_secs(60), response_rx).await
-    {
-        Ok(Ok(val)) => val,
-        _ => false,
+    // Decide: auto-accept, or ask the event consumer.
+    let decision = if auto_accept {
+        crate::server::events::TransferDecision::Accept
+    } else {
+        let (pending_request, decision_rx) =
+            crate::server::events::PendingRequest::new(request.info.clone(), request.files.clone());
+        if events_tx
+            .send(crate::server::events::ServerEvent::TransferRequest(
+                pending_request,
+            ))
+            .await
+            .is_err()
+        {
+            // No consumer listening -> decline.
+            crate::server::events::TransferDecision::Decline
+        } else {
+            match tokio::time::timeout(accept_timeout, decision_rx).await {
+                Ok(Ok(d)) => d,
+                _ => crate::server::events::TransferDecision::Decline, // dropped or timed out
+            }
+        }
     };
 
-    if !accepted {
-        let mut pending_guard = pending_transfer_arc.write().await;
-        *pending_guard = None;
+    let accepted_ids: Vec<FileId> = match decision {
+        crate::server::events::TransferDecision::Accept => request.files.keys().cloned().collect(),
+        crate::server::events::TransferDecision::AcceptFiles(ids) => ids
+            .into_iter()
+            .filter(|id| request.files.contains_key(id))
+            .collect(),
+        crate::server::events::TransferDecision::Decline => Vec::new(),
+    };
 
+    if accepted_ids.is_empty() {
         let mut state = state_ref.write().await;
         state.current_session = None;
-        tracing::info!("Transfer rejected by user or timeout");
+        tracing::info!("Transfer declined (or timed out)");
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // Refresh last activity on acceptance
+    // Build the response token map from the accepted files only, and narrow
+    // the stored session down to the same set.
+    let mut files_map = HashMap::new();
+    for file_id in &accepted_ids {
+        let token = Token::new(&session_id, file_id);
+        files_map.insert(file_id.clone(), token);
+    }
+
     {
         let mut state = state_ref.write().await;
         if let Some(s) = &mut state.current_session {
+            s.files.retain(|id, _| accepted_ids.contains(id));
             s.last_activity = std::time::Instant::now();
         }
     }
 
     // If it's a message, return 204 No Content
     if is_message {
-        let mut pending_guard = pending_transfer_arc.write().await;
-        *pending_guard = None;
-
         let mut state = state_ref.write().await;
 
-        // Save messages to files and update TUI list
-        for file in request.files.values() {
+        // Save accepted messages to files and update TUI list
+        for (file_id, file) in &request.files {
+            if !accepted_ids.contains(file_id) {
+                continue;
+            }
             if let Some(content) = &file.preview {
                 let now = Local::now();
                 let time_str = now.format("%Y-%m-%d %H:%M:%S").to_string();

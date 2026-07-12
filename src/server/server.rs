@@ -1,9 +1,11 @@
+use super::events::ServerEvent;
 use super::state::{PendingTransfer, ProgressCallback, ServerState};
 use crate::protocol::{DeviceInfo, Protocol, ReceivedFile};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, RwLock, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "https")]
@@ -17,9 +19,10 @@ pub struct LocalSendServer {
     https: bool,
     #[cfg(feature = "https")]
     tls_cert: Option<crate::crypto::TlsCertificate>,
-    pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
-    pending_transfer_notify: Option<Arc<Notify>>,
     received_files: Arc<RwLock<Vec<ReceivedFile>>>,
+    events_rx: Option<mpsc::Receiver<ServerEvent>>,
+    auto_accept: bool,
+    accept_timeout: Duration,
 }
 
 impl LocalSendServer {
@@ -52,7 +55,7 @@ impl LocalSendServer {
         device: DeviceInfo,
         save_dir: PathBuf,
         https: bool,
-        pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
+        _pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
         received_files: Arc<RwLock<Vec<ReceivedFile>>>,
     ) -> std::result::Result<Self, crate::error::LocalSendError> {
         Ok(Self {
@@ -63,14 +66,27 @@ impl LocalSendServer {
             https,
             #[cfg(feature = "https")]
             tls_cert: None,
-            pending_transfer,
-            pending_transfer_notify: None,
             received_files,
+            events_rx: None,
+            auto_accept: false,
+            accept_timeout: Duration::from_secs(60),
         })
     }
 
-    pub fn set_pending_transfer_notify(&mut self, notify: Arc<Notify>) {
-        self.pending_transfer_notify = Some(notify);
+    /// No longer wired to anything (Task 2.2 replaced the rendezvous with the
+    /// public event stream). Kept as a no-op until Task 2.5 removes it.
+    #[deprecated(
+        note = "no-op since Task 2.2; use take_events()/set_auto_accept() instead, removed in Task 2.5"
+    )]
+    pub fn set_pending_transfer_notify(&mut self, _notify: Arc<tokio::sync::Notify>) {}
+
+    /// Take the event receiver. Returns `Some` once, after `start()`.
+    pub fn take_events(&mut self) -> Option<mpsc::Receiver<ServerEvent>> {
+        self.events_rx.take()
+    }
+
+    pub fn set_auto_accept(&mut self, yes: bool) {
+        self.auto_accept = yes;
     }
 
     #[cfg(feature = "https")]
@@ -82,14 +98,18 @@ impl LocalSendServer {
         &mut self,
         progress_callback: Option<ProgressCallback>,
     ) -> std::result::Result<(), crate::error::LocalSendError> {
+        let (events_tx, events_rx) = mpsc::channel(64);
+        self.events_rx = Some(events_rx);
+
         let state = Arc::new(RwLock::new(ServerState {
             device: self.device.clone(),
             current_session: None,
             save_dir: self.save_dir.clone(),
             _progress_callback: progress_callback,
-            pending_transfer: self.pending_transfer.clone(),
-            pending_transfer_notify: self.pending_transfer_notify.clone(),
             received_files: self.received_files.clone(),
+            events_tx,
+            auto_accept: self.auto_accept,
+            accept_timeout: self.accept_timeout,
         }));
 
         let router = super::routes::create_router(state.clone());
