@@ -1,24 +1,21 @@
 mod common;
 
-use localsend_rs::server::{LocalSendServer, PendingTransfer, ServerEvent};
+use localsend_rs::server::{LocalSendServer, ServerEvent};
 use localsend_rs::{DeviceInfo, LocalSendClient, LocalSendError, Protocol, build_file_metadata};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 async fn start_receiver(
-    port: u16,
     save_dir: std::path::PathBuf,
 ) -> (LocalSendServer, tokio::sync::mpsc::Receiver<ServerEvent>) {
-    let mut device = DeviceInfo::new("Receiver".to_string(), port, Protocol::Http);
-    device.fingerprint = "receiver-fp".to_string();
-    let pending: Arc<RwLock<Option<PendingTransfer>>> = Arc::new(RwLock::new(None));
-    let received = Arc::new(RwLock::new(Vec::new()));
-    let mut server =
-        LocalSendServer::new_with_device(device, save_dir, false, pending, received).unwrap();
-    server.start(None).await.unwrap();
-    let events = server.take_events().expect("events receiver");
-    (server, events)
+    LocalSendServer::builder()
+        .alias("Receiver")
+        .port(0)
+        .save_dir(save_dir)
+        .protocol(Protocol::Http)
+        .auto_accept(false)
+        .build()
+        .await
+        .expect("build")
 }
 
 fn one_file(
@@ -43,10 +40,10 @@ fn futures_blocking<T>(fut: impl std::future::Future<Output = localsend_rs::Resu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn event_consumer_can_accept_a_transfer() {
-    let port = common::free_port();
     let save = tempfile::tempdir().unwrap();
     let src = tempfile::tempdir().unwrap();
-    let (mut server, mut events) = start_receiver(port, save.path().to_path_buf()).await;
+    let (mut server, mut events) = start_receiver(save.path().to_path_buf()).await;
+    let port = server.port();
     common::wait_for_http_info(port).await;
 
     tokio::spawn(async move {
@@ -78,10 +75,10 @@ async fn event_consumer_can_accept_a_transfer() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn event_consumer_can_decline_a_transfer() {
-    let port = common::free_port();
     let save = tempfile::tempdir().unwrap();
     let src = tempfile::tempdir().unwrap();
-    let (mut server, mut events) = start_receiver(port, save.path().to_path_buf()).await;
+    let (mut server, mut events) = start_receiver(save.path().to_path_buf()).await;
+    let port = server.port();
     common::wait_for_http_info(port).await;
 
     tokio::spawn(async move {

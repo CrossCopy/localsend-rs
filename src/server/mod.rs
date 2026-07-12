@@ -9,4 +9,4 @@ pub(crate) mod state;
 
 pub use events::{PendingRequest, ServerEvent, TransferDecision};
 pub use server::{LocalSendServer, LocalSendServerBuilder};
-pub use state::{PendingTransfer, ProgressCallback};
+pub use state::ProgressCallback;

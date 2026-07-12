@@ -1,5 +1,5 @@
 use super::events::ServerEvent;
-use super::state::{PendingTransfer, ProgressCallback, ServerState};
+use super::state::{ProgressCallback, ServerState};
 use crate::protocol::{DeviceInfo, Protocol, ReceivedFile};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,56 +29,7 @@ pub struct LocalSendServer {
 }
 
 impl LocalSendServer {
-    pub fn new(
-        alias: String,
-        port: u16,
-        save_dir: PathBuf,
-    ) -> std::result::Result<Self, crate::error::LocalSendError> {
-        let device = DeviceInfo {
-            alias,
-            version: crate::protocol::PROTOCOL_VERSION.to_string(),
-            device_model: Some(crate::core::device::get_device_model()),
-            device_type: Some(crate::core::device::get_device_type()),
-            fingerprint: crate::crypto::generate_fingerprint(),
-            port,
-            protocol: Protocol::Http,
-            download: false,
-            ip: None,
-        };
-        Self::new_with_device(
-            device,
-            save_dir,
-            false,
-            Arc::new(RwLock::new(None)),
-            Arc::new(RwLock::new(Vec::new())),
-        )
-    }
-
-    pub fn new_with_device(
-        device: DeviceInfo,
-        save_dir: PathBuf,
-        https: bool,
-        _pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
-        received_files: Arc<RwLock<Vec<ReceivedFile>>>,
-    ) -> std::result::Result<Self, crate::error::LocalSendError> {
-        Ok(Self {
-            device,
-            save_dir,
-            handle: None,
-            shutdown_tx: None,
-            https,
-            #[cfg(feature = "https")]
-            tls_cert: None,
-            received_files,
-            events_rx: None,
-            auto_accept: false,
-            accept_timeout: Duration::from_secs(60),
-            pin: None,
-        })
-    }
-
-    /// Private constructor used by [`LocalSendServerBuilder::build`]. Holds the
-    /// fields `new_with_device` used to take, plus `pin`/`auto_accept`/`accept_timeout`.
+    /// Private constructor used by [`LocalSendServerBuilder::build`].
     /// `pin` is stored now; enforcement lands in Task 2.6.
     fn from_parts(
         device: DeviceInfo,
@@ -126,13 +77,6 @@ impl LocalSendServer {
             accept_timeout: Duration::from_secs(60),
         }
     }
-
-    /// No longer wired to anything (Task 2.2 replaced the rendezvous with the
-    /// public event stream). Kept as a no-op until Task 2.5 removes it.
-    #[deprecated(
-        note = "no-op since Task 2.2; use take_events()/set_auto_accept() instead, removed in Task 2.5"
-    )]
-    pub fn set_pending_transfer_notify(&mut self, _notify: Arc<tokio::sync::Notify>) {}
 
     /// Take the event receiver. Returns `Some` once, after `start()`.
     pub fn take_events(&mut self) -> Option<mpsc::Receiver<ServerEvent>> {

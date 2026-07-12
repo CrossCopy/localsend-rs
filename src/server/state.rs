@@ -5,15 +5,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::RwLock;
 
 pub type ProgressCallback = Box<dyn Fn(String, u64, u64, f64) + Send + Sync>;
-
-pub struct PendingTransfer {
-    pub sender: DeviceInfo,
-    pub files: HashMap<FileId, FileMetadata>,
-    pub response_tx: oneshot::Sender<bool>,
-}
 
 pub struct ActiveSession {
     pub session_id: SessionId,
