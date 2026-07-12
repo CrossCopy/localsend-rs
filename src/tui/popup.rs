@@ -7,7 +7,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use std::collections::HashMap;
-use tokio::sync::oneshot;
 
 use super::theme::THEME;
 
@@ -16,9 +15,7 @@ use super::theme::THEME;
 pub enum Popup {
     /// Confirmation dialog for incoming transfer request.
     TransferConfirm {
-        sender: DeviceInfo,
-        files: HashMap<FileId, FileMetadata>,
-        response_tx: oneshot::Sender<bool>,
+        request: crate::server::PendingRequest,
     },
     /// Progress indicator for active transfer.
     TransferProgress {
@@ -50,8 +47,8 @@ impl Popup {
         frame.render_widget(Clear, popup_area);
 
         match self {
-            Popup::TransferConfirm { sender, files, .. } => {
-                self.render_transfer_confirm(frame, popup_area, sender, files);
+            Popup::TransferConfirm { request } => {
+                self.render_transfer_confirm(frame, popup_area, request.sender(), request.files());
             }
             Popup::TransferProgress {
                 file_name,

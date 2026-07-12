@@ -262,6 +262,9 @@ cargo clippy --all-features
 cargo fmt --check
 ```
 
+- `cargo test` — unit + conformance + in-process interop suites (no Docker needed).
+- `./e2e/run.sh` — containerized sender→receiver e2e over the compose network (requires Docker).
+
 ## About
 
 This is a [CrossCopy](https://crosscopy.io) project - a high-performance Rust implementation of the LocalSend protocol for fast, secure local network file transfers.

@@ -3,6 +3,7 @@ use crate::error::{LocalSendError, Result};
 use crate::protocol::{
     DeviceInfo, FileId, FileMetadata, PrepareUploadRequest, PrepareUploadResponse, SessionId, Token,
 };
+use futures_util::StreamExt;
 use reqwest::{Body, Client as HttpClient, StatusCode};
 use std::collections::HashMap;
 use tokio::fs::File;
@@ -155,18 +156,28 @@ impl LocalSendClient {
         // Stream the file instead of loading it all into memory
         let file = File::open(file_path).await?;
         let total_bytes = file.metadata().await?.len();
+        let started = std::time::Instant::now();
+        let progress = progress.map(std::sync::Arc::new);
 
-        // Create a streaming body
-        let stream = ReaderStream::new(file);
-        let body = Body::wrap_stream(stream);
+        // Wrap the file stream so every chunk that goes out over the wire
+        // also advances a running byte counter and reports it upstream.
+        let counter_progress = progress.clone();
+        let mut sent: u64 = 0;
+        let counted = ReaderStream::new(file).inspect(move |chunk| {
+            if let (Ok(c), Some(cb)) = (chunk, counter_progress.as_ref()) {
+                sent += c.len() as u64;
+                cb(sent, total_bytes, started.elapsed().as_secs_f64());
+            }
+        });
+        let body = Body::wrap_stream(counted);
 
-        // TODO: Add progress tracking in future iteration
-        // For now, just report at start and end
-        if let Some(ref callback) = progress {
-            callback(0, total_bytes, 0.0);
-        }
-
-        let response = self.client.post(&url).body(body).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_LENGTH, total_bytes)
+            .body(body)
+            .send()
+            .await?;
 
         let status = response.status();
         match status {
@@ -175,6 +186,26 @@ impl LocalSendClient {
                 status.as_u16(),
                 "File upload failed",
             )),
+        }
+    }
+
+    pub async fn cancel(&self, target: &DeviceInfo, session_id: &SessionId) -> Result<()> {
+        let ip = target
+            .ip
+            .as_ref()
+            .ok_or_else(|| LocalSendError::network("Target IP not provided"))?;
+        let url = format!(
+            "{}://{}:{}/api/localsend/v2/cancel?sessionId={}",
+            target.protocol, ip, target.port, session_id
+        );
+        let response = self.client.post(&url).send().await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(LocalSendError::http_failed(
+                response.status().as_u16(),
+                "Cancel failed",
+            ))
         }
     }
 }

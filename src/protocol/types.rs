@@ -7,9 +7,10 @@ use std::fmt;
 // ============================================================================
 
 /// Protocol type for LocalSend communication
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
+    #[default]
     Http,
     Https,
 }
@@ -116,8 +117,9 @@ impl Default for FileId {
 pub struct Token(String);
 
 impl Token {
-    pub fn new(session_id: &SessionId, file_id: &FileId) -> Self {
-        Self(format!("{}_{}", session_id.as_str(), file_id.as_str()))
+    /// Random per-file upload token (128-bit, hex).
+    pub fn random() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
     }
 
     pub fn from_string(s: String) -> Self {
@@ -187,19 +189,26 @@ pub enum DeviceType {
     Server,
 }
 
+fn default_port() -> u16 {
+    crate::protocol::constants::DEFAULT_HTTP_PORT
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub alias: String,
     pub version: String,
-    #[serde(rename = "deviceModel")]
+    #[serde(rename = "deviceModel", default)]
     pub device_model: Option<String>,
-    #[serde(rename = "deviceType")]
+    #[serde(rename = "deviceType", default)]
     pub device_type: Option<DeviceType>,
     pub fingerprint: String,
+    #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "Protocol::default")]
     pub protocol: Protocol,
+    #[serde(default)]
     pub download: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
 }
 
@@ -247,13 +256,14 @@ pub struct ReceivedFile {
 pub struct AnnouncementMessage {
     pub alias: String,
     pub version: String,
-    #[serde(rename = "deviceModel")]
+    #[serde(rename = "deviceModel", default)]
     pub device_model: Option<String>,
-    #[serde(rename = "deviceType")]
+    #[serde(rename = "deviceType", default)]
     pub device_type: Option<DeviceType>,
     pub fingerprint: String,
     pub port: u16,
     pub protocol: Protocol,
+    #[serde(default)]
     pub download: bool,
     #[serde(default)]
     pub announce: bool,

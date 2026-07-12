@@ -7,13 +7,13 @@ mod path_safety;
 pub mod prelude;
 pub mod protocol;
 pub mod server;
-pub mod storage;
 
 // Re-export commonly used types for backwards compatibility
 pub use client::{LocalSendClient, TlsTrustPolicy};
 pub use core::{
-    DeviceInfoBuilder, Session, TransferState, build_file_metadata, build_file_metadata_from_bytes,
+    DeviceInfoBuilder, Session, build_file_metadata, build_file_metadata_from_bytes,
     generate_file_id, get_device_model, get_device_type, get_local_ip, get_mime_type,
+    unique_save_path,
 };
 #[cfg(feature = "https")]
 pub use crypto::{TlsCertificate, generate_tls_certificate};
@@ -27,7 +27,6 @@ pub use protocol::{
     validate_device_info, validate_file_metadata, validate_protocol_version,
 };
 pub use server::LocalSendServer;
-pub use storage::{FileSystem, TokioFileSystem};
 
 #[cfg(feature = "cli")]
 pub mod cli;

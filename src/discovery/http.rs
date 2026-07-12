@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::core::device::{get_device_model, get_device_type};
 use crate::crypto::generate_fingerprint;
 use crate::discovery::Discovery;
@@ -7,7 +6,6 @@ use crate::protocol::{DEFAULT_HTTP_PORT, DeviceInfo, PROTOCOL_VERSION, Protocol}
 use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use tokio::sync::broadcast;
 
 pub type Result<T> = std::result::Result<T, LocalSendError>;
@@ -41,7 +39,10 @@ impl HttpDiscovery {
         })
     }
 
-    async fn scan_subnet(&self, base_ip: &str) -> Result<Vec<DeviceInfo>> {
+    /// Sweeps every host address `x.y.z.1..=255` in the `/24` subnet of `base_ip`,
+    /// POSTing this device's info to each host's `/api/localsend/v2/register` endpoint,
+    /// and returns the devices that responded successfully (i.e. the discovered peers).
+    pub async fn scan_subnet(&self, base_ip: &str) -> Result<Vec<DeviceInfo>> {
         let base: Vec<u8> = base_ip
             .split('.')
             .map(|s| s.parse::<u8>().unwrap_or(0))
@@ -95,19 +96,10 @@ impl Discovery for HttpDiscovery {
 
         self.running.store(true, Ordering::Relaxed);
 
-        let (tx, mut _rx) = broadcast::channel(100);
-        self.tx = Some(tx.clone());
+        let (tx, _rx) = broadcast::channel(100);
+        self.tx = Some(tx);
 
-        let running = self.running.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            interval.tick().await;
-
-            while running.load(Ordering::Relaxed) {
-                interval.tick().await;
-            }
-        });
+        tracing::debug!("HttpDiscovery: passive; call scan_subnet() explicitly");
 
         Ok(())
     }

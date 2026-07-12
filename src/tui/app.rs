@@ -4,8 +4,7 @@ use crate::client::LocalSendClient;
 use crate::crypto::generate_fingerprint;
 use crate::discovery::{Discovery, MulticastDiscovery};
 use crate::protocol::{DeviceInfo, DeviceType, PROTOCOL_VERSION, Protocol, ReceivedFile};
-use crate::server::LocalSendServer;
-use crate::server::PendingTransfer;
+use crate::server::{LocalSendServer, ServerEvent};
 
 use super::popup::{MessageLevel, Popup};
 use super::screens::{
@@ -46,7 +45,7 @@ pub struct App {
     // Shared state
     devices: Arc<RwLock<Vec<DeviceInfo>>>,
     received_files: Arc<RwLock<Vec<ReceivedFile>>>,
-    pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
+    events_rx: Option<tokio::sync::mpsc::Receiver<ServerEvent>>,
 
     // Popup overlay
     popup: Option<Popup>,
@@ -91,7 +90,6 @@ impl App {
         let save_dir = PathBuf::from("./downloads");
         let devices = Arc::new(RwLock::new(Vec::new()));
         let received_files = Arc::new(RwLock::new(Vec::new()));
-        let pending_transfer = Arc::new(RwLock::new(None));
 
         Ok(Self {
             should_quit: false,
@@ -102,7 +100,7 @@ impl App {
             save_dir: save_dir.clone(),
             devices: devices.clone(),
             received_files: received_files.clone(),
-            pending_transfer,
+            events_rx: None,
             popup: None,
 
             send_text: SendTextScreen::new(devices.clone()),
@@ -129,7 +127,7 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
 
             // Check for pending transfers (popup trigger)
-            self.check_pending_transfer();
+            self.poll_server_events();
 
             // Handle events with timeout
             if event::poll(tick_rate)?
@@ -182,43 +180,59 @@ impl App {
             std::fs::create_dir_all(&self.save_dir)?;
         }
 
-        let mut server = LocalSendServer::new_with_device(
-            self.device_info.clone(),
-            self.save_dir.clone(),
-            self.https,
-            self.pending_transfer.clone(),
-            self.received_files.clone(),
-        )?;
+        let protocol = if self.https {
+            Protocol::Https
+        } else {
+            Protocol::Http
+        };
 
-        #[cfg(feature = "https")]
-        if self.https {
-            let cert = crate::crypto::generate_tls_certificate()?;
-            server.set_tls_certificate(cert);
-        }
+        let (server, events) = LocalSendServer::builder()
+            .alias(self.device_info.alias.clone())
+            .port(self.port)
+            .save_dir(self.save_dir.clone())
+            .protocol(protocol)
+            .auto_accept(false)
+            .build()
+            .await?;
 
-        server.start(None).await?;
-
+        self.events_rx = Some(events);
         self.server = Some(server);
 
         Ok(())
     }
 
-    /// Check for pending transfer and show popup.
-    fn check_pending_transfer(&mut self) {
-        if self.popup.is_some() {
-            return; // Already showing a popup
-        }
-
-        let mut pending = self
-            .pending_transfer
-            .try_write()
-            .unwrap_or_else(|_| panic!("Lock poisoned"));
-        if let Some(transfer) = pending.take() {
-            self.popup = Some(Popup::TransferConfirm {
-                sender: transfer.sender,
-                files: transfer.files,
-                response_tx: transfer.response_tx,
-            });
+    /// Drain pending `ServerEvent`s and react (show popup, record received files).
+    fn poll_server_events(&mut self) {
+        let Some(rx) = self.events_rx.as_mut() else {
+            return;
+        };
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ServerEvent::TransferRequest(request) => {
+                    if self.popup.is_none() {
+                        self.popup = Some(Popup::TransferConfirm { request });
+                    } else {
+                        request.decline(); // busy with another dialog
+                    }
+                }
+                ServerEvent::FileReceived {
+                    file_name,
+                    size,
+                    sender_alias,
+                    ..
+                } => {
+                    self.received_files
+                        .try_write()
+                        .unwrap_or_else(|_| panic!("Lock poisoned"))
+                        .push(ReceivedFile {
+                            file_name,
+                            size,
+                            sender: sender_alias,
+                            time: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        });
+                }
+                ServerEvent::SessionDone { .. } => {}
+            }
         }
     }
 
@@ -328,17 +342,15 @@ impl App {
             Some(Popup::TransferConfirm { .. }) => {
                 match key {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                        // Accept - we need to take ownership of the sender
-                        if let Some(Popup::TransferConfirm { response_tx, .. }) = self.popup.take()
-                        {
-                            let _ = response_tx.send(true);
+                        // Accept - we need to take ownership of the request
+                        if let Some(Popup::TransferConfirm { request }) = self.popup.take() {
+                            request.accept();
                         }
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         // Decline
-                        if let Some(Popup::TransferConfirm { response_tx, .. }) = self.popup.take()
-                        {
-                            let _ = response_tx.send(false);
+                        if let Some(Popup::TransferConfirm { request }) = self.popup.take() {
+                            request.decline();
                         }
                     }
                     _ => {}

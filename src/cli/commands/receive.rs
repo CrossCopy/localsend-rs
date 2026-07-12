@@ -51,80 +51,78 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
         println!("HTTPS mode ENABLED");
     }
 
-    #[cfg(feature = "https")]
-    let tls_cert = if https_enabled {
-        Some(crate::crypto::generate_tls_certificate()?)
-    } else {
-        None
-    };
-
-    let fingerprint = if https_enabled {
-        #[cfg(feature = "https")]
-        {
-            tls_cert.as_ref().unwrap().fingerprint.clone()
-        }
-        #[cfg(not(feature = "https"))]
-        {
-            crate::crypto::generate_fingerprint()
-        }
-    } else {
-        crate::crypto::generate_fingerprint()
-    };
-
     let protocol_enum = if https_enabled {
         crate::protocol::Protocol::Https
     } else {
         crate::protocol::Protocol::Http
     };
 
-    let device = crate::protocol::DeviceInfo {
-        alias: "LocalSend-Rust".to_string(),
-        version: crate::protocol::PROTOCOL_VERSION.to_string(),
-        device_model: Some(crate::core::device::get_device_model()),
-        device_type: Some(crate::core::device::get_device_type()),
-        fingerprint,
-        port: command.port,
-        protocol: protocol_enum,
-        download: false,
-        ip: None,
-    };
+    let mut builder = crate::server::LocalSendServer::builder()
+        .alias("LocalSend-Rust".to_string())
+        .port(command.port)
+        .save_dir(&command.directory)
+        .protocol(protocol_enum)
+        .auto_accept(command.auto_accept);
+    if let Some(ref pin) = command.pin {
+        builder = builder.pin(pin.clone());
+    }
+    let (mut server, mut events) = builder.build().await?;
 
-    // Start multicast discovery
-    let mut discovery = crate::discovery::MulticastDiscovery::new_with_device(device.clone());
-
+    // Discovery must announce the SAME device identity the server uses.
+    let mut discovery =
+        crate::discovery::MulticastDiscovery::new_with_device(server.device().clone());
     println!("Starting multicast discovery...");
     discovery.start().await?;
-    discovery.on_discovered(|device| {
-        println!(
-            "Device discovered: {} (port: {})",
-            device.alias, device.port
-        );
-    });
-
-    // Announce our presence
     println!("Announcing presence to network...");
     discovery.announce_presence().await?;
 
-    let pending_transfer = std::sync::Arc::new(tokio::sync::RwLock::new(None));
-    let received_files = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
-    let mut server = crate::server::LocalSendServer::new_with_device(
-        device,
-        command.directory,
-        https_enabled,
-        pending_transfer,
-        received_files,
-    )?;
-
-    #[cfg(feature = "https")]
-    if let Some(cert) = tls_cert {
-        server.set_tls_certificate(cert);
-    }
-
-    server.start(None).await?;
+    let auto_accept = command.auto_accept;
+    let event_loop = tokio::spawn(async move {
+        while let Some(ev) = events.recv().await {
+            match ev {
+                crate::server::ServerEvent::TransferRequest(req) => {
+                    println!(
+                        "Incoming transfer from '{}' ({} file(s))",
+                        req.sender().alias,
+                        req.files().len()
+                    );
+                    if auto_accept {
+                        req.accept();
+                    } else {
+                        // Headless interactive: y/n on stdin.
+                        let accept = inquire::Confirm::new("Accept this transfer?")
+                            .with_default(false)
+                            .prompt()
+                            .unwrap_or(false);
+                        if accept { req.accept() } else { req.decline() }
+                    }
+                }
+                crate::server::ServerEvent::FileReceived {
+                    file_name,
+                    path,
+                    size,
+                    sender_alias,
+                    ..
+                } => {
+                    println!(
+                        "Received '{}' ({} bytes) from {} -> {}",
+                        file_name,
+                        size,
+                        sender_alias,
+                        path.display()
+                    );
+                }
+                crate::server::ServerEvent::SessionDone { session_id } => {
+                    println!("Session {} complete", session_id);
+                }
+            }
+        }
+    });
 
     tokio::signal::ctrl_c().await?;
 
     println!("\nShutting down server...");
+    event_loop.abort();
     server.stop();
     discovery.stop();
 

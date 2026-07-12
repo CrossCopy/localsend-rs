@@ -1,146 +1,88 @@
-use crate::protocol::{
-    DeviceInfo, FileId, FileMetadata, PrepareUploadRequest, PrepareUploadResponse, Protocol,
-    ReceivedFile, SessionId,
-};
-use axum::{
-    Json, Router,
-    body::Body,
-    extract::{Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{get, post},
-};
-use chrono::Local;
-use futures_util::StreamExt;
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use super::events::ServerEvent;
+use super::state::{ProgressCallback, ServerState};
+use crate::protocol::{DeviceInfo, Protocol};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, RwLock, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "https")]
 use axum_server::tls_rustls::RustlsConfig;
 
-pub type ProgressCallback = Box<dyn Fn(String, u64, u64, f64) + Send + Sync>;
-
-pub struct PendingTransfer {
-    pub sender: DeviceInfo,
-    pub files: HashMap<FileId, FileMetadata>,
-    pub response_tx: oneshot::Sender<bool>,
-}
-
 pub struct LocalSendServer {
     device: DeviceInfo,
     save_dir: PathBuf,
     handle: Option<JoinHandle<()>>,
+    sweep_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     https: bool,
     #[cfg(feature = "https")]
     tls_cert: Option<crate::crypto::TlsCertificate>,
-    pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
-    pending_transfer_notify: Option<Arc<Notify>>,
-    received_files: Arc<RwLock<Vec<ReceivedFile>>>,
-}
-
-pub struct ActiveSession {
-    pub session_id: SessionId,
-    pub files: HashMap<FileId, FileMetadata>,
-    pub sender_alias: String,
-    pub last_activity: std::time::Instant,
-}
-
-pub struct ServerState {
-    pub device: DeviceInfo,
-    pub current_session: Option<ActiveSession>,
-    pub save_dir: PathBuf,
-    pub _progress_callback: Option<ProgressCallback>,
-    pub pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
-    pub pending_transfer_notify: Option<Arc<Notify>>,
-    pub received_files: Arc<RwLock<Vec<ReceivedFile>>>,
-}
-
-async fn write_body_to_file(body: Body, path: &Path) -> std::io::Result<u64> {
-    let mut file = tokio::fs::File::create(path).await?;
-    let mut bytes_written = 0u64;
-    let mut stream = body.into_data_stream();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
-        bytes_written += chunk.len() as u64;
-        file.write_all(&chunk).await?;
-    }
-
-    file.flush().await?;
-    Ok(bytes_written)
-}
-
-async fn publish_pending_transfer(
-    pending_transfer: &Arc<RwLock<Option<PendingTransfer>>>,
-    pending_transfer_notify: Option<&Arc<Notify>>,
-    pending: PendingTransfer,
-) {
-    {
-        let mut pending_guard = pending_transfer.write().await;
-        *pending_guard = Some(pending);
-    }
-
-    if let Some(notify) = pending_transfer_notify {
-        notify.notify_one();
-    }
+    events_rx: Option<mpsc::Receiver<ServerEvent>>,
+    auto_accept: bool,
+    accept_timeout: Duration,
+    /// Receiver-side PIN, enforced by `pin::PinGate` in the request handler.
+    pin: Option<String>,
 }
 
 impl LocalSendServer {
-    pub fn new(
-        alias: String,
-        port: u16,
-        save_dir: PathBuf,
-    ) -> std::result::Result<Self, crate::error::LocalSendError> {
-        let device = DeviceInfo {
-            alias,
-            version: crate::protocol::PROTOCOL_VERSION.to_string(),
-            device_model: Some(crate::core::device::get_device_model()),
-            device_type: Some(crate::core::device::get_device_type()),
-            fingerprint: crate::crypto::generate_fingerprint(),
-            port,
-            protocol: Protocol::Http,
-            download: false,
-            ip: None,
-        };
-        Self::new_with_device(
-            device,
-            save_dir,
-            false,
-            Arc::new(RwLock::new(None)),
-            Arc::new(RwLock::new(Vec::new())),
-        )
-    }
-
-    pub fn new_with_device(
+    /// Private constructor used by [`LocalSendServerBuilder::build`].
+    fn from_parts(
         device: DeviceInfo,
         save_dir: PathBuf,
         https: bool,
-        pending_transfer: Arc<RwLock<Option<PendingTransfer>>>,
-        received_files: Arc<RwLock<Vec<ReceivedFile>>>,
+        pin: Option<String>,
+        auto_accept: bool,
+        accept_timeout: Duration,
     ) -> std::result::Result<Self, crate::error::LocalSendError> {
         Ok(Self {
             device,
             save_dir,
             handle: None,
+            sweep_handle: None,
             shutdown_tx: None,
             https,
             #[cfg(feature = "https")]
             tls_cert: None,
-            pending_transfer,
-            pending_transfer_notify: None,
-            received_files,
+            events_rx: None,
+            auto_accept,
+            accept_timeout,
+            pin,
         })
     }
 
-    pub fn set_pending_transfer_notify(&mut self, notify: Arc<Notify>) {
-        self.pending_transfer_notify = Some(notify);
+    /// Returns the actual bound port. If the server was started with an
+    /// ephemeral port (`0`), this reflects the OS-assigned port after
+    /// `start()`/`builder().build()` has returned.
+    pub fn port(&self) -> u16 {
+        self.device.port
+    }
+
+    pub fn device(&self) -> &DeviceInfo {
+        &self.device
+    }
+
+    pub fn builder() -> LocalSendServerBuilder {
+        LocalSendServerBuilder {
+            alias: "LocalSend-Rust".to_string(),
+            port: crate::protocol::DEFAULT_HTTP_PORT,
+            save_dir: PathBuf::from("./downloads"),
+            protocol: Protocol::Http,
+            pin: None,
+            auto_accept: false,
+            accept_timeout: Duration::from_secs(60),
+        }
+    }
+
+    /// Take the event receiver. Returns `Some` once, after `start()`.
+    pub fn take_events(&mut self) -> Option<mpsc::Receiver<ServerEvent>> {
+        self.events_rx.take()
+    }
+
+    pub fn set_auto_accept(&mut self, yes: bool) {
+        self.auto_accept = yes;
     }
 
     #[cfg(feature = "https")]
@@ -152,17 +94,8 @@ impl LocalSendServer {
         &mut self,
         progress_callback: Option<ProgressCallback>,
     ) -> std::result::Result<(), crate::error::LocalSendError> {
-        let state = Arc::new(RwLock::new(ServerState {
-            device: self.device.clone(),
-            current_session: None,
-            save_dir: self.save_dir.clone(),
-            _progress_callback: progress_callback,
-            pending_transfer: self.pending_transfer.clone(),
-            pending_transfer_notify: self.pending_transfer_notify.clone(),
-            received_files: self.received_files.clone(),
-        }));
-
-        let router = Self::create_router(state.clone());
+        let (events_tx, events_rx) = mpsc::channel(64);
+        self.events_rx = Some(events_rx);
 
         let addr = format!("0.0.0.0:{}", self.device.port);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -188,14 +121,36 @@ impl LocalSendServer {
                             ))
                         })?;
 
-                let socket_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
-                    crate::error::LocalSendError::network(format!("Failed to parse address: {}", e))
-                })?;
+                // Bind before spawn so the real (possibly OS-assigned) port is
+                // known before the ServerState/router are built.
+                let std_listener = std::net::TcpListener::bind(&addr)?;
+                std_listener.set_nonblocking(true)?;
+                let bound_port = std_listener.local_addr()?.port();
+                self.device.port = bound_port;
+
+                let state = Arc::new(RwLock::new(ServerState {
+                    device: self.device.clone(),
+                    current_session: None,
+                    save_dir: self.save_dir.clone(),
+                    _progress_callback: progress_callback,
+                    events_tx,
+                    auto_accept: self.auto_accept,
+                    accept_timeout: self.accept_timeout,
+                    pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
+                }));
+                let router = super::routes::create_router(state.clone());
+
+                let server = axum_server::from_tcp_rustls(std_listener, tls_config)
+                    .map_err(|e| {
+                        crate::error::LocalSendError::network(format!(
+                            "Failed to serve HTTPS listener: {}",
+                            e
+                        ))
+                    })?
+                    .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>());
 
                 let handle = tokio::spawn(async move {
-                    tracing::info!("Starting HTTPS server on {}", socket_addr);
-                    let server = axum_server::bind_rustls(socket_addr, tls_config)
-                        .serve(router.into_make_service());
+                    tracing::info!("Starting HTTPS server on port {}", bound_port);
 
                     tokio::select! {
                         res = server => {
@@ -210,20 +165,41 @@ impl LocalSendServer {
                 });
 
                 self.handle = Some(handle);
+                self.sweep_handle = Some(spawn_session_sweep(state));
                 Ok(())
             }
             #[cfg(not(feature = "https"))]
             {
-                return Err(crate::error::LocalSendError::network(
+                Err(crate::error::LocalSendError::network(
                     "HTTPS support not enabled. Please build with --features https",
-                ));
+                ))
             }
         } else {
+            // Bind before spawn so the real (possibly OS-assigned) port is
+            // known before the ServerState/router are built.
             let listener = TcpListener::bind(&addr).await?;
-            tracing::info!("Starting HTTP server on {}", addr);
+            let bound_port = listener.local_addr()?.port();
+            self.device.port = bound_port;
+            tracing::info!("Starting HTTP server on port {}", bound_port);
+
+            let state = Arc::new(RwLock::new(ServerState {
+                device: self.device.clone(),
+                current_session: None,
+                save_dir: self.save_dir.clone(),
+                _progress_callback: progress_callback,
+                events_tx,
+                auto_accept: self.auto_accept,
+                accept_timeout: self.accept_timeout,
+                pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
+            }));
+            let router = super::routes::create_router(state.clone());
 
             let handle = tokio::spawn(async move {
-                let server = axum::serve(listener, router).with_graceful_shutdown(async {
+                let server = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async {
                     let _ = shutdown_rx.await;
                 });
 
@@ -233,6 +209,7 @@ impl LocalSendServer {
             });
 
             self.handle = Some(handle);
+            self.sweep_handle = Some(spawn_session_sweep(state));
             Ok(())
         }
     }
@@ -241,369 +218,141 @@ impl LocalSendServer {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(handle) = self.sweep_handle.take() {
+            handle.abort();
+        }
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
     }
-
-    fn create_router(state: Arc<RwLock<ServerState>>) -> Router {
-        Router::new()
-            .route("/api/localsend/v2/info", get(handle_info))
-            .route("/api/localsend/v2/register", post(handle_register))
-            .route(
-                "/api/localsend/v2/prepare-upload",
-                post(handle_prepare_upload),
-            )
-            .route("/api/localsend/v2/upload", post(handle_upload))
-            .route("/api/localsend/v2/cancel", post(handle_cancel))
-            .with_state(state)
-    }
 }
 
-async fn handle_info(State(state): State<Arc<RwLock<ServerState>>>) -> Response {
-    let state = state.read().await;
-    Json(state.device.clone()).into_response()
-}
-
-async fn handle_register(
-    State(state): State<Arc<RwLock<ServerState>>>,
-    Json(remote_device): Json<DeviceInfo>,
-) -> Response {
-    tracing::debug!("Register request from {:?}", remote_device.alias);
-    let state = state.read().await;
-    Json(state.device.clone()).into_response()
-}
-
-#[derive(Deserialize)]
-struct PrepareUploadParams {
-    #[serde(rename = "pin")]
-    _pin: Option<String>,
-}
-
-async fn handle_prepare_upload(
-    State(state_ref): State<Arc<RwLock<ServerState>>>,
-    Query(_params): Query<PrepareUploadParams>,
-    Json(request): Json<PrepareUploadRequest>,
-) -> Response {
-    use crate::protocol::{SessionId, Token};
-
-    let session_id = SessionId::new();
-    let mut files_map = HashMap::new();
-
-    // Check if it's a text message (all files have non-empty preview and small size)
-    let is_message = !request.files.is_empty()
-        && request
-            .files
-            .values()
-            .all(|f| f.preview.is_some() && f.size < 1024 * 1024);
-
-    for file_id in request.files.keys() {
-        let token = Token::new(&session_id, file_id);
-        files_map.insert(file_id.clone(), token);
-    }
-
-    let (pending_transfer_arc, pending_transfer_notify, _sender_info, response_rx, pending) = {
-        let mut state = state_ref.write().await;
-
-        // Check for existing session timeout (e.g. 5 minutes or session finished)
-        if let Some(session) = &state.current_session {
-            if session.last_activity.elapsed().as_secs() > 300 {
-                state.current_session = None;
-            } else {
-                tracing::warn!("Session already exists, rejecting new session");
-                return StatusCode::CONFLICT.into_response();
+/// Every 60s, reclaim a session that's been idle past its 300s TTL (R5: a
+/// sender that vanishes mid-transfer must not permanently wedge the single
+/// upload slot). The lock is only held for the duration of the check itself
+/// -- no `.await` happens while it's held.
+fn spawn_session_sweep(state: Arc<RwLock<ServerState>>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let mut s = state.write().await;
+            if let Some(session) = &s.current_session
+                && session.is_timed_out(300)
+            {
+                tracing::info!("Sweeping timed-out session {}", session.id);
+                s.current_session = None;
             }
         }
-
-        let session = ActiveSession {
-            session_id: session_id.clone(),
-            files: request.files.clone(),
-            sender_alias: request.info.alias.clone(),
-            last_activity: std::time::Instant::now(),
-        };
-
-        state.current_session = Some(session);
-
-        let (response_tx, response_rx) = oneshot::channel();
-        let pending = PendingTransfer {
-            sender: request.info.clone(),
-            files: request.files.clone(),
-            response_tx,
-        };
-
-        (
-            state.pending_transfer.clone(),
-            state.pending_transfer_notify.clone(),
-            request.info.clone(),
-            response_rx,
-            pending,
-        )
-    };
-
-    publish_pending_transfer(
-        &pending_transfer_arc,
-        pending_transfer_notify.as_ref(),
-        pending,
-    )
-    .await;
-
-    // Wait for user or timeout
-    let accepted = match tokio::time::timeout(std::time::Duration::from_secs(60), response_rx).await
-    {
-        Ok(Ok(val)) => val,
-        _ => false,
-    };
-
-    if !accepted {
-        let mut pending_guard = pending_transfer_arc.write().await;
-        *pending_guard = None;
-
-        let mut state = state_ref.write().await;
-        state.current_session = None;
-        tracing::info!("Transfer rejected by user or timeout");
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    // Refresh last activity on acceptance
-    {
-        let mut state = state_ref.write().await;
-        if let Some(s) = &mut state.current_session {
-            s.last_activity = std::time::Instant::now();
-        }
-    }
-
-    // If it's a message, return 204 No Content
-    if is_message {
-        let mut pending_guard = pending_transfer_arc.write().await;
-        *pending_guard = None;
-
-        let mut state = state_ref.write().await;
-
-        // Save messages to files and update TUI list
-        for file in request.files.values() {
-            if let Some(content) = &file.preview {
-                let now = Local::now();
-                let time_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
-                let filename = format!(
-                    "message_{}_{}.txt",
-                    now.format("%Y%m%d_%H%M%S"),
-                    file.file_name.replace("/", "_")
-                );
-                let path = match crate::path_safety::safe_join(&state.save_dir, &filename) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        tracing::warn!("Rejected unsafe message file name: {}", e);
-                        continue;
-                    }
-                };
-                if let Err(e) = std::fs::write(&path, content) {
-                    tracing::error!("Failed to save message to {:?}: {}", path, e);
-                } else {
-                    tracing::info!("Saved message to {:?}", path);
-
-                    // Update TUI list
-                    let mut files_list = state.received_files.write().await;
-                    files_list.push(ReceivedFile {
-                        file_name: filename,
-                        size: content.len() as u64,
-                        sender: request.info.alias.clone(),
-                        time: time_str,
-                    });
-                }
-            }
-        }
-
-        state.current_session = None;
-        return StatusCode::NO_CONTENT.into_response();
-    }
-
-    Json(PrepareUploadResponse {
-        session_id,
-        files: files_map,
     })
-    .into_response()
 }
 
-#[derive(Deserialize)]
-struct UploadParams {
-    #[serde(rename = "sessionId")]
-    session_id: SessionId,
-    #[serde(rename = "fileId")]
-    file_id: FileId,
-    #[serde(rename = "token")]
-    token: crate::protocol::Token,
+/// Builder for [`LocalSendServer`]; the canonical construction path.
+///
+/// `build()` binds the listener, starts serving, and returns the server
+/// together with its [`ServerEvent`] receiver — the server is already
+/// listening when `build()` returns. Pass `port(0)` for an OS-assigned
+/// ephemeral port, then read the real port back via [`LocalSendServer::port`].
+pub struct LocalSendServerBuilder {
+    alias: String,
+    port: u16,
+    save_dir: PathBuf,
+    protocol: Protocol,
+    pin: Option<String>,
+    auto_accept: bool,
+    accept_timeout: Duration,
 }
 
-#[axum::debug_handler]
-async fn handle_upload(
-    State(state_ref): State<Arc<RwLock<ServerState>>>,
-    Query(params): Query<UploadParams>,
-    body: Body,
-) -> Response {
-    let state = state_ref.write().await;
+impl LocalSendServerBuilder {
+    pub fn alias(mut self, alias: impl Into<String>) -> Self {
+        self.alias = alias.into();
+        self
+    }
 
-    // Verify session
-    let (file_name, session_id) = if let Some(session) = &state.current_session {
-        if session.session_id != params.session_id {
-            tracing::warn!(
-                "Upload rejected: Session ID mismatch. Expected {}, got {}",
-                session.session_id,
-                params.session_id
-            );
-            return StatusCode::FORBIDDEN.into_response();
-        }
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
 
-        // Verify token
-        let expected_token = crate::protocol::Token::new(&session.session_id, &params.file_id);
-        if params.token.as_str() != expected_token.as_str() {
-            tracing::warn!("Upload rejected: Token mismatch");
-            return StatusCode::FORBIDDEN.into_response();
-        }
+    pub fn save_dir(mut self, dir: impl AsRef<std::path::Path>) -> Self {
+        self.save_dir = dir.as_ref().to_path_buf();
+        self
+    }
 
-        // Find file metadata
-        if let Some(meta) = session.files.get(&params.file_id) {
-            (meta.file_name.clone(), session.session_id.clone())
+    pub fn protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    pub fn pin(mut self, pin: impl Into<String>) -> Self {
+        self.pin = Some(pin.into());
+        self
+    }
+
+    pub fn auto_accept(mut self, yes: bool) -> Self {
+        self.auto_accept = yes;
+        self
+    }
+
+    pub fn accept_timeout(mut self, d: Duration) -> Self {
+        self.accept_timeout = d;
+        self
+    }
+
+    pub async fn build(self) -> crate::Result<(LocalSendServer, mpsc::Receiver<ServerEvent>)> {
+        let https = matches!(self.protocol, Protocol::Https);
+
+        #[cfg(feature = "https")]
+        let tls_cert = if https {
+            Some(crate::crypto::generate_tls_certificate()?)
         } else {
-            tracing::warn!(
-                "Upload rejected: File ID {} not found in session",
-                params.file_id
-            );
-            return StatusCode::NOT_FOUND.into_response();
+            None
+        };
+        #[cfg(not(feature = "https"))]
+        if https {
+            return Err(crate::error::LocalSendError::network(
+                "HTTPS support not enabled; build with --features https",
+            ));
         }
-    } else {
-        tracing::warn!("Upload rejected: No active session");
-        return StatusCode::FORBIDDEN.into_response();
-    };
 
-    let save_path = match crate::path_safety::safe_join(&state.save_dir, &file_name) {
-        Ok(path) => path,
-        Err(e) => {
-            tracing::warn!("Upload rejected: {}", e);
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-    };
-
-    // Release the lock before async I/O operations
-    drop(state);
-
-    // Ensure parent directory exists (async)
-    if let Some(parent) = save_path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await
-    {
-        tracing::error!("Failed to create directory {:?}: {}", parent, e);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    let body_len = match write_body_to_file(body, &save_path).await {
-        Ok(bytes_written) => bytes_written,
-        Err(e) => {
-            tracing::error!("Failed to save file to {:?}: {}", save_path, e);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    tracing::info!("Received file: {:?} for session {}", save_path, session_id);
-
-    // Reacquire lock for state updates
-    let mut state = state_ref.write().await;
-
-    // Update TUI list
-    {
-        let sender = state
-            .current_session
-            .as_ref()
-            .map(|s| s.sender_alias.clone())
-            .unwrap_or_else(|| "Unknown".to_string());
-        let time_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut files_list = state.received_files.write().await;
-        files_list.push(ReceivedFile {
-            file_name,
-            size: body_len,
-            sender,
-            time: time_str,
-        });
-    }
-
-    // Update last activity and check if session is complete (simple heuristic: 1 file for now)
-    // In a real LocalSend implementation, we'd wait for all files.
-    if let Some(s) = &mut state.current_session {
-        s.last_activity = std::time::Instant::now();
-        // For simplicity, we clear session after one file if it was the only one
-        if s.files.len() <= 1 {
-            state.current_session = None;
-        }
-    }
-
-    StatusCode::OK.into_response()
-}
-
-#[derive(Deserialize)]
-struct CancelParams {
-    #[serde(rename = "sessionId")]
-    session_id: SessionId,
-}
-
-async fn handle_cancel(
-    State(state_ref): State<Arc<RwLock<ServerState>>>,
-    Query(params): Query<CancelParams>,
-) -> Response {
-    let mut state = state_ref.write().await;
-
-    if let Some(session) = &state.current_session
-        && session.session_id.as_str() == params.session_id.as_str()
-    {
-        state.current_session = None;
-        tracing::info!("Session {} cancelled", params.session_id);
-    }
-
-    StatusCode::OK.into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{PendingTransfer, publish_pending_transfer, write_body_to_file};
-    use axum::body::Body;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::{RwLock, oneshot};
-
-    #[tokio::test]
-    async fn write_body_to_file_writes_stream_and_returns_size() {
-        let path = std::env::temp_dir().join(format!(
-            "localsend-stream-upload-{}.bin",
-            uuid::Uuid::new_v4()
-        ));
-        let body = Body::from("streamed upload content");
-
-        let bytes_written = write_body_to_file(body, &path)
-            .await
-            .expect("body should stream to file");
-
-        assert_eq!(bytes_written, 23);
-        assert_eq!(
-            tokio::fs::read(&path).await.expect("file should exist"),
-            b"streamed upload content"
-        );
-
-        let _ = tokio::fs::remove_file(path).await;
-    }
-
-    #[tokio::test]
-    async fn publish_pending_transfer_sets_pending_and_notifies_listener() {
-        let pending_transfer = Arc::new(RwLock::new(None));
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let (response_tx, _response_rx) = oneshot::channel();
-        let pending = PendingTransfer {
-            sender: crate::DeviceInfo::new("sender".to_string(), 53317, crate::Protocol::Http),
-            files: HashMap::new(),
-            response_tx,
+        // HTTPS identity = SHA-256 of the cert (spec); HTTP = random string.
+        let fingerprint = {
+            #[cfg(feature = "https")]
+            if let Some(ref cert) = tls_cert {
+                cert.fingerprint.clone()
+            } else {
+                crate::crypto::generate_fingerprint()
+            }
+            #[cfg(not(feature = "https"))]
+            crate::crypto::generate_fingerprint()
         };
 
-        publish_pending_transfer(&pending_transfer, Some(&notify), pending).await;
+        let device = DeviceInfo {
+            alias: self.alias,
+            version: crate::protocol::PROTOCOL_VERSION.to_string(),
+            device_model: Some(crate::core::device::get_device_model()),
+            device_type: Some(crate::core::device::get_device_type()),
+            fingerprint,
+            port: self.port,
+            protocol: self.protocol,
+            download: false,
+            ip: None,
+        };
 
-        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
-            .await
-            .expect("pending transfer notification should wake listener");
-        assert!(pending_transfer.read().await.is_some());
+        let mut server = LocalSendServer::from_parts(
+            device,
+            self.save_dir,
+            https,
+            self.pin,
+            self.auto_accept,
+            self.accept_timeout,
+        )?;
+        #[cfg(feature = "https")]
+        if let Some(cert) = tls_cert {
+            server.set_tls_certificate(cert);
+        }
+        server.start(None).await?;
+        let events = server.take_events().expect("events available after start");
+        Ok((server, events))
     }
 }
