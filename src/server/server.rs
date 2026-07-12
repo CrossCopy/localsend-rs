@@ -76,6 +76,8 @@ impl LocalSendServer {
             pin: None,
             auto_accept: false,
             accept_timeout: Duration::from_secs(60),
+            #[cfg(feature = "https")]
+            tls_certificate: None,
         }
     }
 
@@ -114,6 +116,9 @@ impl LocalSendServer {
         if self.https {
             #[cfg(feature = "https")]
             {
+                rustls::crypto::ring::default_provider()
+                    .install_default()
+                    .ok();
                 let (cert_pem, key_pem) = if let Some(ref cert) = self.tls_cert {
                     (cert.cert_pem.clone(), cert.key_pem.clone())
                 } else {
@@ -271,6 +276,8 @@ pub struct LocalSendServerBuilder {
     pin: Option<String>,
     auto_accept: bool,
     accept_timeout: Duration,
+    #[cfg(feature = "https")]
+    tls_certificate: Option<crate::crypto::TlsCertificate>,
 }
 
 impl LocalSendServerBuilder {
@@ -309,12 +316,21 @@ impl LocalSendServerBuilder {
         self
     }
 
+    #[cfg(feature = "https")]
+    pub fn tls_certificate(mut self, certificate: crate::crypto::TlsCertificate) -> Self {
+        self.tls_certificate = Some(certificate);
+        self
+    }
+
     pub async fn build(self) -> crate::Result<(LocalSendServer, mpsc::Receiver<ServerEvent>)> {
         let https = matches!(self.protocol, Protocol::Https);
 
         #[cfg(feature = "https")]
         let tls_cert = if https {
-            Some(crate::crypto::generate_tls_certificate()?)
+            Some(match self.tls_certificate {
+                Some(certificate) => certificate,
+                None => crate::crypto::generate_tls_certificate()?,
+            })
         } else {
             None
         };
