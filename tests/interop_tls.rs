@@ -1,4 +1,7 @@
-use localsend_rs::{DeviceInfo, LocalSendServer, Protocol, generate_tls_certificate};
+use localsend_rs::{
+    DeviceInfo, LocalSendClient, LocalSendServer, Protocol, TlsTrustPolicy,
+    generate_tls_certificate,
+};
 use std::time::Duration;
 
 #[tokio::test]
@@ -75,5 +78,90 @@ async fn builder_generates_a_nonempty_https_fingerprint_when_none_is_supplied() 
     assert!(!server.device().fingerprint.is_empty());
     assert_eq!(info.fingerprint, server.device().fingerprint);
 
+    server.stop();
+}
+
+#[tokio::test]
+async fn pinned_client_accepts_the_matching_self_signed_leaf() {
+    let output = tempfile::tempdir().expect("output directory");
+    let (mut server, _events) = LocalSendServer::builder()
+        .alias("Pinned receiver")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Https)
+        .build()
+        .await
+        .expect("start HTTPS receiver");
+
+    let mut target = server.device().clone();
+    target.ip = Some("127.0.0.1".into());
+    let sender = DeviceInfo::new("Pinned sender".into(), 0, Protocol::Https);
+    let client = LocalSendClient::with_trust_policy(
+        sender,
+        TlsTrustPolicy::new([target.fingerprint.clone()]),
+    )
+    .expect("pinned client");
+
+    client
+        .register(&target)
+        .await
+        .expect("matching fingerprint should be accepted");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn pinned_client_rejects_a_non_matching_self_signed_leaf() {
+    let output = tempfile::tempdir().expect("output directory");
+    let (mut server, _events) = LocalSendServer::builder()
+        .alias("Pinned receiver")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Https)
+        .build()
+        .await
+        .expect("start HTTPS receiver");
+
+    let mut target = server.device().clone();
+    target.ip = Some("127.0.0.1".into());
+    let sender = DeviceInfo::new("Pinned sender".into(), 0, Protocol::Https);
+    let client = LocalSendClient::with_trust_policy(sender, TlsTrustPolicy::new(["f".repeat(64)]))
+        .expect("pinned client");
+
+    assert!(client.register(&target).await.is_err());
+    server.stop();
+}
+
+#[test]
+fn pinned_client_rejects_an_empty_or_malformed_discovered_fingerprint() {
+    let device = DeviceInfo::new("Pinned sender".into(), 0, Protocol::Https);
+    assert!(LocalSendClient::with_trust_policy(device.clone(), TlsTrustPolicy::new([""])).is_err());
+    assert!(
+        LocalSendClient::with_trust_policy(device, TlsTrustPolicy::new(["not-a-sha256"])).is_err()
+    );
+}
+
+#[tokio::test]
+async fn http_requests_bypass_the_tls_verifier() {
+    let output = tempfile::tempdir().expect("output directory");
+    let (mut server, _events) = LocalSendServer::builder()
+        .alias("HTTP receiver")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Http)
+        .build()
+        .await
+        .expect("start HTTP receiver");
+
+    let mut target = server.device().clone();
+    target.ip = Some("127.0.0.1".into());
+    let sender = DeviceInfo::new("Pinned sender".into(), 0, Protocol::Http);
+    let client = LocalSendClient::with_trust_policy(sender, TlsTrustPolicy::new(["f".repeat(64)]))
+        .expect("pinned client configuration");
+
+    client
+        .register(&target)
+        .await
+        .expect("HTTP should not invoke TLS verification");
     server.stop();
 }

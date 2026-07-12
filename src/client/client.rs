@@ -6,6 +6,7 @@ use crate::protocol::{
 use futures_util::StreamExt;
 use reqwest::{Body, Client as HttpClient, StatusCode};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 
@@ -19,27 +20,32 @@ pub struct LocalSendClient {
 
 impl LocalSendClient {
     pub fn new(device: DeviceInfo) -> Self {
-        // Historical behavior: accept any self-signed certificate. Prefer
-        // `with_trust_policy` for production usage to require explicit
-        // fingerprint allow-listing.
         Self {
-            client: HttpClient::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .unwrap_or_else(|_| HttpClient::new()),
+            client: HttpClient::new(),
             device,
         }
     }
 
-    pub fn with_trust_policy(device: DeviceInfo, policy: TlsTrustPolicy) -> Self {
-        let accept_invalid = policy.allows_insecure();
-        Self {
-            client: HttpClient::builder()
-                .danger_accept_invalid_certs(accept_invalid)
+    pub fn with_trust_policy(device: DeviceInfo, policy: TlsTrustPolicy) -> Result<Self> {
+        let client = match policy {
+            TlsTrustPolicy::InsecureForTests => HttpClient::builder()
+                .danger_accept_invalid_certs(true)
                 .build()
-                .unwrap_or_else(|_| HttpClient::new()),
-            device,
-        }
+                .map_err(LocalSendError::from)?,
+            TlsTrustPolicy::PinnedFingerprint(fingerprint) => {
+                let verifier = FingerprintVerifier::new(fingerprint)?;
+                let tls_config = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(verifier))
+                    .with_no_client_auth();
+                HttpClient::builder()
+                    .tls_backend_preconfigured(tls_config)
+                    .build()
+                    .map_err(LocalSendError::from)?
+            }
+        };
+
+        Ok(Self { client, device })
     }
 
     pub async fn register(&self, target: &DeviceInfo) -> Result<DeviceInfo> {
@@ -210,6 +216,89 @@ impl LocalSendClient {
     }
 }
 
+#[derive(Debug)]
+struct FingerprintVerifier {
+    expected_fingerprint: String,
+    signature_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+}
+
+impl FingerprintVerifier {
+    fn new(expected_fingerprint: String) -> Result<Self> {
+        let expected_fingerprint =
+            crate::client::trust_policy::normalize_fingerprint(&expected_fingerprint)
+                .ok_or_else(|| LocalSendError::network("Invalid LocalSend TLS fingerprint"))?;
+
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let placeholder_certificate = crate::crypto::generate_tls_certificate()?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                placeholder_certificate.cert_der,
+            ))
+            .map_err(|error| {
+                LocalSendError::network(format!("Invalid TLS verifier root: {error}"))
+            })?;
+        let signature_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|error| {
+                LocalSendError::network(format!("TLS verifier setup failed: {error}"))
+            })?;
+
+        Ok(Self {
+            expected_fingerprint,
+            signature_verifier,
+        })
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let actual = crate::crypto::sha256_from_bytes(end_entity.as_ref());
+        if crate::client::trust_policy::normalize_fingerprint(&actual)
+            .is_some_and(|actual| actual == self.expected_fingerprint)
+        {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "LocalSend TLS certificate fingerprint mismatch".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.signature_verifier
+            .verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.signature_verifier
+            .verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.signature_verifier.supported_verify_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::LocalSendClient;
@@ -219,9 +308,9 @@ mod tests {
     #[test]
     fn with_trust_policy_keeps_strict_policy_insecure_flag() {
         let device = DeviceInfo::new("alias".to_string(), 53317, Protocol::Https);
-        let policy = TlsTrustPolicy::new(vec!["trusted-fp".to_string()]);
+        let policy = TlsTrustPolicy::new(vec!["a".repeat(64)]);
 
-        let client = LocalSendClient::with_trust_policy(device, policy.clone());
+        let client = LocalSendClient::with_trust_policy(device, policy.clone()).unwrap();
 
         assert!(!policy.allows_insecure());
         assert!(!policy.allows(""));

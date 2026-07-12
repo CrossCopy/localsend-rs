@@ -1,16 +1,12 @@
-use std::collections::HashSet;
-
 /// Explicit policy for trusting self-signed LocalSend peer certificates.
 ///
-/// `TlsTrustPolicy::new(fingerprints)` accepts only the listed
-/// SHA-256 fingerprints and rejects everything else.
-///
-/// `TlsTrustPolicy::insecure()` preserves the historical accept-all behavior
-/// and is intended for development and ad-hoc LAN debugging. Production code
-/// should construct a policy from a trusted fingerprint store.
-#[derive(Debug, Clone)]
-pub struct TlsTrustPolicy {
-    trusted: Option<HashSet<String>>,
+/// `PinnedFingerprint` accepts one exact normalized SHA-256 fingerprint.
+/// `InsecureForTests` is test-only and must never be selected by production
+/// application code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsTrustPolicy {
+    PinnedFingerprint(String),
+    InsecureForTests,
 }
 
 impl TlsTrustPolicy {
@@ -19,19 +15,24 @@ impl TlsTrustPolicy {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self {
-            trusted: Some(trusted.into_iter().map(Into::into).collect()),
-        }
+        let fingerprint = trusted
+            .into_iter()
+            .map(Into::into)
+            .find_map(|fingerprint: String| normalize_fingerprint(&fingerprint));
+
+        Self::PinnedFingerprint(fingerprint.unwrap_or_default())
     }
 
-    pub fn insecure() -> Self {
-        Self { trusted: None }
+    pub fn insecure_for_tests() -> Self {
+        Self::InsecureForTests
     }
 
     pub fn allows(&self, fingerprint: &str) -> bool {
-        match &self.trusted {
-            None => true,
-            Some(set) => !fingerprint.trim().is_empty() && set.contains(fingerprint),
+        match self {
+            Self::InsecureForTests => true,
+            Self::PinnedFingerprint(expected) => {
+                normalize_fingerprint(fingerprint).is_some_and(|actual| actual == *expected)
+            }
         }
     }
 
@@ -39,8 +40,25 @@ impl TlsTrustPolicy {
     /// an invalid (for example self-signed) certificate. Mirrors the historical
     /// `danger_accept_invalid_certs(true)` semantics for `Insecure` policies.
     pub fn allows_insecure(&self) -> bool {
-        self.trusted.is_none()
+        matches!(self, Self::InsecureForTests)
     }
+
+    pub fn pinned_fingerprint(&self) -> Option<&str> {
+        match self {
+            Self::PinnedFingerprint(fingerprint) if !fingerprint.is_empty() => Some(fingerprint),
+            Self::PinnedFingerprint(_) | Self::InsecureForTests => None,
+        }
+    }
+}
+
+pub(crate) fn normalize_fingerprint(fingerprint: &str) -> Option<String> {
+    let normalized: String = fingerprint
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+
+    (normalized.len() == 64).then_some(normalized)
 }
 
 #[cfg(test)]
@@ -49,25 +67,26 @@ mod tests {
 
     #[test]
     fn trust_policy_accepts_matching_fingerprint() {
-        let policy = TlsTrustPolicy::new(vec!["trusted-fp".to_string()]);
-        assert!(policy.allows("trusted-fp"));
+        let fingerprint = "a".repeat(64);
+        let policy = TlsTrustPolicy::new(vec![fingerprint.clone()]);
+        assert!(policy.allows(&fingerprint));
     }
 
     #[test]
     fn trust_policy_rejects_unknown_fingerprint() {
-        let policy = TlsTrustPolicy::new(vec!["trusted-fp".to_string()]);
-        assert!(!policy.allows("other-fp"));
+        let policy = TlsTrustPolicy::new(vec!["a".repeat(64)]);
+        assert!(!policy.allows(&"b".repeat(64)));
     }
 
     #[test]
     fn trust_policy_rejects_empty_fingerprints() {
-        let policy = TlsTrustPolicy::new(vec!["trusted-fp".to_string()]);
+        let policy = TlsTrustPolicy::new(vec!["a".repeat(64)]);
         assert!(!policy.allows(""));
     }
 
     #[test]
-    fn trust_policy_insecure_accepts_anything_when_no_fingerprints() {
-        let policy = TlsTrustPolicy::insecure();
+    fn insecure_test_policy_accepts_anything() {
+        let policy = TlsTrustPolicy::insecure_for_tests();
         assert!(policy.allows(""));
         assert!(policy.allows("unknown-fp"));
     }
