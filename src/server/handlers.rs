@@ -57,6 +57,13 @@ pub(crate) async fn handle_prepare_upload(
         }
     }
 
+    // R7: an empty files map means there is nothing to transfer -- answer
+    // 204 immediately, before any session is reserved or accept-event is
+    // emitted (a no-op request must not spuriously open a session).
+    if request.files.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     // Check if it's a text message (all files have non-empty preview and small size)
     let is_message = !request.files.is_empty()
         && request
