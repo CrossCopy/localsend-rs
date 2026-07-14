@@ -177,9 +177,8 @@ impl Default for Port {
 // Device Types
 // ============================================================================
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
-#[derive(Default)]
 pub enum DeviceType {
     Mobile,
     #[default]
@@ -187,6 +186,36 @@ pub enum DeviceType {
     Web,
     Headless,
     Server,
+}
+
+impl DeviceType {
+    /// Parse a wire `deviceType` string. Unknown values (for example HarmonyOS reports
+    /// `"tablet"`, which is not in the protocol enum) map to [`DeviceType::Desktop`],
+    /// matching the official app's `@MappableEnum(defaultValue: DeviceType.desktop)` and
+    /// localsend-ts's `lenientDeviceType`. Keeping this lenient means such a peer is still
+    /// discovered instead of being dropped on a failed deserialization.
+    fn from_wire(value: &str) -> Self {
+        match value.to_lowercase().as_str() {
+            "mobile" => DeviceType::Mobile,
+            "desktop" => DeviceType::Desktop,
+            "web" => DeviceType::Web,
+            "headless" => DeviceType::Headless,
+            "server" => DeviceType::Server,
+            _ => DeviceType::Desktop,
+        }
+    }
+}
+
+// Hand-written so an unknown `deviceType` degrades to `Desktop` instead of failing the
+// whole payload (see `from_wire`). Serialization stays derived and unchanged.
+impl<'de> Deserialize<'de> for DeviceType {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(DeviceType::from_wire(&raw))
+    }
 }
 
 fn default_port() -> u16 {
@@ -312,5 +341,59 @@ impl DeviceInfo {
             download: announcement.download,
             ip: socket_addr.map(|s| s.ip().to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeviceInfo, DeviceType};
+
+    #[test]
+    fn known_device_types_round_trip() {
+        for (wire, expected) in [
+            ("mobile", DeviceType::Mobile),
+            ("desktop", DeviceType::Desktop),
+            ("web", DeviceType::Web),
+            ("headless", DeviceType::Headless),
+            ("server", DeviceType::Server),
+        ] {
+            let parsed: DeviceType =
+                serde_json::from_value(serde_json::json!(wire)).expect("known type parses");
+            assert_eq!(parsed, expected);
+            // Serialization stays stable/lowercase.
+            assert_eq!(
+                serde_json::to_value(expected).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_device_type_degrades_to_desktop() {
+        // HarmonyOS advertises "tablet", which is not in the protocol enum. It must not
+        // fail the payload — the official app and localsend-ts both fall back to desktop.
+        let parsed: DeviceType =
+            serde_json::from_value(serde_json::json!("tablet")).expect("unknown type is lenient");
+        assert_eq!(parsed, DeviceType::Desktop);
+    }
+
+    #[test]
+    fn info_payload_from_a_harmonyos_tablet_deserializes() {
+        // Shape of the `/info` body a HarmonyOS tablet returns: `deviceType: "tablet"` is
+        // not in the protocol enum and previously failed the whole payload. Values are
+        // synthetic — the only field under test is the unknown `deviceType`.
+        let body = serde_json::json!({
+            "alias": "Example Tablet",
+            "version": "2.1",
+            "deviceModel": "Example MatePad",
+            "deviceType": "tablet",
+            "fingerprint": "A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4A1B2C3D4",
+            "download": false
+        });
+
+        let device: DeviceInfo = serde_json::from_value(body).expect("tablet info parses");
+        assert_eq!(device.alias, "Example Tablet");
+        assert_eq!(device.device_type, Some(DeviceType::Desktop));
+        assert_eq!(device.fingerprint.len(), 64);
     }
 }
