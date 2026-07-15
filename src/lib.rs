@@ -18,7 +18,7 @@ pub use core::{
 #[cfg(feature = "https")]
 pub use crypto::{TlsCertificate, generate_tls_certificate};
 pub use crypto::{generate_fingerprint, sha256_from_bytes, sha256_from_file};
-pub use discovery::{Discovery, HttpDiscovery, MulticastDiscovery};
+pub use discovery::{Discovery, HttpDiscovery, MulticastConfig, MulticastDiscovery};
 pub use error::{LocalSendError, Result};
 pub use protocol::{
     AnnouncementMessage, DEFAULT_HTTP_PORT, DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT,

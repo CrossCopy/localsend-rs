@@ -19,9 +19,49 @@ use tokio::sync::broadcast;
 
 pub type Result<T> = std::result::Result<T, LocalSendError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MulticastConfig {
+    pub address: Ipv4Addr,
+    pub port: u16,
+    pub interface_names: Option<BTreeSet<String>>,
+}
+
+impl MulticastConfig {
+    pub fn new(
+        address: Ipv4Addr,
+        port: u16,
+        interface_names: Option<BTreeSet<String>>,
+    ) -> Result<Self> {
+        if !address.is_multicast() {
+            return Err(LocalSendError::InvalidMulticastAddress(address.to_string()));
+        }
+        if port == 0 {
+            return Err(LocalSendError::InvalidPort(port.to_string()));
+        }
+        Ok(Self {
+            address,
+            port,
+            interface_names,
+        })
+    }
+}
+
+impl Default for MulticastConfig {
+    fn default() -> Self {
+        Self {
+            address: DEFAULT_MULTICAST_ADDRESS
+                .parse()
+                .expect("LocalSend's multicast constant must be a valid IPv4 address"),
+            port: DEFAULT_MULTICAST_PORT,
+            interface_names: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MulticastDiscovery {
     local_device: DeviceInfo,
+    config: MulticastConfig,
     sockets: Vec<Arc<UdpSocket>>,
     running: Arc<AtomicBool>,
     tx: Option<broadcast::Sender<DeviceInfo>>,
@@ -45,13 +85,20 @@ impl MulticastDiscovery {
     }
 
     pub fn new_with_device(device: DeviceInfo) -> Self {
+        Self::new_with_device_and_config(device, MulticastConfig::default())
+            .expect("default multicast configuration must be valid")
+    }
+
+    pub fn new_with_device_and_config(device: DeviceInfo, config: MulticastConfig) -> Result<Self> {
+        let config = MulticastConfig::new(config.address, config.port, config.interface_names)?;
         let (tx, _rx) = broadcast::channel(100);
-        Self {
+        Ok(Self {
             local_device: device,
+            config,
             sockets: Vec::new(),
             running: Arc::new(AtomicBool::new(false)),
             tx: Some(tx),
-        }
+        })
     }
 }
 
@@ -62,10 +109,10 @@ impl Discovery for MulticastDiscovery {
             return Err(LocalSendError::network("Discovery already running"));
         }
 
-        let bind_addr: SocketAddr = format!("0.0.0.0:{}", DEFAULT_MULTICAST_PORT).parse()?;
-        let sockets = Self::multicast_interfaces()?
+        let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, self.config.port));
+        let sockets = Self::multicast_interfaces(self.config.interface_names.as_ref())?
             .into_iter()
-            .map(|interface| create_reusable_udp_socket(&bind_addr, interface))
+            .map(|interface| create_reusable_udp_socket(&bind_addr, interface, self.config.address))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .map(Arc::new)
@@ -79,6 +126,7 @@ impl Discovery for MulticastDiscovery {
             let local_fingerprint = self.local_device.fingerprint.clone();
             let running = self.running.clone();
             let local_device = self.local_device.clone();
+            let multicast_addr = SocketAddr::from((self.config.address, self.config.port));
 
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
@@ -126,6 +174,7 @@ impl Discovery for MulticastDiscovery {
                                                 &device,
                                                 &local_device,
                                                 &socket,
+                                                multicast_addr,
                                             )
                                             .await;
                                         });
@@ -168,8 +217,7 @@ impl Discovery for MulticastDiscovery {
 
         let msg = serde_json::to_string(&announcement)?;
         let buf = msg.as_bytes();
-        let multicast_addr: SocketAddr =
-            format!("{}:{}", DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT).parse()?;
+        let multicast_addr = SocketAddr::from((self.config.address, self.config.port));
 
         // Send announcement multiple times with delays to improve reliability
         let delays = [100, 500, 2000];
@@ -207,7 +255,7 @@ impl Discovery for MulticastDiscovery {
 }
 
 impl MulticastDiscovery {
-    fn multicast_interfaces() -> Result<Vec<Ipv4Addr>> {
+    fn multicast_interfaces(interface_names: Option<&BTreeSet<String>>) -> Result<Vec<Ipv4Addr>> {
         let addresses = get_if_addrs()
             .map_err(|error| {
                 LocalSendError::network(format!("Failed to list interfaces: {error}"))
@@ -215,38 +263,26 @@ impl MulticastDiscovery {
             .into_iter()
             .filter(|interface| !interface.is_loopback())
             .filter_map(|interface| match interface.addr {
-                IfAddr::V4(address) => Some((address.ip, address.netmask)),
+                IfAddr::V4(address) => Some((interface.name, address.ip, address.netmask)),
                 IfAddr::V6(_) => None,
             });
         let addresses = addresses.collect::<Vec<_>>();
-        let primary = get_local_ip().ok();
-        let mut interfaces = Self::multicast_interfaces_from(addresses.iter().copied(), primary);
+        let primary = interface_names
+            .is_none()
+            .then(|| get_local_ip().ok())
+            .flatten();
+        let mut interfaces =
+            select_interface_addresses(addresses.iter().cloned(), interface_names, primary);
 
-        if interfaces.is_empty() && primary.is_some() {
-            interfaces = Self::multicast_interfaces_from(addresses, None);
+        if interfaces.is_empty() && primary.is_some() && interface_names.is_none() {
+            interfaces = select_interface_addresses(addresses, None, None);
         }
 
-        if interfaces.is_empty() {
+        if interfaces.is_empty() && interface_names.is_none() {
             Ok(vec![Ipv4Addr::UNSPECIFIED])
         } else {
             Ok(interfaces)
         }
-    }
-
-    fn multicast_interfaces_from(
-        addresses: impl IntoIterator<Item = (Ipv4Addr, Ipv4Addr)>,
-        primary: Option<Ipv4Addr>,
-    ) -> Vec<Ipv4Addr> {
-        addresses
-            .into_iter()
-            .filter(|(address, _)| !address.is_unspecified() && !address.is_loopback())
-            .filter(|(address, netmask)| {
-                primary.is_none_or(|primary| Self::same_subnet(*address, primary, *netmask))
-            })
-            .map(|(address, _)| address)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
     }
 
     fn same_subnet(address: Ipv4Addr, primary: Ipv4Addr, netmask: Ipv4Addr) -> bool {
@@ -302,6 +338,7 @@ impl MulticastDiscovery {
         target_device: &DeviceInfo,
         local_device: &DeviceInfo,
         socket: &UdpSocket,
+        multicast_addr: SocketAddr,
     ) {
         tracing::debug!(
             "Responding to announcement from {} ({:?})",
@@ -354,17 +391,33 @@ impl MulticastDiscovery {
 
         if let Ok(msg) = serde_json::to_string(&announcement) {
             let buf = msg.as_bytes();
-            let multicast_addr_str =
-                format!("{}:{}", DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT);
-            if let Ok(multicast_addr) = multicast_addr_str.parse::<SocketAddr>() {
-                if let Err(e) = socket.send_to(buf, &multicast_addr).await {
-                    tracing::debug!("Failed to send UDP fallback response: {}", e);
-                } else {
-                    tracing::debug!("Sent UDP fallback response to multicast group");
-                }
+            if let Err(e) = socket.send_to(buf, multicast_addr).await {
+                tracing::debug!("Failed to send UDP fallback response: {}", e);
+            } else {
+                tracing::debug!("Sent UDP fallback response to multicast group");
             }
         }
     }
+}
+
+fn select_interface_addresses(
+    addresses: impl IntoIterator<Item = (String, Ipv4Addr, Ipv4Addr)>,
+    interface_names: Option<&BTreeSet<String>>,
+    primary: Option<Ipv4Addr>,
+) -> Vec<Ipv4Addr> {
+    addresses
+        .into_iter()
+        .filter(|(name, _, _)| interface_names.is_none_or(|names| names.contains(name)))
+        .map(|(_, address, netmask)| (address, netmask))
+        .filter(|(address, _)| !address.is_unspecified() && !address.is_loopback())
+        .filter(|(address, netmask)| {
+            primary
+                .is_none_or(|primary| MulticastDiscovery::same_subnet(*address, primary, *netmask))
+        })
+        .map(|(address, _)| address)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Creates a UDP socket with port reuse enabled.
@@ -377,7 +430,11 @@ impl MulticastDiscovery {
 /// By enabling SO_REUSEADDR (and SO_REUSEPORT on Unix), the OS allows multiple
 /// processes to bind to the same UDP port. For multicast traffic, the OS will
 /// clone incoming packets and deliver them to all participating sockets.
-fn create_reusable_udp_socket(bind_addr: &SocketAddr, interface: Ipv4Addr) -> Result<UdpSocket> {
+fn create_reusable_udp_socket(
+    bind_addr: &SocketAddr,
+    interface: Ipv4Addr,
+    multicast_addr: Ipv4Addr,
+) -> Result<UdpSocket> {
     let domain = if bind_addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -402,13 +459,6 @@ fn create_reusable_udp_socket(bind_addr: &SocketAddr, interface: Ipv4Addr) -> Re
         .bind(&(*bind_addr).into())
         .map_err(|e| LocalSendError::network(format!("Failed to bind to {}: {}", bind_addr, e)))?;
 
-    let multicast_addr = DEFAULT_MULTICAST_ADDRESS
-        .parse::<Ipv4Addr>()
-        .map_err(|error| {
-            LocalSendError::network(format!(
-                "Invalid multicast address {DEFAULT_MULTICAST_ADDRESS}: {error}"
-            ))
-        })?;
     socket
         .join_multicast_v4(&multicast_addr, &interface)
         .map_err(|error| {
@@ -432,8 +482,52 @@ fn create_reusable_udp_socket(bind_addr: &SocketAddr, interface: Ipv4Addr) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::MulticastDiscovery;
+    use super::{MulticastConfig, MulticastDiscovery, select_interface_addresses};
+    use crate::LocalSendError;
+    use std::collections::BTreeSet;
     use std::net::Ipv4Addr;
+
+    #[derive(Clone)]
+    struct TestInterface {
+        name: String,
+        address: Ipv4Addr,
+        netmask: Ipv4Addr,
+    }
+
+    impl TestInterface {
+        fn ipv4(name: &str, address: &str) -> Self {
+            Self {
+                name: name.into(),
+                address: address.parse().unwrap(),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+            }
+        }
+    }
+
+    #[test]
+    fn multicast_config_rejects_non_multicast_address() {
+        let result = MulticastConfig::new("192.168.1.1".parse().unwrap(), 53317, None);
+        assert!(matches!(
+            result,
+            Err(LocalSendError::InvalidMulticastAddress(_))
+        ));
+    }
+
+    #[test]
+    fn interface_filter_keeps_only_named_ipv4_interfaces() {
+        let interfaces = vec![
+            TestInterface::ipv4("en0", "192.168.1.10"),
+            TestInterface::ipv4("utun3", "10.0.0.2"),
+        ];
+        let selected = select_interface_addresses(
+            interfaces
+                .into_iter()
+                .map(|interface| (interface.name, interface.address, interface.netmask)),
+            Some(&BTreeSet::from(["en0".into()])),
+            None,
+        );
+        assert_eq!(selected, vec!["192.168.1.10".parse::<Ipv4Addr>().unwrap()]);
+    }
 
     #[cfg(feature = "https")]
     use crate::{DeviceInfo, LocalSendServer, Protocol};
@@ -468,23 +562,35 @@ mod tests {
     #[test]
     fn multicast_uses_each_interface_on_the_primary_lan_only() {
         assert_eq!(
-            MulticastDiscovery::multicast_interfaces_from(
+            select_interface_addresses(
                 [
-                    (Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(255, 255, 255, 0)),
-                    (Ipv4Addr::LOCALHOST, Ipv4Addr::new(255, 0, 0, 0)),
                     (
+                        "unspecified".into(),
+                        Ipv4Addr::UNSPECIFIED,
+                        Ipv4Addr::new(255, 255, 255, 0),
+                    ),
+                    (
+                        "loopback".into(),
+                        Ipv4Addr::LOCALHOST,
+                        Ipv4Addr::new(255, 0, 0, 0),
+                    ),
+                    (
+                        "en0".into(),
                         Ipv4Addr::new(192, 168, 6, 10),
                         Ipv4Addr::new(255, 255, 255, 0),
                     ),
                     (
+                        "en1".into(),
                         Ipv4Addr::new(192, 168, 6, 101),
                         Ipv4Addr::new(255, 255, 255, 0),
                     ),
                     (
+                        "bridge0".into(),
                         Ipv4Addr::new(192, 168, 139, 3),
                         Ipv4Addr::new(255, 255, 254, 0),
                     ),
                 ],
+                None,
                 Some(Ipv4Addr::new(192, 168, 6, 101))
             ),
             vec![

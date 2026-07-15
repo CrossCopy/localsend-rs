@@ -40,6 +40,9 @@ pub enum LocalSendError {
     #[error("Invalid port: {0}")]
     InvalidPort(String),
 
+    #[error("Invalid multicast address: {0}")]
+    InvalidMulticastAddress(String),
+
     // ============================================================================
     // Protocol Errors
     // ============================================================================
