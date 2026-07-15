@@ -5,11 +5,15 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::RwLock;
 use tokio_util::io::ReaderStream;
 
@@ -73,6 +77,7 @@ pub(crate) struct WebShareSession {
     pub ip: IpAddr,
     pub approved: bool,
     pub response_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    pub downloaded_files: HashSet<FileId>,
 }
 
 #[derive(Debug)]
@@ -119,6 +124,7 @@ pub(crate) async fn handle_prepare_download(
 ) -> Response {
     let mut state = state_ref.write().await;
     let device = state.device.clone();
+    let events_tx = state.events_tx.clone();
     let Some(web) = state.web_share.as_mut() else {
         return (StatusCode::FORBIDDEN, "Web share not initialized").into_response();
     };
@@ -147,13 +153,16 @@ pub(crate) async fn handle_prepare_download(
             ip: peer.ip(),
             approved,
             response_tx: (!approved).then_some(response_tx),
+            downloaded_files: HashSet::new(),
         },
     );
     if approved {
+        let _ = events_tx.try_send(crate::server::events::ServerEvent::WebShareRequest(
+            crate::server::events::PendingWebShareRequest::new(session_id.clone(), peer.ip()),
+        ));
         return prepare_response(device, session_id, web);
     }
 
-    let events_tx = state.events_tx.clone();
     let timeout = state.accept_timeout;
     drop(state);
     if events_tx
@@ -235,8 +244,17 @@ pub(crate) async fn handle_download(
         (file.clone(), state.events_tx.clone())
     };
 
-    let (body, length) = match &file.source {
-        WebShareSource::Inline(bytes) => (Body::from(bytes.as_ref().clone()), bytes.len() as u64),
+    let (source, length): (
+        Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
+        u64,
+    ) = match &file.source {
+        WebShareSource::Inline(bytes) => (
+            Box::pin(stream::once({
+                let bytes = Bytes::from(bytes.as_ref().clone());
+                async move { Ok(bytes) }
+            })),
+            bytes.len() as u64,
+        ),
         WebShareSource::Path(path) => {
             let Ok(handle) = tokio::fs::File::open(path).await else {
                 return StatusCode::NOT_FOUND.into_response();
@@ -244,9 +262,19 @@ pub(crate) async fn handle_download(
             let Ok(metadata) = handle.metadata().await else {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             };
-            (Body::from_stream(ReaderStream::new(handle)), metadata.len())
+            (Box::pin(ReaderStream::new(handle)), metadata.len())
         }
     };
+    let body = Body::from_stream(WebShareProgressStream {
+        inner: source,
+        state: state_ref,
+        events_tx,
+        session_id: query.session_id.clone(),
+        file_id: query.file_id.clone(),
+        bytes_sent: 0,
+        total_bytes: length,
+        finished: false,
+    });
 
     let safe_name = file.metadata.file_name.replace(['/', '\\'], "-");
     let disposition = format!("attachment; filename=\"{}\"", safe_name.replace('"', ""));
@@ -263,18 +291,79 @@ pub(crate) async fn handle_download(
     if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
         response.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
-    let _ = events_tx.try_send(
-        crate::server::events::ServerEvent::WebShareDownloadProgress {
-            session_id: query.session_id.clone(),
-            file_id: query.file_id,
-            bytes_sent: length,
-            total_bytes: length,
-        },
-    );
-    let _ = events_tx.try_send(crate::server::events::ServerEvent::WebShareSessionDone {
-        session_id: query.session_id,
-    });
     response
+}
+
+struct WebShareProgressStream {
+    inner: Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
+    state: Arc<RwLock<ServerState>>,
+    events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
+    session_id: SessionId,
+    file_id: FileId,
+    bytes_sent: u64,
+    total_bytes: u64,
+    finished: bool,
+}
+
+impl Stream for WebShareProgressStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                self.bytes_sent = self.bytes_sent.saturating_add(bytes.len() as u64);
+                let _ = self.events_tx.try_send(
+                    crate::server::events::ServerEvent::WebShareDownloadProgress {
+                        session_id: self.session_id.clone(),
+                        file_id: self.file_id.clone(),
+                        bytes_sent: self.bytes_sent,
+                        total_bytes: self.total_bytes,
+                    },
+                );
+                if self.bytes_sent >= self.total_bytes {
+                    self.finish_file();
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(None) if !self.finished => {
+                self.finish_file();
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
+impl WebShareProgressStream {
+    fn finish_file(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let state = self.state.clone();
+        let events_tx = self.events_tx.clone();
+        let session_id = self.session_id.clone();
+        let file_id = self.file_id.clone();
+        tokio::spawn(async move {
+            let session_done = {
+                let mut state = state.write().await;
+                let Some(web) = state.web_share.as_mut() else {
+                    return;
+                };
+                let file_count = web.files.len();
+                let Some(session) = web.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                session.downloaded_files.insert(file_id);
+                session.downloaded_files.len() == file_count
+            };
+            if session_done {
+                let _ = events_tx
+                    .send(crate::server::events::ServerEvent::WebShareSessionDone { session_id })
+                    .await;
+            }
+        });
+    }
 }
 
 pub(crate) async fn handle_web_index(

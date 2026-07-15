@@ -6,7 +6,7 @@ use localsend_rs::server::{LocalSendServer, ServerEvent, WebShareFile};
 #[tokio::test(flavor = "multi_thread")]
 async fn approved_browser_session_downloads_exact_bytes() {
     let fixture = b"crosscopy-web-share\nsecond line";
-    let (mut server, _events) = LocalSendServer::builder()
+    let (mut server, mut events) = LocalSendServer::builder()
         .alias("Browser sender")
         .port(0)
         .protocol(Protocol::Http)
@@ -55,6 +55,31 @@ async fn approved_browser_session_downloads_exact_bytes() {
         .await
         .expect("download bytes");
     assert_eq!(bytes.as_ref(), fixture);
+
+    let mut last_progress = 0;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("web share event timeout")
+            .expect("web share event channel");
+        match event {
+            ServerEvent::WebShareRequest(request) => {
+                assert_eq!(request.session_id().as_str(), session_id);
+            }
+            ServerEvent::WebShareDownloadProgress {
+                bytes_sent,
+                total_bytes,
+                ..
+            } => {
+                assert!(bytes_sent >= last_progress);
+                assert!(bytes_sent <= total_bytes);
+                last_progress = bytes_sent;
+            }
+            ServerEvent::WebShareSessionDone { .. } => break,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!(last_progress, fixture.len() as u64);
 
     server.stop_web_share().await.expect("web share stops");
     assert!(!server.device().download);

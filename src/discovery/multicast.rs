@@ -100,6 +100,12 @@ impl MulticastDiscovery {
             tx: Some(tx),
         })
     }
+
+    /// Replace the identity used by future announcements without rebuilding
+    /// sockets or losing the current discovery cache.
+    pub fn set_local_device(&mut self, device: DeviceInfo) {
+        self.local_device = device;
+    }
 }
 
 #[async_trait::async_trait]
@@ -511,6 +517,18 @@ mod tests {
             result,
             Err(LocalSendError::InvalidMulticastAddress(_))
         ));
+    }
+
+    #[test]
+    fn live_discovery_identity_can_toggle_browser_download_advertising() {
+        let mut original = crate::DeviceInfo::new("CrossCopy".into(), 53317, crate::Protocol::Http);
+        original.download = false;
+        let mut discovery = MulticastDiscovery::new_with_device(original.clone());
+        original.download = true;
+
+        discovery.set_local_device(original.clone());
+
+        assert_eq!(discovery.local_device, original);
     }
 
     #[test]
