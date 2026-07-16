@@ -349,6 +349,7 @@ impl App {
                 ServerEvent::WebShareRequest(_)
                 | ServerEvent::WebShareDownloadProgress { .. }
                 | ServerEvent::WebShareSessionDone { .. } => {}
+                ServerEvent::FileReceiveProgress { .. } => {}
                 ServerEvent::FileReceived {
                     file_name,
                     path,

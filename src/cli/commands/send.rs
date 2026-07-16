@@ -1,10 +1,10 @@
 use crate::DeviceInfo;
-use crate::client::LocalSendClient;
+use crate::client::{LocalSendClient, TlsTrustPolicy};
 use crate::core::file::build_file_metadata;
 use crate::crypto::generate_fingerprint;
 use crate::discovery::{Discovery, MulticastDiscovery};
 use crate::protocol::types::FileMetadataDetails;
-use crate::protocol::{DeviceType, FileMetadata};
+use crate::protocol::{DeviceType, FileMetadata, Protocol};
 use clap::Parser;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -24,23 +24,31 @@ pub struct SendCommand {
 
     #[arg(short, long)]
     pin: Option<String>,
+
+    /// Test-only: throttle sender stream production to the given KiB/s.
+    #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(1..))]
+    send_rate_limit_kib: Option<u64>,
 }
 
 pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
     let target = resolve_target(&command.target).await?;
     println!("Sending to: {} ({:?})", target.alias, target.ip);
 
-    let client = LocalSendClient::new(DeviceInfo {
+    let sender = DeviceInfo {
         alias: "LocalSend-Rust".to_string(),
         version: "2.1".to_string(),
         device_model: Some(std::env::consts::OS.to_string()),
         device_type: Some(DeviceType::Desktop),
         fingerprint: generate_fingerprint(),
         port: 53318,
-        protocol: crate::protocol::Protocol::Https, // Default to HTTPS
+        protocol: Protocol::Https, // Default to HTTPS
         download: false,
         ip: None,
-    });
+    };
+    let client = build_client_for_target(sender, &target)?;
+    let send_rate_limit = command
+        .send_rate_limit_kib
+        .map(|kib_per_second| kib_per_second.saturating_mul(1_024));
 
     // Register first to ensure connection
     let _ = client.register(&target).await;
@@ -103,13 +111,14 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
                 println!("Uploading: {} ({} bytes)", path.display(), file_size);
 
                 client
-                    .upload_file(
+                    .upload_file_with_rate_limit(
                         &target,
                         &upload_response.session_id,
                         file_id,
                         token,
                         path,
                         None,
+                        send_rate_limit,
                     )
                     .await?;
 
@@ -127,13 +136,14 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
                 tokio::fs::write(&temp_file, text.as_bytes()).await?;
 
                 client
-                    .upload_file(
+                    .upload_file_with_rate_limit(
                         &target,
                         &upload_response.session_id,
                         file_id,
                         token,
                         &temp_file,
                         None,
+                        send_rate_limit,
                     )
                     .await?;
 
@@ -144,6 +154,20 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn build_client_for_target(
+    sender: DeviceInfo,
+    target: &DeviceInfo,
+) -> anyhow::Result<LocalSendClient> {
+    match target_trust_policy(target) {
+        Some(policy) => Ok(LocalSendClient::with_trust_policy(sender, policy)?),
+        None => Ok(LocalSendClient::new(sender)),
+    }
+}
+
+fn target_trust_policy(target: &DeviceInfo) -> Option<TlsTrustPolicy> {
+    (target.protocol == Protocol::Https).then(|| TlsTrustPolicy::new([target.fingerprint.clone()]))
 }
 
 /// Split a `host` / `host:port` target into its host and optional explicit port.
@@ -280,11 +304,39 @@ async fn probe_device(ip: String, port: u16) -> anyhow::Result<DeviceInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_host_port;
+    use super::{SendCommand, build_client_for_target, split_host_port, target_trust_policy};
+    use crate::protocol::{DeviceInfo, Protocol};
+    use clap::Parser;
 
     #[test]
     fn bare_ipv4_has_no_port() {
         assert_eq!(split_host_port("127.0.0.1"), ("127.0.0.1".into(), None));
+    }
+
+    #[test]
+    fn parses_test_sender_rate_limit() {
+        let command = SendCommand::try_parse_from([
+            "send",
+            "--send-rate-limit-kib",
+            "512",
+            "127.0.0.1",
+            "/tmp/large.bin",
+        ])
+        .expect("positive sender limit should parse");
+
+        assert_eq!(command.send_rate_limit_kib, Some(512));
+    }
+
+    #[test]
+    fn rejects_zero_sender_rate_limit() {
+        SendCommand::try_parse_from([
+            "send",
+            "--send-rate-limit-kib",
+            "0",
+            "127.0.0.1",
+            "/tmp/large.bin",
+        ])
+        .expect_err("zero sender limit should be rejected");
     }
 
     #[test]
@@ -326,5 +378,29 @@ mod tests {
     fn bracketed_ipv6_with_and_without_port() {
         assert_eq!(split_host_port("[::1]:53317"), ("::1".into(), Some(53317)));
         assert_eq!(split_host_port("[::1]"), ("::1".into(), None));
+    }
+
+    #[test]
+    fn https_target_requires_a_valid_discovered_fingerprint() {
+        let sender = DeviceInfo::new("sender".to_string(), 53318, Protocol::Https);
+        let mut target = DeviceInfo::new("receiver".to_string(), 53317, Protocol::Https);
+        target.fingerprint = "not-a-certificate-fingerprint".to_string();
+
+        let error = build_client_for_target(sender, &target)
+            .err()
+            .expect("HTTPS client must reject an invalid peer fingerprint");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid LocalSend TLS fingerprint")
+        );
+    }
+
+    #[test]
+    fn http_target_does_not_require_a_certificate_fingerprint() {
+        let target = DeviceInfo::new("receiver".to_string(), 53317, Protocol::Http);
+
+        assert_eq!(target_trust_policy(&target), None);
     }
 }

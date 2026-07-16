@@ -1,4 +1,4 @@
-use super::state::{ServerState, write_body_to_file};
+use super::state::{ServerState, write_body_to_file_with_progress};
 use crate::protocol::{DeviceInfo, FileId, PrepareUploadRequest, PrepareUploadResponse, SessionId};
 use axum::{
     Json,
@@ -10,6 +10,7 @@ use axum::{
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 pub(crate) async fn handle_info(State(state): State<Arc<RwLock<ServerState>>>) -> Response {
@@ -203,6 +204,54 @@ pub(crate) struct UploadParams {
     token: crate::protocol::Token,
 }
 
+#[derive(Clone)]
+struct ReceiveProgressContext {
+    session_id: SessionId,
+    file_id: FileId,
+    file_name: String,
+    sender_alias: String,
+    total_bytes: u64,
+    file_count: usize,
+    events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
+    received_bytes: Arc<AtomicU64>,
+}
+
+impl ReceiveProgressContext {
+    fn add(&self, amount: u64) {
+        let previous = self
+            .received_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(amount).min(self.total_bytes))
+            })
+            .unwrap_or_else(|current| current);
+        self.emit(previous.saturating_add(amount).min(self.total_bytes));
+    }
+
+    fn rollback(&self, amount: u64) {
+        let previous = self
+            .received_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(amount))
+            })
+            .unwrap_or_else(|current| current);
+        self.emit(previous.saturating_sub(amount));
+    }
+
+    fn emit(&self, bytes_received: u64) {
+        let _ = self
+            .events_tx
+            .try_send(crate::server::events::ServerEvent::FileReceiveProgress {
+                session_id: self.session_id.clone(),
+                file_id: self.file_id.clone(),
+                file_name: self.file_name.clone(),
+                sender_alias: self.sender_alias.clone(),
+                bytes_received,
+                total_bytes: self.total_bytes,
+                file_count: self.file_count,
+            });
+    }
+}
+
 #[axum::debug_handler]
 pub(crate) async fn handle_upload(
     State(state_ref): State<Arc<RwLock<ServerState>>>,
@@ -212,44 +261,63 @@ pub(crate) async fn handle_upload(
     let state = state_ref.write().await;
 
     // Verify session
-    let (file_name, session_id, sender_alias, declared_size, declared_sha) =
-        if let Some(session) = &state.current_session {
-            if session.id != params.session_id {
-                tracing::warn!(
-                    "Upload rejected: Session ID mismatch. Expected {}, got {}",
-                    session.id,
-                    params.session_id
-                );
-                return StatusCode::FORBIDDEN.into_response();
-            }
-
-            // Verify token against the session's random per-file token (R6) --
-            // never re-derive it, only compare against what was issued.
-            if !session.verify_token(&params.file_id, &params.token) {
-                tracing::warn!("Upload rejected: Token mismatch");
-                return StatusCode::FORBIDDEN.into_response();
-            }
-
-            // Find file metadata
-            if let Some(meta) = session.files.get(&params.file_id) {
-                (
-                    meta.file_name.clone(),
-                    session.id.clone(),
-                    session.sender_alias.clone(),
-                    meta.size,
-                    meta.sha256.clone(),
-                )
-            } else {
-                tracing::warn!(
-                    "Upload rejected: File ID {} not found in session",
-                    params.file_id
-                );
-                return StatusCode::NOT_FOUND.into_response();
-            }
-        } else {
-            tracing::warn!("Upload rejected: No active session");
+    let (
+        file_name,
+        session_id,
+        sender_alias,
+        declared_size,
+        declared_sha,
+        events_tx,
+        received_bytes,
+        total_bytes,
+        file_count,
+        receive_rate_limit_bytes_per_second,
+    ) = if let Some(session) = &state.current_session {
+        if session.id != params.session_id {
+            tracing::warn!(
+                "Upload rejected: Session ID mismatch. Expected {}, got {}",
+                session.id,
+                params.session_id
+            );
             return StatusCode::FORBIDDEN.into_response();
-        };
+        }
+
+        // Verify token against the session's random per-file token (R6) --
+        // never re-derive it, only compare against what was issued.
+        if !session.verify_token(&params.file_id, &params.token) {
+            tracing::warn!("Upload rejected: Token mismatch");
+            return StatusCode::FORBIDDEN.into_response();
+        }
+
+        // Find file metadata
+        if let Some(meta) = session.files.get(&params.file_id) {
+            (
+                meta.file_name.clone(),
+                session.id.clone(),
+                session.sender_alias.clone(),
+                meta.size,
+                meta.sha256.clone(),
+                state.events_tx.clone(),
+                session.received_bytes.clone(),
+                session
+                    .files
+                    .values()
+                    .map(|file| file.size)
+                    .fold(0_u64, u64::saturating_add),
+                session.files.len(),
+                state.receive_rate_limit_bytes_per_second,
+            )
+        } else {
+            tracing::warn!(
+                "Upload rejected: File ID {} not found in session",
+                params.file_id
+            );
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    } else {
+        tracing::warn!("Upload rejected: No active session");
+        return StatusCode::FORBIDDEN.into_response();
+    };
 
     let save_path = match crate::core::unique_save_path(&state.save_dir, &file_name) {
         Ok(path) => path,
@@ -270,9 +338,36 @@ pub(crate) async fn handle_upload(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    let body_len = match write_body_to_file(body, &save_path).await {
+    let progress = ReceiveProgressContext {
+        session_id: session_id.clone(),
+        file_id: params.file_id.clone(),
+        file_name: file_name.clone(),
+        sender_alias: sender_alias.clone(),
+        total_bytes,
+        file_count,
+        events_tx,
+        received_bytes,
+    };
+    let callback_progress = progress.clone();
+    let file_reported = Arc::new(AtomicU64::new(0));
+    let callback_file_reported = file_reported.clone();
+    let mut previous_file_bytes = 0_u64;
+    let body_len = match write_body_to_file_with_progress(
+        body,
+        &save_path,
+        receive_rate_limit_bytes_per_second,
+        move |file_bytes| {
+            let delta = file_bytes.saturating_sub(previous_file_bytes);
+            previous_file_bytes = file_bytes;
+            callback_file_reported.store(file_bytes, Ordering::Relaxed);
+            callback_progress.add(delta);
+        },
+    )
+    .await
+    {
         Ok(bytes_written) => bytes_written,
         Err(e) => {
+            progress.rollback(file_reported.load(Ordering::Relaxed));
             tracing::error!("Failed to save file to {:?}: {}", save_path, e);
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
@@ -287,6 +382,7 @@ pub(crate) async fn handle_upload(
     // the session untouched so it is neither recorded nor completed -- the
     // sender can retry the same file id against the still-open session.
     if body_len != declared_size {
+        progress.rollback(body_len);
         tracing::warn!(
             "Upload size mismatch for {:?}: declared {} bytes, received {} bytes; discarding partial",
             save_path,
@@ -304,6 +400,7 @@ pub(crate) async fn handle_upload(
         match crate::sha256_from_file(&save_path).await {
             Ok(actual) if actual.eq_ignore_ascii_case(&expected_sha) => {}
             Ok(actual) => {
+                progress.rollback(body_len);
                 tracing::warn!(
                     "Upload sha256 mismatch for {:?}: declared {}, computed {}; discarding",
                     save_path,
@@ -314,6 +411,7 @@ pub(crate) async fn handle_upload(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
             Err(e) => {
+                progress.rollback(body_len);
                 tracing::error!("Failed to hash uploaded file {:?}: {}", save_path, e);
                 let _ = tokio::fs::remove_file(&save_path).await;
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();

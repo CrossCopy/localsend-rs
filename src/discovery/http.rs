@@ -68,6 +68,15 @@ impl HttpDiscovery {
         Ok(self.scan_hosts(subnet_hosts(base_ip)?).await)
     }
 
+    /// Probe a caller-supplied set of hosts over the normal LocalSend `/info`
+    /// endpoint.  This is useful for routed networks where the caller knows a
+    /// reachable address but cannot enumerate it through multicast; it still
+    /// performs the same TLS/HTTP negotiation, response decoding and
+    /// fingerprint-based de-duplication as a subnet scan.
+    pub async fn scan_ips(&self, ips: Vec<String>) -> Result<Vec<DeviceInfo>> {
+        Ok(self.scan_hosts(ips).await)
+    }
+
     /// Probe an explicit list of hosts concurrently and return the de-duplicated set of
     /// LocalSend devices that answered (ourselves excluded). Shared core of `scan_subnet`.
     async fn scan_hosts(&self, targets: Vec<String>) -> Vec<DeviceInfo> {
@@ -128,7 +137,10 @@ impl HttpDiscovery {
             Ok(response) => response,
             // Connect failures/timeouts mean nothing is listening on this host — the other
             // scheme won't fare better, so signal the caller to stop probing this host.
-            Err(e) if e.is_connect() || e.is_timeout() => return ProbeOutcome::Unreachable,
+            // A TLS handshake against an HTTP-only LocalSend server is reported by
+            // reqwest as a connect error too. Only a timeout proves the host is
+            // unreachable for both schemes; connection errors must try the fallback.
+            Err(e) if e.is_timeout() => return ProbeOutcome::Unreachable,
             Err(_) => return ProbeOutcome::Miss,
         };
         if !response.status().is_success() {
@@ -282,10 +294,14 @@ mod tests {
         let expected_fingerprint = server.device().fingerprint.clone();
 
         // Probe just the loopback host the server is on, over the (self-signed) TLS the
-        // real devices use. `scan_hosts` is the shared core of `scan_subnet`.
+        // real devices use. This exercises the public explicit-target path used by
+        // routed E2E environments.
         let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Https)
             .expect("build discovery");
-        let found = discovery.scan_hosts(vec!["127.0.0.1".to_string()]).await;
+        let found = discovery
+            .scan_ips(vec!["127.0.0.1".to_string()])
+            .await
+            .expect("scan explicit loopback target");
 
         let target = found
             .iter()
@@ -297,5 +313,59 @@ mod tests {
         assert_eq!(target.protocol, Protocol::Https);
 
         server.stop();
+    }
+
+    #[tokio::test]
+    async fn https_scanner_falls_back_to_an_http_server() {
+        use crate::{LocalSendServer, Protocol};
+
+        let output = tempfile::tempdir().expect("output directory");
+        let (mut server, _events) = LocalSendServer::builder()
+            .alias("http-scan-target")
+            .port(0)
+            .save_dir(output.path())
+            .protocol(Protocol::Http)
+            .build()
+            .await
+            .expect("start HTTP receiver");
+        let expected_fingerprint = server.device().fingerprint.clone();
+
+        // CrossCopy advertises HTTPS, so its scanner tries TLS first. The TLS
+        // handshake against this HTTP endpoint fails with reqwest's connect flag;
+        // discovery must still retry the same port over HTTP.
+        let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Https)
+            .expect("build discovery");
+        let found = discovery.scan_hosts(vec!["127.0.0.1".to_string()]).await;
+
+        let target = found
+            .iter()
+            .find(|device| device.fingerprint == expected_fingerprint)
+            .expect("the HTTP server must be discovered after the HTTPS attempt");
+        assert_eq!(target.alias, "http-scan-target");
+        assert_eq!(target.protocol, Protocol::Http);
+
+        server.stop();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CROSSCOPY_E2E_LOCALSEND_TARGET to name a reachable LocalSend peer"]
+    async fn scan_ips_finds_an_explicit_e2e_peer() {
+        use crate::Protocol;
+
+        let target = std::env::var("CROSSCOPY_E2E_LOCALSEND_TARGET")
+            .expect("set CROSSCOPY_E2E_LOCALSEND_TARGET to a LocalSend peer IP");
+        let discovery = HttpDiscovery::new("e2e-scanner".into(), 53317, Protocol::Https)
+            .expect("build discovery client");
+
+        let found = discovery
+            .scan_ips(vec![target.clone()])
+            .await
+            .expect("probe explicit E2E target");
+        assert!(
+            found
+                .iter()
+                .any(|peer| peer.ip.as_deref() == Some(target.as_str())),
+            "the explicit LocalSend target must answer /info"
+        );
     }
 }

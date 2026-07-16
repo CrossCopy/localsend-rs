@@ -1,9 +1,29 @@
 mod common;
 
 use localsend_rs::Protocol;
-use localsend_rs::server::LocalSendServer;
+use localsend_rs::server::{LocalSendServer, ServerEvent};
 use localsend_rs::sha256_from_bytes;
 use serde_json::json;
+
+fn assert_rejected_upload_only_emits_rolled_back_progress(
+    events: &mut tokio::sync::mpsc::Receiver<ServerEvent>,
+) {
+    let mut samples = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            ServerEvent::FileReceiveProgress { bytes_received, .. } => samples.push(bytes_received),
+            ServerEvent::FileReceived { .. } | ServerEvent::SessionDone { .. } => {
+                panic!("rejected upload must not emit completion events")
+            }
+            other => panic!("unexpected event for rejected upload: {other:?}"),
+        }
+    }
+    assert!(
+        !samples.is_empty(),
+        "upload should have reported raw progress"
+    );
+    assert_eq!(samples.last(), Some(&0), "rejected bytes must roll back");
+}
 
 /// Drive `prepare-upload` over raw reqwest and return `(session_id, token)`
 /// for the single offered file id `f1`.
@@ -77,11 +97,7 @@ async fn short_body_is_rejected_and_partial_discarded() {
         "partial upload must be deleted"
     );
 
-    // The session must not have been recorded/completed.
-    assert!(
-        events.try_recv().is_err(),
-        "no FileReceived/SessionDone must be emitted for a rejected upload"
-    );
+    assert_rejected_upload_only_emits_rolled_back_progress(&mut events);
 }
 
 /// When the metadata carries a sha256, a full-length body whose contents
@@ -120,8 +136,5 @@ async fn sha256_mismatch_is_rejected_and_partial_discarded() {
         !save.path().join("big.bin").exists(),
         "partial upload must be deleted"
     );
-    assert!(
-        events.try_recv().is_err(),
-        "no FileReceived/SessionDone must be emitted for a rejected upload"
-    );
+    assert_rejected_upload_only_emits_rolled_back_progress(&mut events);
 }

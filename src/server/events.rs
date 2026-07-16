@@ -30,6 +30,16 @@ pub enum ServerEvent {
     WebShareSessionDone {
         session_id: SessionId,
     },
+    /// Cumulative payload bytes written for an active receive session.
+    FileReceiveProgress {
+        session_id: SessionId,
+        file_id: FileId,
+        file_name: String,
+        sender_alias: String,
+        bytes_received: u64,
+        total_bytes: u64,
+        file_count: usize,
+    },
     /// One file finished writing to disk.
     FileReceived {
         session_id: SessionId,

@@ -162,6 +162,26 @@ impl LocalSendClient {
         file_path: &std::path::Path,
         progress: Option<ProgressCallback>,
     ) -> Result<()> {
+        self.upload_file_with_rate_limit(
+            target, session_id, file_id, token, file_path, progress, None,
+        )
+        .await
+    }
+
+    /// Uploads a file while optionally pacing the source stream. The rate
+    /// limit is intended for deterministic integration tests; normal callers
+    /// should use [`Self::upload_file`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_file_with_rate_limit(
+        &self,
+        target: &DeviceInfo,
+        session_id: &SessionId,
+        file_id: &FileId,
+        token: &Token,
+        file_path: &std::path::Path,
+        progress: Option<ProgressCallback>,
+        rate_limit_bytes_per_second: Option<u64>,
+    ) -> Result<()> {
         let ip = target
             .ip
             .as_ref()
@@ -179,9 +199,32 @@ impl LocalSendClient {
 
         // Wrap the file stream so every chunk that goes out over the wire
         // also advances a running byte counter and reports it upstream.
+        let throttle_started = tokio::time::Instant::now();
+        let throttled_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let throttle_counter = throttled_bytes.clone();
+        let rate_limit_bytes_per_second = rate_limit_bytes_per_second.filter(|rate| *rate > 0);
+        let paced = ReaderStream::new(file).then(move |chunk| {
+            let target_elapsed = chunk.as_ref().ok().and_then(|bytes| {
+                let cumulative = throttle_counter
+                    .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                    + bytes.len() as u64;
+                rate_limit_bytes_per_second
+                    .map(|rate| std::time::Duration::from_secs_f64(cumulative as f64 / rate as f64))
+            });
+            async move {
+                if let Some(target_elapsed) = target_elapsed {
+                    let delay = target_elapsed.saturating_sub(throttle_started.elapsed());
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                chunk
+            }
+        });
+
         let counter_progress = progress.clone();
         let mut sent: u64 = 0;
-        let counted = ReaderStream::new(file).inspect(move |chunk| {
+        let counted = paced.inspect(move |chunk| {
             if let (Ok(c), Some(cb)) = (chunk, counter_progress.as_ref()) {
                 sent += c.len() as u64;
                 cb(sent, total_bytes, started.elapsed().as_secs_f64());

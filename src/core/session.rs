@@ -1,5 +1,7 @@
 use crate::protocol::{FileId, FileMetadata, SessionId, Token};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 /// Active file transfer session
@@ -9,6 +11,7 @@ pub struct Session {
     pub files: HashMap<FileId, FileMetadata>,
     pub tokens: HashMap<FileId, Token>,
     pub received: HashSet<FileId>,
+    pub received_bytes: Arc<AtomicU64>,
     pub sender_alias: String,
     pub created_at: Instant,
     pub last_activity: Instant,
@@ -32,6 +35,7 @@ impl Session {
             files,
             tokens,
             received: HashSet::new(),
+            received_bytes: Arc::new(AtomicU64::new(0)),
             sender_alias,
             created_at: now,
             last_activity: now,

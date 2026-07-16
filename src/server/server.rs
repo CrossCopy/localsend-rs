@@ -1,5 +1,5 @@
 use super::events::ServerEvent;
-use super::state::{ProgressCallback, ServerState};
+use super::state::ServerState;
 use crate::protocol::{DeviceInfo, Protocol};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ pub struct LocalSendServer {
     /// effect on in-flight requests, not just at `start()` time.
     auto_accept: Arc<AtomicBool>,
     accept_timeout: Duration,
+    receive_rate_limit_bytes_per_second: Option<u64>,
     /// Receiver-side PIN, enforced by `pin::PinGate` in the request handler.
     pin: Option<String>,
     state: Option<Arc<RwLock<ServerState>>>,
@@ -40,6 +41,7 @@ impl LocalSendServer {
         pin: Option<String>,
         auto_accept: bool,
         accept_timeout: Duration,
+        receive_rate_limit_bytes_per_second: Option<u64>,
     ) -> std::result::Result<Self, crate::error::LocalSendError> {
         Ok(Self {
             device,
@@ -53,6 +55,7 @@ impl LocalSendServer {
             events_rx: None,
             auto_accept: Arc::new(AtomicBool::new(auto_accept)),
             accept_timeout,
+            receive_rate_limit_bytes_per_second,
             pin,
             state: None,
         })
@@ -78,6 +81,7 @@ impl LocalSendServer {
             pin: None,
             auto_accept: false,
             accept_timeout: Duration::from_secs(60),
+            receive_rate_limit_bytes_per_second: None,
             #[cfg(feature = "https")]
             tls_certificate: None,
         }
@@ -104,10 +108,7 @@ impl LocalSendServer {
         self.tls_cert = Some(cert);
     }
 
-    pub async fn start(
-        &mut self,
-        progress_callback: Option<ProgressCallback>,
-    ) -> std::result::Result<(), crate::error::LocalSendError> {
+    pub async fn start(&mut self) -> std::result::Result<(), crate::error::LocalSendError> {
         let (events_tx, events_rx) = mpsc::channel(64);
         self.events_rx = Some(events_rx);
 
@@ -149,10 +150,10 @@ impl LocalSendServer {
                     device: self.device.clone(),
                     current_session: None,
                     save_dir: self.save_dir.clone(),
-                    _progress_callback: progress_callback,
                     events_tx,
                     auto_accept: self.auto_accept.clone(),
                     accept_timeout: self.accept_timeout,
+                    receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
                     pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
                     web_share: None,
                 }));
@@ -205,10 +206,10 @@ impl LocalSendServer {
                 device: self.device.clone(),
                 current_session: None,
                 save_dir: self.save_dir.clone(),
-                _progress_callback: progress_callback,
                 events_tx,
                 auto_accept: self.auto_accept.clone(),
                 accept_timeout: self.accept_timeout,
+                receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
                 pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
                 web_share: None,
             }));
@@ -345,6 +346,7 @@ pub struct LocalSendServerBuilder {
     pin: Option<String>,
     auto_accept: bool,
     accept_timeout: Duration,
+    receive_rate_limit_bytes_per_second: Option<u64>,
     #[cfg(feature = "https")]
     tls_certificate: Option<crate::crypto::TlsCertificate>,
 }
@@ -382,6 +384,14 @@ impl LocalSendServerBuilder {
 
     pub fn accept_timeout(mut self, d: Duration) -> Self {
         self.accept_timeout = d;
+        self
+    }
+
+    /// Limits receiver body consumption for deterministic integration tests.
+    /// Production callers should leave this unset.
+    pub fn receive_rate_limit(mut self, bytes_per_second: u64) -> Self {
+        self.receive_rate_limit_bytes_per_second =
+            (bytes_per_second > 0).then_some(bytes_per_second);
         self
     }
 
@@ -441,12 +451,13 @@ impl LocalSendServerBuilder {
             self.pin,
             self.auto_accept,
             self.accept_timeout,
+            self.receive_rate_limit_bytes_per_second,
         )?;
         #[cfg(feature = "https")]
         if let Some(cert) = tls_cert {
             server.set_tls_certificate(cert);
         }
-        server.start(None).await?;
+        server.start().await?;
         let events = server.take_events().expect("events available after start");
         Ok((server, events))
     }
