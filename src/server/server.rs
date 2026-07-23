@@ -29,6 +29,8 @@ pub struct LocalSendServer {
     receive_rate_limit_bytes_per_second: Option<u64>,
     /// Receiver-side PIN, enforced by `pin::PinGate` in the request handler.
     pin: Option<String>,
+    crosscopy_authorized_upload_gate:
+        Option<Arc<dyn super::crosscopy_authorized::CrossCopyAuthorizedUploadGate>>,
     state: Option<Arc<RwLock<ServerState>>>,
 }
 
@@ -57,6 +59,7 @@ impl LocalSendServer {
             accept_timeout,
             receive_rate_limit_bytes_per_second,
             pin,
+            crosscopy_authorized_upload_gate: None,
             state: None,
         })
     }
@@ -82,6 +85,7 @@ impl LocalSendServer {
             auto_accept: false,
             accept_timeout: Duration::from_secs(60),
             receive_rate_limit_bytes_per_second: None,
+            crosscopy_authorized_upload_gate: None,
             #[cfg(feature = "https")]
             tls_certificate: None,
         }
@@ -101,6 +105,13 @@ impl LocalSendServer {
     /// Current auto-accept setting.
     pub fn auto_accept(&self) -> bool {
         self.auto_accept.load(Ordering::Relaxed)
+    }
+
+    fn set_crosscopy_authorized_upload_gate(
+        &mut self,
+        gate: Option<Arc<dyn super::crosscopy_authorized::CrossCopyAuthorizedUploadGate>>,
+    ) {
+        self.crosscopy_authorized_upload_gate = gate;
     }
 
     #[cfg(feature = "https")]
@@ -156,6 +167,10 @@ impl LocalSendServer {
                     receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
                     pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
                     web_share: None,
+                    crosscopy_authorized_upload_gate: self.crosscopy_authorized_upload_gate.clone(),
+                    crosscopy_authorized_session: None,
+                    crosscopy_authorized_active_upload: None,
+                    crosscopy_authorized_stopping: false,
                 }));
                 self.state = Some(state.clone());
                 let router = super::routes::create_router(state.clone());
@@ -212,6 +227,10 @@ impl LocalSendServer {
                 receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
                 pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
                 web_share: None,
+                crosscopy_authorized_upload_gate: self.crosscopy_authorized_upload_gate.clone(),
+                crosscopy_authorized_session: None,
+                crosscopy_authorized_active_upload: None,
+                crosscopy_authorized_stopping: false,
             }));
             self.state = Some(state.clone());
             let router = super::routes::create_router(state.clone());
@@ -236,7 +255,37 @@ impl LocalSendServer {
         }
     }
 
-    pub fn stop(&mut self) {
+    /// Stop the listener after terminalizing any protected File-v3 upload that
+    /// is still owned by this server.  A process crash remains recoverable by
+    /// Task 2's durable reconciliation; this orderly shutdown must not leave a
+    /// live receiver-owned handoff slot pending.
+    pub async fn stop(&mut self) {
+        let (owner, active_cancellation) = if let Some(state) = &self.state {
+            let mut state = state.write().await;
+            // Establish the admission barrier and take the only installed
+            // owner as one atomic state transition. A subsequent protected
+            // prepare cannot consume a new gate slot while cancellation is
+            // awaited below.
+            state.crosscopy_authorized_stopping = true;
+            (
+                state
+                    .crosscopy_authorized_session
+                    .take()
+                    .map(|session| session.owner),
+                state
+                    .crosscopy_authorized_active_upload
+                    .take()
+                    .map(|active| active.cancellation),
+            )
+        } else {
+            (None, None)
+        };
+        if let Some(cancellation) = active_cancellation {
+            cancellation.cancel();
+        }
+        if let Some(owner) = owner {
+            owner.cancel().await;
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -321,12 +370,27 @@ fn spawn_session_sweep(state: Arc<RwLock<ServerState>>) -> JoinHandle<()> {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
-            let mut s = state.write().await;
-            if let Some(session) = &s.current_session
-                && session.is_timed_out(300)
-            {
-                tracing::info!("Sweeping timed-out session {}", session.id);
-                s.current_session = None;
+            let protected_owner = {
+                let mut s = state.write().await;
+                if let Some(session) = &s.current_session
+                    && session.is_timed_out(300)
+                {
+                    tracing::info!("Sweeping timed-out session {}", session.id);
+                    s.current_session = None;
+                }
+                if s.crosscopy_authorized_session
+                    .as_ref()
+                    .is_some_and(|session| session.is_timed_out(300))
+                {
+                    s.crosscopy_authorized_session
+                        .take()
+                        .map(|session| session.owner)
+                } else {
+                    None
+                }
+            };
+            if let Some(owner) = protected_owner {
+                owner.cancel().await;
             }
         }
     })
@@ -347,6 +411,8 @@ pub struct LocalSendServerBuilder {
     auto_accept: bool,
     accept_timeout: Duration,
     receive_rate_limit_bytes_per_second: Option<u64>,
+    crosscopy_authorized_upload_gate:
+        Option<Arc<dyn super::crosscopy_authorized::CrossCopyAuthorizedUploadGate>>,
     #[cfg(feature = "https")]
     tls_certificate: Option<crate::crypto::TlsCertificate>,
 }
@@ -392,6 +458,18 @@ impl LocalSendServerBuilder {
     pub fn receive_rate_limit(mut self, bytes_per_second: u64) -> Self {
         self.receive_rate_limit_bytes_per_second =
             (bytes_per_second > 0).then_some(bytes_per_second);
+        self
+    }
+
+    /// Enable the optional CrossCopy File-v3 receiver mode on this existing
+    /// listener.  This does not create a second socket or discovery identity.
+    /// Omitting the hook preserves normal LocalSend behavior and rejects the
+    /// reserved protected header.
+    pub fn crosscopy_authorized_upload_gate(
+        mut self,
+        gate: Arc<dyn super::crosscopy_authorized::CrossCopyAuthorizedUploadGate>,
+    ) -> Self {
+        self.crosscopy_authorized_upload_gate = Some(gate);
         self
     }
 
@@ -453,6 +531,7 @@ impl LocalSendServerBuilder {
             self.accept_timeout,
             self.receive_rate_limit_bytes_per_second,
         )?;
+        server.set_crosscopy_authorized_upload_gate(self.crosscopy_authorized_upload_gate);
         #[cfg(feature = "https")]
         if let Some(cert) = tls_cert {
             server.set_tls_certificate(cert);

@@ -574,7 +574,7 @@ mod tests {
             .await
             .expect("the announced certificate fingerprint should be pinned");
 
-        server.stop();
+        server.stop().await;
     }
 
     #[test]

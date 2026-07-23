@@ -1,3 +1,4 @@
+use super::CROSSCOPY_FILE_V3_HANDOFF_HEADER;
 use super::handlers::{
     handle_cancel, handle_info, handle_prepare_upload, handle_register, handle_upload,
 };
@@ -7,6 +8,10 @@ use super::web_share::{
 };
 use axum::{
     Router,
+    extract::Request,
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use std::sync::Arc;
@@ -30,5 +35,20 @@ pub(crate) fn create_router(state: Arc<RwLock<ServerState>>) -> Router {
         .route("/", get(handle_web_index))
         .route("/main.js", get(handle_web_js))
         .route("/i18n.json", get(handle_web_i18n))
+        // The reserved credential is meaningful only on one exact protected
+        // prepare route.  Never let another LocalSend handler silently ignore
+        // it and fall back into standard behavior.
+        .layer(middleware::from_fn(reject_crosscopy_header_on_other_routes))
         .with_state(state)
+}
+
+async fn reject_crosscopy_header_on_other_routes(request: Request, next: Next) -> Response {
+    if request
+        .headers()
+        .contains_key(CROSSCOPY_FILE_V3_HANDOFF_HEADER)
+        && request.uri().path() != "/api/localsend/v2/prepare-upload"
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    next.run(request).await
 }

@@ -93,7 +93,7 @@ async fn uploads_a_file_byte_for_byte_rs_to_rs() {
         .expect("saved file");
     assert_eq!(got_sha, want_sha);
 
-    server.stop();
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -148,5 +148,5 @@ async fn upload_completes_when_progress_event_channel_is_not_drained() {
         .await
         .expect("saved file");
     assert_eq!(got_sha, want_sha);
-    server.stop();
+    server.stop().await;
 }

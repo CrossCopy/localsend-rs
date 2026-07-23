@@ -41,7 +41,7 @@ async fn builder_uses_the_supplied_certificate_fingerprint_for_https() {
     assert_eq!(server.device().fingerprint, expected_fingerprint);
     assert_eq!(info.fingerprint, expected_fingerprint);
 
-    server.stop();
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -78,7 +78,7 @@ async fn builder_generates_a_nonempty_https_fingerprint_when_none_is_supplied() 
     assert!(!server.device().fingerprint.is_empty());
     assert_eq!(info.fingerprint, server.device().fingerprint);
 
-    server.stop();
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -107,7 +107,7 @@ async fn pinned_client_accepts_the_matching_self_signed_leaf() {
         .await
         .expect("matching fingerprint should be accepted");
 
-    server.stop();
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -129,7 +129,7 @@ async fn pinned_client_rejects_a_non_matching_self_signed_leaf() {
         .expect("pinned client");
 
     assert!(client.register(&target).await.is_err());
-    server.stop();
+    server.stop().await;
 }
 
 #[test]
@@ -163,5 +163,5 @@ async fn http_requests_bypass_the_tls_verifier() {
         .register(&target)
         .await
         .expect("HTTP should not invoke TLS verification");
-    server.stop();
+    server.stop().await;
 }

@@ -88,8 +88,13 @@ strum = { version = "0.27", features = ["derive"], optional = true }
 itertools = { version = "0.14", optional = true }
 chrono = { version = "0.4.43", features = ["serde"] }
 parking_lot = "0.12"
+# The optional protected client accepts the File service's linear redacting
+# request by value.  Standard LocalSend APIs remain independent and unchanged.
+crosscopy-file-service = { path = "../../packages/crosscopy-file-service" }
 
 [dev-dependencies]
+crosscopy-ipc = { path = "../../packages/crosscopy-ipc" }
+prost = "0.14"
 tempfile = "3"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 serde_json = "1.0"

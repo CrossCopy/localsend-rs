@@ -175,7 +175,7 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
 
     println!("\nShutting down server...");
     event_loop.abort();
-    server.stop();
+    server.stop().await;
     discovery.stop();
 
     Ok(())

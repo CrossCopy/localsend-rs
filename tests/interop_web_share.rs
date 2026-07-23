@@ -92,7 +92,7 @@ async fn approved_browser_session_downloads_exact_bytes() {
             .status(),
         reqwest::StatusCode::FORBIDDEN
     );
-    server.stop();
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -132,7 +132,7 @@ async fn browser_prepare_waits_for_explicit_approval() {
         .await
         .expect("approve request");
     assert!(request.await.unwrap().unwrap().status().is_success());
-    server.stop();
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -178,7 +178,7 @@ async fn browser_share_pin_uses_receiver_rate_limit() {
             .status(),
         reqwest::StatusCode::TOO_MANY_REQUESTS
     );
-    server.stop();
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -250,5 +250,5 @@ async fn browser_share_streams_disk_files_and_rejects_unknown_file_ids() {
         response.bytes().await.expect("download bytes").as_ref(),
         fixture
     );
-    server.stop();
+    server.stop().await;
 }

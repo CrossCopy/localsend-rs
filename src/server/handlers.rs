@@ -1,12 +1,18 @@
-use super::state::{ServerState, write_body_to_file_with_progress};
+use super::crosscopy_authorized::{
+    CROSSCOPY_FILE_V3_HANDOFF_HEADER, CrossCopyAuthorizedHandoff, CrossCopyAuthorizedPrepare,
+    CrossCopyAuthorizedPrepareMetadata, CrossCopyAuthorizedUpload, CrossCopyAuthorizedUploadBody,
+};
+use super::events::ServerEvent;
+use super::state::{CrossCopyAuthorizedSession, ServerState, write_body_to_file_with_progress};
 use crate::protocol::{DeviceInfo, FileId, PrepareUploadRequest, PrepareUploadResponse, SessionId};
 use axum::{
     Json,
     body::Body,
     extract::{ConnectInfo, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,7 +43,116 @@ pub(crate) async fn handle_prepare_upload(
     State(state_ref): State<Arc<RwLock<ServerState>>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     Query(params): Query<PrepareUploadParams>,
+    headers: HeaderMap,
     Json(request): Json<PrepareUploadRequest>,
+) -> Response {
+    if headers.contains_key(CROSSCOPY_FILE_V3_HANDOFF_HEADER) {
+        return handle_crosscopy_authorized_prepare(state_ref, headers, request).await;
+    }
+    handle_standard_prepare_upload(state_ref, peer, params, request).await
+}
+
+async fn handle_crosscopy_authorized_prepare(
+    state_ref: Arc<RwLock<ServerState>>,
+    headers: HeaderMap,
+    request: PrepareUploadRequest,
+) -> Response {
+    // Header names are case-insensitive through `HeaderMap`, but the value is
+    // intentionally stricter: exactly one canonical lowercase hex token with
+    // no whitespace, commas, or alternate encoding.
+    let values = match headers
+        .get_all(CROSSCOPY_FILE_V3_HANDOFF_HEADER)
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(values) => values,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let handoff = match CrossCopyAuthorizedHandoff::parse(&values) {
+        Ok(handoff) => handoff,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    // File-v3 is one exact regular file.  Text/mixed/multi-file LocalSend
+    // shapes never enter the protected mode and cannot cause standard fallback.
+    if request.files.len() != 1 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some((file_id, file)) = request.files.into_iter().next() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if file.file_name.trim().is_empty() || file.preview.is_some() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let metadata = CrossCopyAuthorizedPrepareMetadata::new(request.info, file_id, file);
+
+    // Avoid consuming an external, linear File-v3 receiver slot when this
+    // listener already has a protected upload in flight.  This is only a
+    // preflight: a concurrent prepare can still win the race after this read,
+    // so the post-take insertion below remains responsible for terminalizing
+    // the owner it cannot install.
+    let (stopping, occupied) = {
+        let state = state_ref.read().await;
+        (
+            state.crosscopy_authorized_stopping,
+            state.crosscopy_authorized_session.is_some(),
+        )
+    };
+    if stopping {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if occupied {
+        return StatusCode::CONFLICT.into_response();
+    }
+
+    let gate = state_ref
+        .read()
+        .await
+        .crosscopy_authorized_upload_gate
+        .clone();
+    let Some(gate) = gate else {
+        // The default listener intentionally has no File-v3 authority.
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let owner = match gate
+        .take_authorized_upload(CrossCopyAuthorizedPrepare::new(handoff, metadata.clone()))
+        .await
+    {
+        Ok(owner) => owner,
+        Err(_) => return StatusCode::FORBIDDEN.into_response(),
+    };
+    let session = CrossCopyAuthorizedSession::new(metadata, owner);
+    let response = PrepareUploadResponse {
+        session_id: session.session_id.clone(),
+        files: std::iter::once((session.file_id.clone(), session.upload_token.clone())).collect(),
+    };
+    let rejected = {
+        let mut state = state_ref.write().await;
+        if state.crosscopy_authorized_stopping {
+            Some((session.owner, StatusCode::SERVICE_UNAVAILABLE))
+        } else if state.crosscopy_authorized_session.is_some() {
+            Some((session.owner, StatusCode::CONFLICT))
+        } else {
+            state.crosscopy_authorized_session = Some(session);
+            None
+        }
+    };
+    if let Some((owner, status)) = rejected {
+        // The external gate already consumed a linear slot.  A local session
+        // conflict or concurrent orderly shutdown must terminalize that owner
+        // instead of leaking it.
+        owner.cancel().await;
+        return status.into_response();
+    }
+    Json(response).into_response()
+}
+
+async fn handle_standard_prepare_upload(
+    state_ref: Arc<RwLock<ServerState>>,
+    peer: std::net::SocketAddr,
+    params: PrepareUploadParams,
+    request: PrepareUploadRequest,
 ) -> Response {
     // PIN gate runs first, before any session/event work -- a locked-out or
     // unauthenticated peer must never reach the accept flow (which would
@@ -258,7 +373,77 @@ pub(crate) async fn handle_upload(
     Query(params): Query<UploadParams>,
     body: Body,
 ) -> Response {
-    let state = state_ref.write().await;
+    let mut state = state_ref.write().await;
+
+    // The protected session owns a distinct one-shot token and opaque sink.
+    // Check it before the standard state, remove it atomically, and never pass
+    // its body through the standard save/event pipeline.
+    if state
+        .crosscopy_authorized_session
+        .as_ref()
+        .is_some_and(|session| session.session_id == params.session_id)
+    {
+        let session = state
+            .crosscopy_authorized_session
+            .take()
+            .expect("protected session remained present under write lock");
+        let events_tx = state.events_tx.clone();
+        if session.file_id != params.file_id || session.upload_token != params.token {
+            drop(state);
+            session.owner.cancel().await;
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let active_session_id = session.session_id.clone();
+        state.crosscopy_authorized_active_upload =
+            Some(super::state::CrossCopyAuthorizedActiveUpload {
+                session_id: active_session_id.clone(),
+                cancellation: session.owner.cancellation(),
+            });
+        drop(state);
+        let stream = body
+            .into_data_stream()
+            .map(|item| item.map_err(|error| std::io::Error::other(error.to_string())));
+        let sender_alias = session.metadata.sender().alias.clone();
+        let file_id = session.metadata.file_id().clone();
+        let file_name = session.metadata.file().file_name.clone();
+        let session_id = session.session_id.clone();
+        let upload = CrossCopyAuthorizedUpload::new(
+            session.session_id,
+            session.metadata,
+            CrossCopyAuthorizedUploadBody::new(Box::pin(stream)),
+        );
+        let result = session.owner.receive(upload).await;
+        {
+            let mut state = state_ref.write().await;
+            if state
+                .crosscopy_authorized_active_upload
+                .as_ref()
+                .is_some_and(|active| active.session_id == active_session_id)
+            {
+                state.crosscopy_authorized_active_upload = None;
+            }
+        }
+        return match result {
+            Ok(receipt) => {
+                let _ = events_tx
+                    .send(ServerEvent::FileReceived {
+                        session_id: session_id.clone(),
+                        file_id,
+                        file_name,
+                        path: receipt.path().clone(),
+                        size: receipt.size(),
+                        sender_alias,
+                        message_text: None,
+                    })
+                    .await;
+                let _ = events_tx
+                    .send(ServerEvent::SessionDone { session_id })
+                    .await;
+                StatusCode::OK.into_response()
+            }
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
 
     // Verify session
     let (
@@ -500,6 +685,34 @@ pub(crate) async fn handle_cancel(
     Query(params): Query<CancelParams>,
 ) -> Response {
     let mut state = state_ref.write().await;
+
+    if state
+        .crosscopy_authorized_session
+        .as_ref()
+        .is_some_and(|session| session.session_id == params.session_id)
+    {
+        let session = state
+            .crosscopy_authorized_session
+            .take()
+            .expect("protected session remained present under write lock");
+        drop(state);
+        session.owner.cancel().await;
+        return StatusCode::OK.into_response();
+    }
+
+    if state
+        .crosscopy_authorized_active_upload
+        .as_ref()
+        .is_some_and(|active| active.session_id == params.session_id)
+    {
+        state
+            .crosscopy_authorized_active_upload
+            .as_ref()
+            .expect("active protected upload remained present")
+            .cancellation
+            .cancel();
+        return StatusCode::OK.into_response();
+    }
 
     if let Some(session) = &state.current_session
         && session.id.as_str() == params.session_id.as_str()

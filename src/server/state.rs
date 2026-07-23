@@ -1,10 +1,15 @@
 use crate::protocol::DeviceInfo;
+use crate::protocol::{FileId, SessionId, Token};
+use crate::server::crosscopy_authorized::{
+    CrossCopyAuthorizedPrepareMetadata, CrossCopyAuthorizedUploadOwner,
+};
 use axum::body::Body;
 use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
 pub struct ServerState {
     pub device: DeviceInfo,
@@ -18,6 +23,54 @@ pub struct ServerState {
     pub receive_rate_limit_bytes_per_second: Option<u64>,
     pub pin_gate: crate::server::pin::PinGate,
     pub web_share: Option<crate::server::web_share::WebShareState>,
+    /// Optional host-owned gate for File-v3 protected prepares.  `None` is the
+    /// production-compatible default and makes the reserved header fail closed.
+    pub crosscopy_authorized_upload_gate:
+        Option<std::sync::Arc<dyn crate::server::CrossCopyAuthorizedUploadGate>>,
+    /// A protected session is deliberately separate from `current_session` so
+    /// standard and CrossCopy-issued LocalSend tokens can never be confused.
+    pub crosscopy_authorized_session: Option<CrossCopyAuthorizedSession>,
+    /// An upload whose owner was moved into `receive`. It remains cancellable
+    /// by exact session id until the body future returns.
+    pub crosscopy_authorized_active_upload: Option<CrossCopyAuthorizedActiveUpload>,
+    /// Once orderly shutdown begins, protected admission is closed before any
+    /// in-flight owner is terminalized. Standard LocalSend shutdown behavior
+    /// remains unchanged.
+    pub crosscopy_authorized_stopping: bool,
+}
+
+pub(crate) struct CrossCopyAuthorizedActiveUpload {
+    pub(crate) session_id: SessionId,
+    pub(crate) cancellation: CancellationToken,
+}
+
+pub(crate) struct CrossCopyAuthorizedSession {
+    pub(crate) session_id: SessionId,
+    pub(crate) file_id: FileId,
+    pub(crate) upload_token: Token,
+    pub(crate) metadata: CrossCopyAuthorizedPrepareMetadata,
+    pub(crate) owner: Box<dyn CrossCopyAuthorizedUploadOwner>,
+    pub(crate) created_at: std::time::Instant,
+}
+
+impl CrossCopyAuthorizedSession {
+    pub(crate) fn new(
+        metadata: CrossCopyAuthorizedPrepareMetadata,
+        owner: Box<dyn CrossCopyAuthorizedUploadOwner>,
+    ) -> Self {
+        Self {
+            file_id: metadata.file_id().clone(),
+            metadata,
+            session_id: SessionId::new(),
+            upload_token: Token::random(),
+            owner,
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn is_timed_out(&self, seconds: u64) -> bool {
+        self.created_at.elapsed().as_secs() >= seconds
+    }
 }
 
 pub(crate) async fn write_body_to_file_with_progress<F>(

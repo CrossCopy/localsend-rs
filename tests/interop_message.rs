@@ -114,5 +114,5 @@ async fn message_path_emits_text_received_without_saving_and_session_done() {
     .expect("timed out waiting for SessionDone");
     assert!(!session_done.as_str().is_empty());
 
-    server.stop();
+    server.stop().await;
 }

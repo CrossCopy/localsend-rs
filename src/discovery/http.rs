@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(target.port, server.port());
         assert_eq!(target.protocol, Protocol::Https);
 
-        server.stop();
+        server.stop().await;
     }
 
     #[tokio::test]
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(target.alias, "http-scan-target");
         assert_eq!(target.protocol, Protocol::Http);
 
-        server.stop();
+        server.stop().await;
     }
 
     #[tokio::test]

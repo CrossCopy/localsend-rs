@@ -3,6 +3,9 @@ use crate::error::{LocalSendError, Result};
 use crate::protocol::{
     DeviceInfo, FileId, FileMetadata, PrepareUploadRequest, PrepareUploadResponse, SessionId, Token,
 };
+use crosscopy_file_service::{
+    AuthorizedLocalSendHttpRequest, FileTransferSource, FileV3HandoffHeaderSink,
+};
 use futures_util::StreamExt;
 use reqwest::{Body, Client as HttpClient, StatusCode};
 use std::collections::HashMap;
@@ -153,6 +156,103 @@ impl LocalSendClient {
         }
     }
 
+    /// Send one File-v3-authorized regular file.  The caller transfers the
+    /// redacting handoff owner by value; it is consumed precisely while this
+    /// method writes the one protected `prepare-upload` header.  The subsequent
+    /// per-file LocalSend upload token is receiver-minted and unrelated to the
+    /// handoff value.
+    pub async fn send_crosscopy_authorized_file(
+        &self,
+        target: &DeviceInfo,
+        request: AuthorizedLocalSendHttpRequest,
+    ) -> Result<u64> {
+        let source = request.source().clone();
+        let offer = request.offer().clone();
+        if offer.item_count != 1 {
+            return Err(LocalSendError::invalid_state(
+                "CrossCopy-authorized LocalSend requires exactly one file",
+            ));
+        }
+        let FileTransferSource::PathSnapshot { path, size, .. } = source else {
+            return Err(LocalSendError::invalid_state(
+                "CrossCopy-authorized LocalSend requires a path snapshot",
+            ));
+        };
+        if size != offer.total_bytes {
+            return Err(LocalSendError::invalid_state(
+                "CrossCopy-authorized LocalSend source size differs from offer",
+            ));
+        }
+        if request.cancellation().is_cancelled() {
+            return Err(LocalSendError::invalid_state(
+                "CrossCopy-authorized LocalSend was cancelled before prepare",
+            ));
+        }
+        let metadata = crate::build_file_metadata(&path).await?;
+        if metadata.size != size || metadata.preview.is_some() {
+            return Err(LocalSendError::invalid_state(
+                "CrossCopy-authorized LocalSend source no longer matches a regular file",
+            ));
+        }
+        let file_id = metadata.id.clone();
+        let files = HashMap::from([(file_id.clone(), metadata)]);
+        let ip = target
+            .ip
+            .as_ref()
+            .ok_or_else(|| LocalSendError::network("Target IP not provided"))?;
+        let url = format!(
+            "{}://{}:{}/api/localsend/v2/prepare-upload",
+            target.protocol, ip, target.port
+        );
+        let mut headers = CrossCopyPrepareHeaders::new(self.client.post(&url));
+        let _metadata = request.apply_handoff_header(&mut headers);
+        let response = tokio::select! {
+            biased;
+            _ = _metadata.cancellation().cancelled() => {
+                return Err(LocalSendError::invalid_state(
+                    "CrossCopy-authorized LocalSend was cancelled during prepare",
+                ));
+            }
+            response = headers.finish().json(&PrepareUploadRequest {
+                info: self.device.clone(),
+                files,
+            }).send() => response?,
+        };
+        let status = response.status();
+        if status != StatusCode::OK {
+            return Err(match status {
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => LocalSendError::Rejected {
+                    status: status.as_u16(),
+                },
+                StatusCode::CONFLICT => LocalSendError::SessionBlocked,
+                _ => LocalSendError::http_failed(
+                    status.as_u16(),
+                    "CrossCopy-authorized prepare upload failed",
+                ),
+            });
+        }
+        let prepared: PrepareUploadResponse = response.json().await?;
+        let upload_token = prepared.files.get(&file_id).ok_or_else(|| {
+            LocalSendError::invalid_state(
+                "CrossCopy-authorized LocalSend receiver omitted the file token",
+            )
+        })?;
+        tokio::select! {
+            biased;
+            _ = _metadata.cancellation().cancelled() => Err(LocalSendError::invalid_state(
+                "CrossCopy-authorized LocalSend was cancelled before upload",
+            )),
+            result = self.upload_file(
+                target,
+                &prepared.session_id,
+                &file_id,
+                upload_token,
+                &path,
+                None,
+            ) => result.map(|()| size),
+        }
+    }
+
     pub async fn upload_file(
         &self,
         target: &DeviceInfo,
@@ -268,6 +368,37 @@ impl LocalSendClient {
                 "Cancel failed",
             ))
         }
+    }
+}
+
+/// One-use request-builder sink used only by the File-v3 linear request.  It
+/// has no getter and returns no header map, so the raw handoff token cannot
+/// escape the protected prepare call as generic client state.
+struct CrossCopyPrepareHeaders {
+    builder: Option<reqwest::RequestBuilder>,
+}
+
+impl CrossCopyPrepareHeaders {
+    fn new(builder: reqwest::RequestBuilder) -> Self {
+        Self {
+            builder: Some(builder),
+        }
+    }
+
+    fn finish(mut self) -> reqwest::RequestBuilder {
+        self.builder
+            .take()
+            .expect("protected prepare builder is consumed exactly once")
+    }
+}
+
+impl FileV3HandoffHeaderSink for CrossCopyPrepareHeaders {
+    fn set_file_v3_handoff(&mut self, name: &'static str, value: &str) {
+        let builder = self
+            .builder
+            .take()
+            .expect("protected handoff header is applied exactly once");
+        self.builder = Some(builder.header(name, value));
     }
 }
 

@@ -70,7 +70,7 @@ async fn event_consumer_can_accept_a_transfer() {
         .await
         .unwrap();
     assert!(save.path().join("a.bin").exists());
-    server.stop();
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -99,7 +99,7 @@ async fn event_consumer_can_decline_a_transfer() {
         .await
         .expect_err("declined");
     assert!(matches!(err, LocalSendError::Rejected { status: 403 }));
-    server.stop();
+    server.stop().await;
 }
 
 /// Per-file accept: the consumer answers `accept_files` with a subset, and the
@@ -160,7 +160,7 @@ async fn event_consumer_can_accept_a_subset_of_files() {
         .unwrap();
     assert!(save.path().join("keep.bin").exists());
     assert!(!save.path().join("skip.bin").exists());
-    server.stop();
+    server.stop().await;
 }
 
 /// The auto-accept flag is live: flipping it on a already-running server via
@@ -205,5 +205,5 @@ async fn set_auto_accept_true_takes_effect_live() {
         .await
         .unwrap();
     assert!(save.path().join("a.bin").exists());
-    server.stop();
+    server.stop().await;
 }
