@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use crosscopy_file_service::{
     FileOffer, FileTransferSource, FileV3SenderBinding, PendingFileV3Send, TransferPeer,
 };
-use crosscopy_ipc::file::FileV3HandoffReady;
+use crosscopy_ipc::file::{
+    FileV3HandoffReady, FileV3LocalSendEndpoint, FileV3LocalSendEndpointProtocol,
+};
 use localsend_rs::server::{
     CROSSCOPY_FILE_V3_HANDOFF_HEADER, CrossCopyAuthorizedPrepare, CrossCopyAuthorizedUpload,
     CrossCopyAuthorizedUploadError, CrossCopyAuthorizedUploadGate, CrossCopyAuthorizedUploadOwner,
@@ -174,9 +176,23 @@ async fn start_with_gate(shared: Arc<Shared>) -> (LocalSendServer, u16, tempfile
     (server, port, output)
 }
 
+/// The advertised endpoint is this test's own listener, so whether it answers
+/// is not in question. Reachability probing has its own coverage in
+/// `crosscopy-file-service`; injecting a trivial probe here keeps this test on
+/// the one thing it is about — which prepare consumes the handoff token.
+struct AlwaysReachable;
+
+#[async_trait]
+impl crosscopy_file_service::FileV3DataEndpointProbe for AlwaysReachable {
+    async fn is_reachable(&self, _ipv4: std::net::Ipv4Addr, _port: std::num::NonZeroU16) -> bool {
+        true
+    }
+}
+
 async fn authorized_request(
     path: &std::path::Path,
     size: u64,
+    port: u16,
 ) -> crosscopy_file_service::AuthorizedLocalSendRequest {
     let pending = PendingFileV3Send::new(
         FileV3SenderBinding::new(
@@ -220,6 +236,21 @@ async fn authorized_request(
         operation_instance_handle: "instance".into(),
         handoff_token: HANDOFF.into(),
         expires_at_ms: 1_000,
+        localsend_endpoints: vec![FileV3LocalSendEndpoint {
+            // A File-v3 data endpoint may not be loopback — `FileV3DataEndpoints`
+            // refuses one by design, since a receiver advertising 127.0.0.1 is
+            // describing the sender's own host. This test's listener is on
+            // loopback, so the frame carries a routable placeholder address and
+            // the REAL port, and the send below dials loopback on the port it is
+            // handed. Endpoint selection is covered directly in
+            // `crosscopy-file-service`; what this test proves is token handling.
+            ipv4_address: "10.0.0.1".into(),
+            port: u32::from(port),
+            protocol: FileV3LocalSendEndpointProtocol::FileV3LocalsendEndpointProtocolHttp as i32,
+        }],
+        // The listener serves plain HTTP. Only the HTTPS path requires a pinned
+        // fingerprint, and it treats an empty one as fail-closed.
+        localsend_certificate_fingerprint: String::new(),
     };
     let payload = ready.encode_to_vec();
     let (mut writer, mut reader) = tokio::io::duplex(1024);
@@ -716,17 +747,22 @@ async fn typed_client_consumes_ready_token_only_for_protected_prepare() {
         .await
         .expect("source bytes");
     let client = LocalSendClient::new(DeviceInfo::new("sender".into(), 0, Protocol::Http));
-    let request = authorized_request(&source, 9).await;
-    let target = common::target_device(port);
+    let request = authorized_request(&source, 9, port).await;
     let bytes = request
-        .send_with(|http| async move {
-            client
-                .send_crosscopy_authorized_file(&target, http)
-                .await
-                .map_err(|error| {
-                    crosscopy_file_service::FileV3SenderError::Outbound(error.to_string())
-                })
-        })
+        .execute_with_endpoint(
+            &AlwaysReachable,
+            move |_ipv4, selected_port, _protocol, http| async move {
+                // Dial the port the selection handed back, on the loopback the
+                // listener actually serves — see the placeholder note above.
+                let target = common::target_device(selected_port.get());
+                client
+                    .send_crosscopy_authorized_file(&target, http)
+                    .await
+                    .map_err(|error| {
+                        crosscopy_file_service::FileV3SenderError::Outbound(error.to_string())
+                    })
+            },
+        )
         .await
         .expect("typed protected client send");
     assert_eq!(bytes, 9);
