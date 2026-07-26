@@ -26,10 +26,20 @@ pub(crate) async fn handle_info(State(state): State<Arc<RwLock<ServerState>>>) -
 
 pub(crate) async fn handle_register(
     State(state): State<Arc<RwLock<ServerState>>>,
-    Json(remote_device): Json<DeviceInfo>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    Json(mut remote_device): Json<DeviceInfo>,
 ) -> Response {
     tracing::debug!("Register request from {:?}", remote_device.alias);
     let state = state.read().await;
+    // Prefer the address we actually received the request from over the one the
+    // body claims. The socket cannot be wished into being wrong, and the
+    // official client omits `ip` from what it posts anyway.
+    remote_device.ip = Some(peer.ip().to_string());
+    // A registration is a sighting: this peer was reachable a moment ago, and
+    // said so itself. Announcing it costs nothing when nobody is listening.
+    let _ = state
+        .events_tx
+        .try_send(ServerEvent::PeerRegistered(remote_device));
     Json(state.device.clone()).into_response()
 }
 

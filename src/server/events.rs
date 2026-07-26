@@ -8,6 +8,18 @@ use tokio::sync::oneshot;
 /// Events emitted by [`crate::server::LocalSendServer`].
 #[derive(Debug)]
 pub enum ServerEvent {
+    /// A peer registered itself with us over HTTP.
+    ///
+    /// This is how a healthy LocalSend client answers an announcement: it POSTs
+    /// `/register` straight back to the announcer and only falls back to a
+    /// multicast reply if that fails. So on a working network the *reply to our
+    /// own announcement arrives here*, on the HTTP door, and never reaches
+    /// multicast discovery at all.
+    ///
+    /// The handler used to log this and drop it, which made a registration
+    /// invisible to anything tracking who is still out there — a peer answering
+    /// exactly as the protocol intends looked identical to one that had gone.
+    PeerRegistered(DeviceInfo),
     /// A sender wants to transfer files. Respond via the [`PendingRequest`].
     /// Dropping the request (or ignoring it past the accept timeout) declines it.
     TransferRequest(PendingRequest),

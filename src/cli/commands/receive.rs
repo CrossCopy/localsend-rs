@@ -110,6 +110,9 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
     let event_loop = tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
             match ev {
+                crate::server::ServerEvent::PeerRegistered(device) => {
+                    println!("'{}' is here", device.alias);
+                }
                 crate::server::ServerEvent::TransferRequest(req) => {
                     println!(
                         "Incoming transfer from '{}' ({} file(s))",
