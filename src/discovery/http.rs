@@ -109,8 +109,23 @@ impl HttpDiscovery {
     /// retried on the other scheme — it would fail there too — which keeps the scan fast
     /// over a subnet that is mostly empty.
     async fn probe_info(&self, ip: &str) -> Option<DeviceInfo> {
+        self.probe_peer(ip, self.local_device.port).await
+    }
+
+    /// Ask ONE known peer, at ITS port, whether it is still there.
+    ///
+    /// The difference from a scan is which port is used. A sweep is looking for
+    /// strangers and can only assume the well-known port, so it probes with its
+    /// own. A peer we have already met answered somewhere specific, and that is
+    /// not necessarily where we listen — a caller checking whether a known peer
+    /// is still alive has to ask where the peer actually is.
+    ///
+    /// This is what a daemon's liveness check runs on. It is unicast, and every
+    /// LocalSend client is required to serve it, which makes it evidence about
+    /// a peer that does not depend on the peer volunteering anything.
+    pub async fn probe_peer(&self, ip: &str, port: u16) -> Option<DeviceInfo> {
         for protocol in self.protocol_candidates() {
-            match self.probe_info_with(ip, protocol).await {
+            match self.probe_info_with(ip, port, protocol).await {
                 ProbeOutcome::Found(device) => return Some(device),
                 ProbeOutcome::Unreachable => return None,
                 ProbeOutcome::Miss => continue,
@@ -128,11 +143,8 @@ impl HttpDiscovery {
 
     /// `ip`/`port`/`protocol` on the returned device are taken from the connection we
     /// actually made, because the official app omits `port`/`protocol` from `/info`.
-    async fn probe_info_with(&self, ip: &str, protocol: Protocol) -> ProbeOutcome {
-        let url = format!(
-            "{}://{}:{}/api/localsend/v2/info",
-            protocol, ip, self.local_device.port
-        );
+    async fn probe_info_with(&self, ip: &str, port: u16, protocol: Protocol) -> ProbeOutcome {
+        let url = format!("{}://{}:{}/api/localsend/v2/info", protocol, ip, port);
         let response = match self.client.get(&url).send().await {
             Ok(response) => response,
             // Connect failures/timeouts mean nothing is listening on this host — the other
@@ -151,7 +163,12 @@ impl HttpDiscovery {
             Err(_) => return ProbeOutcome::Miss,
         };
         device.ip = Some(ip.to_string());
-        device.port = self.local_device.port;
+        // The port we actually reached it on, not ours. The official app omits
+        // `port` from `/info`, so the connection is the only evidence of where
+        // this device answers — and stamping our own port here would hand the
+        // caller an address that only works while both sides happen to use the
+        // same one.
+        device.port = port;
         device.protocol = protocol;
         tracing::info!(
             "[DISCOVER/TCP] {} ({}, model: {:?})",
@@ -346,6 +363,71 @@ mod tests {
         assert_eq!(target.protocol, Protocol::Http);
 
         server.stop().await;
+    }
+
+    /// A liveness check asks ONE known peer, at ITS port.
+    ///
+    /// The scan path takes the port from the scanner's own device because it is
+    /// sweeping a subnet of strangers, all of which are assumed to be on the
+    /// well-known port. A peer we have already met is different: we know where
+    /// it answered, and that is not necessarily where we listen. The scanner
+    /// here is deliberately configured with the wrong port, so a probe that
+    /// used its own would find nothing.
+    #[tokio::test]
+    async fn probe_peer_asks_at_the_peers_own_port() {
+        use crate::{LocalSendServer, Protocol};
+
+        let output = tempfile::tempdir().expect("output directory");
+        let (mut server, _events) = LocalSendServer::builder()
+            .alias("probe-target")
+            .port(0)
+            .save_dir(output.path())
+            .protocol(Protocol::Http)
+            .build()
+            .await
+            .expect("start HTTP receiver");
+        let expected_fingerprint = server.device().fingerprint.clone();
+        let peer_port = server.port();
+
+        // A port the peer is definitely NOT on.
+        let wrong_port = peer_port.checked_add(1).expect("a spare port number");
+        let discovery = HttpDiscovery::new("prober".into(), wrong_port, Protocol::Http)
+            .expect("build discovery");
+
+        let found = discovery
+            .probe_peer("127.0.0.1", peer_port)
+            .await
+            .expect("the peer must answer at its own port");
+        assert_eq!(found.fingerprint, expected_fingerprint);
+        assert_eq!(found.port, peer_port);
+
+        server.stop().await;
+    }
+
+    /// A probe of somewhere nothing is listening must answer "no", not hang or
+    /// report a device: it is what tells liveness a peer has gone.
+    #[tokio::test]
+    async fn probe_peer_reports_nothing_when_the_peer_is_gone() {
+        use crate::{LocalSendServer, Protocol};
+
+        let output = tempfile::tempdir().expect("output directory");
+        let (mut server, _events) = LocalSendServer::builder()
+            .alias("departing")
+            .port(0)
+            .save_dir(output.path())
+            .protocol(Protocol::Http)
+            .build()
+            .await
+            .expect("start HTTP receiver");
+        let peer_port = server.port();
+        let discovery = HttpDiscovery::new("prober".into(), peer_port, Protocol::Http)
+            .expect("build discovery");
+        server.stop().await;
+
+        assert!(
+            discovery.probe_peer("127.0.0.1", peer_port).await.is_none(),
+            "a stopped peer must not still be reported as answering"
+        );
     }
 
     #[tokio::test]
