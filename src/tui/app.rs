@@ -259,23 +259,13 @@ impl App {
         let mut discovery = MulticastDiscovery::new_with_device(device_info.clone());
 
         discovery.on_discovered(move |device: DeviceInfo| {
-            // Skip self
-            if device.fingerprint == device_info.fingerprint {
-                return;
-            }
-
             // Discovery callback runs off the UI thread; if the reader holds
             // the lock this instant, drop this announce — the peer re-announces
             // periodically, so it will be picked up on a later round.
             let Ok(mut devices_guard) = devices.try_write() else {
                 return;
             };
-            let exists = devices_guard.iter().any(|d| {
-                d.fingerprint == device.fingerprint || (d.ip == device.ip && d.port == device.port)
-            });
-            if !exists {
-                devices_guard.push(device);
-            }
+            remember_device(&mut devices_guard, &device_info.fingerprint, device);
         });
 
         discovery.start().await?;
@@ -324,6 +314,13 @@ impl App {
         while let Ok(ev) = rx.try_recv() {
             self.dirty = true; // any server event may change what's on screen
             match ev {
+                // A peer answering our announcement arrives on this door, not
+                // on multicast, so it has to be folded into the same list.
+                ServerEvent::PeerRegistered(device) => {
+                    if let Ok(mut devices) = self.devices.try_write() {
+                        remember_device(&mut devices, &self.device_info.fingerprint, device);
+                    }
+                }
                 ServerEvent::TransferRequest(request) => match self.popup {
                     // Free slot: show the confirm dialog.
                     None => self.popup = Some(Popup::confirm(request)),
@@ -1159,10 +1156,80 @@ pub async fn run_tui(
     app_result
 }
 
+/// Fold a sighting into the device list, reporting whether it was news.
+///
+/// Both doors a peer can arrive at go through this: the multicast callback, and
+/// the `/register` a peer POSTs when it answers our announcement. The second
+/// used to have nowhere to go, so the list held only the peers whose POST had
+/// failed — the fallback — and the healthy ones were invisible.
+fn remember_device(
+    devices: &mut Vec<DeviceInfo>,
+    self_fingerprint: &str,
+    device: DeviceInfo,
+) -> bool {
+    if device.fingerprint == self_fingerprint {
+        return false;
+    }
+    let exists = devices.iter().any(|d| {
+        d.fingerprint == device.fingerprint || (d.ip == device.ip && d.port == device.port)
+    });
+    if exists {
+        return false;
+    }
+    devices.push(device);
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{App, SendKind, SendUpdate, send_update_from_result};
+    use super::{App, SendKind, SendUpdate, remember_device, send_update_from_result};
+    use crate::protocol::{DeviceInfo, Protocol};
     use crate::tui::popup::{MessageLevel, Popup};
+
+    fn device(fingerprint: &str, ip: &str, port: u16) -> DeviceInfo {
+        let mut device = DeviceInfo::new("peer".into(), port, Protocol::Https);
+        device.fingerprint = fingerprint.into();
+        device.ip = Some(ip.into());
+        device
+    }
+
+    /// A peer answering an announcement POSTs `/register` here rather than
+    /// replying over multicast, so this is the only place its arrival shows up.
+    /// Without it the device list held only the peers whose POST had failed.
+    #[test]
+    fn a_peer_that_registers_joins_the_device_list() {
+        let mut devices = Vec::new();
+        assert!(remember_device(
+            &mut devices,
+            "self-fp",
+            device("peer-fp", "192.168.6.172", 53317)
+        ));
+        assert_eq!(devices.len(), 1);
+    }
+
+    #[test]
+    fn a_peer_already_listed_is_not_added_twice() {
+        let mut devices = vec![device("peer-fp", "192.168.6.172", 53317)];
+        assert!(!remember_device(
+            &mut devices,
+            "self-fp",
+            device("peer-fp", "192.168.6.172", 53317)
+        ));
+        assert_eq!(devices.len(), 1);
+    }
+
+    /// Announcements come back to their own sender, and a device offering to
+    /// send files to itself is not a device.
+    #[test]
+    fn our_own_registration_is_never_listed() {
+        let mut devices = Vec::new();
+        assert!(!remember_device(
+            &mut devices,
+            "self-fp",
+            device("self-fp", "192.168.6.250", 53317)
+        ));
+        assert!(devices.is_empty());
+    }
 
     // App::new does no I/O (it binds nothing until run()), so it's safe to build
     // one for pure state-machine assertions.
