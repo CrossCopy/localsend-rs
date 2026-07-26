@@ -1,10 +1,9 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    #[cfg(feature = "https")]
-    {
-        use rustls::crypto::ring::default_provider;
-        default_provider().install_default().ok();
-    }
+    // Unconditional: reqwest is built with `rustls-no-provider` regardless of
+    // the `https` feature, so a client constructed on any code path needs the
+    // process default provider to already be installed.
+    localsend_rs::crypto::ensure_crypto_provider();
 
     use clap::Parser;
     #[cfg(feature = "tui")]

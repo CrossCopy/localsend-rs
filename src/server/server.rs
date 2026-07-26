@@ -130,9 +130,7 @@ impl LocalSendServer {
         if self.https {
             #[cfg(feature = "https")]
             {
-                rustls::crypto::ring::default_provider()
-                    .install_default()
-                    .ok();
+                crate::crypto::ensure_crypto_provider();
                 let (cert_pem, key_pem) = if let Some(ref cert) = self.tls_cert {
                     (cert.cert_pem.clone(), cert.key_pem.clone())
                 } else {

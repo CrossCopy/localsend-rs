@@ -191,6 +191,7 @@ fn subnet_hosts(base_ip: &str) -> Result<Vec<String>> {
 /// A reqwest client tuned for LAN discovery: accepts the self-signed certificates that
 /// every LocalSend device presents, and bounds each probe so the scan finishes promptly.
 fn build_discovery_client() -> Result<Client> {
+    crate::crypto::ensure_crypto_provider();
     Client::builder()
         .danger_accept_invalid_certs(true)
         .connect_timeout(CONNECT_TIMEOUT)

@@ -270,6 +270,7 @@ async fn resolve_target(target: &str) -> anyhow::Result<DeviceInfo> {
 }
 
 async fn probe_device(ip: String, port: u16) -> anyhow::Result<DeviceInfo> {
+    crate::crypto::ensure_crypto_provider();
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(2))

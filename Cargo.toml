@@ -46,11 +46,19 @@ uuid = { version = "1.19", features = ["v4", "serde"] }
 
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
-axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
-reqwest = { version = "0.13", features = ["json", "stream", "rustls"] }
+# Every TLS feature below is deliberately spelled in its "-no-provider" /
+# `default-features = false` form. The convenient spellings (`tls-rustls`,
+# reqwest's `rustls`, tokio-rustls' defaults, rustls' own `default`) each
+# hard-enable `rustls/aws_lc_rs`, which links ~1.2 MiB of aws-lc assembly that
+# is never executed: this crate installs `rustls::crypto::ring` as the process
+# default provider (see `ensure_crypto_provider`). The cost of that choice is
+# that a reqwest `Client` built BEFORE the provider is installed panics, so
+# every constructor in this crate calls `ensure_crypto_provider()` first.
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider", "charset", "http2", "system-proxy"] }
 tower = "0.5"
-rustls = { version = "0.23.36", features = ["ring"] }
-tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23.36", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
 rcgen = { version = "0.14", optional = true }
 
@@ -96,6 +104,11 @@ crosscopy-file-service = { path = "../../packages/crosscopy-file-service" }
 crosscopy-ipc = { path = "../../packages/crosscopy-ipc" }
 prost = "0.14"
 tempfile = "3"
+# Dev-only, and deliberately still on the provider-bundled `rustls` feature.
+# Dev-dependencies are never built when a consumer (the CrossCopy superproject)
+# compiles this crate, so this does NOT put aws-lc back into the shipped binary.
+# Keeping it here lets the ~20 bare `reqwest::Client::new()` calls in tests/
+# work without each one first installing a crypto provider.
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 serde_json = "1.0"
 tokio = { version = "1.49", features = ["full", "test-util"] }

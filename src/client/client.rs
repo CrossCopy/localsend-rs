@@ -24,6 +24,7 @@ pub struct LocalSendClient {
 
 impl LocalSendClient {
     pub fn new(device: DeviceInfo) -> Self {
+        crate::crypto::ensure_crypto_provider();
         Self {
             client: HttpClient::new(),
             device,
@@ -31,6 +32,7 @@ impl LocalSendClient {
     }
 
     pub fn with_trust_policy(device: DeviceInfo, policy: TlsTrustPolicy) -> Result<Self> {
+        crate::crypto::ensure_crypto_provider();
         let client = match policy {
             TlsTrustPolicy::InsecureForTests => HttpClient::builder()
                 .danger_accept_invalid_certs(true)
@@ -416,9 +418,7 @@ impl FingerprintVerifier {
             crate::client::trust_policy::normalize_fingerprint(&expected_fingerprint)
                 .ok_or_else(|| LocalSendError::network("Invalid LocalSend TLS fingerprint"))?;
 
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        crate::crypto::ensure_crypto_provider();
         let placeholder_certificate = crate::crypto::generate_tls_certificate()?;
         let mut roots = rustls::RootCertStore::empty();
         roots
