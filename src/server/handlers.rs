@@ -451,7 +451,19 @@ pub(crate) async fn handle_upload(
                     .await;
                 StatusCode::OK.into_response()
             }
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            // The host's reason is the only account of WHY a protected upload
+            // failed, and this is the last place it exists: the 500 that goes
+            // back on the wire carries no detail, and the sender can only report
+            // "File upload failed". Discarding it here once cost six instrumented
+            // runs to recover a single `DestinationExists`.
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %session_id,
+                    "protected File-v3 upload was refused by the host gate"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         };
     }
 

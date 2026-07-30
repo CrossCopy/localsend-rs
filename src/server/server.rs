@@ -287,12 +287,31 @@ impl LocalSendServer {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        // Abort AND await. `abort()` only requests cancellation: the task keeps
+        // its clone of the state `Arc` until the runtime actually reclaims it, so
+        // a `stop()` that merely aborted left `ServerState` alive for an
+        // unbounded time after returning. Measured with a drop probe on
+        // `ServerState`: in roughly half of the runs it was still alive ten
+        // seconds later, and was released only when the runtime was torn down.
+        // Awaiting the handle makes "stop() returned" mean "these tasks are
+        // gone". A cancelled task resolves to `Err(JoinError::cancelled)`, which
+        // is the expected outcome here, not a failure.
         if let Some(handle) = self.sweep_handle.take() {
             handle.abort();
+            let _ = handle.await;
         }
         if let Some(handle) = self.handle.take() {
             handle.abort();
+            let _ = handle.await;
         }
+        // The two tasks above held the only other strong references, so dropping
+        // ours is what actually releases `ServerState` — and with it the save
+        // directory, the event sender, the pin gate, and any host-supplied
+        // protected upload gate. Without this, "the listener has stopped" was not
+        // a statement that the host's gate had been handed back. The `None` also
+        // agrees with what every other method already reports once stopped
+        // ("Server is not running"), and `start` reassigns it.
+        self.state = None;
     }
 
     pub async fn start_web_share(
