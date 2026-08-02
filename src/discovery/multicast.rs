@@ -17,6 +17,12 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 
+mod announcement;
+mod interfaces;
+
+use announcement::{AnnouncementSendSummary, send_announcement_round};
+use interfaces::{select_interface_addresses, select_multicast_candidate_addresses};
+
 pub type Result<T> = std::result::Result<T, LocalSendError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,14 +233,30 @@ impl Discovery for MulticastDiscovery {
 
         // Send announcement multiple times with delays to improve reliability
         let delays = [100, 500, 2000];
+        let mut summary = AnnouncementSendSummary::default();
+        let mut attempt = 0;
         for delay in delays {
             tokio::time::sleep(Duration::from_millis(delay)).await;
-            for socket in &self.sockets {
-                socket.send_to(buf, &multicast_addr).await?;
-            }
+            send_announcement_round(&self.sockets, buf, multicast_addr, attempt, &mut summary)
+                .await;
+            attempt += 1;
         }
 
-        Ok(())
+        for delay in [2000, 4000] {
+            if !summary.needs_recovery_retry() {
+                break;
+            }
+            tracing::warn!(
+                delay_ms = delay,
+                "every LocalSend multicast interface failed; retrying after a startup grace period"
+            );
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            send_announcement_round(&self.sockets, buf, multicast_addr, attempt, &mut summary)
+                .await;
+            attempt += 1;
+        }
+
+        summary.finish()
     }
 
     fn on_discovered<F>(&mut self, callback: F)
@@ -277,8 +299,17 @@ impl MulticastDiscovery {
             .is_none()
             .then(|| get_local_ip().ok())
             .flatten();
-        let mut interfaces =
-            select_interface_addresses(addresses.iter().cloned(), interface_names, primary);
+        let mut interfaces = select_multicast_candidate_addresses(
+            addresses.iter().cloned(),
+            interface_names,
+            primary,
+        );
+        tracing::debug!(
+            ?primary,
+            configured_interfaces = ?interface_names,
+            candidates = ?interfaces,
+            "selected LocalSend multicast interface candidates"
+        );
 
         if interfaces.is_empty() && primary.is_some() && interface_names.is_none() {
             interfaces = select_interface_addresses(addresses, None, None);
@@ -289,12 +320,6 @@ impl MulticastDiscovery {
         } else {
             Ok(interfaces)
         }
-    }
-
-    fn same_subnet(address: Ipv4Addr, primary: Ipv4Addr, netmask: Ipv4Addr) -> bool {
-        let netmask = u32::from_be_bytes(netmask.octets());
-        u32::from_be_bytes(address.octets()) & netmask
-            == u32::from_be_bytes(primary.octets()) & netmask
     }
 
     fn client_for_announcement(
@@ -406,26 +431,6 @@ impl MulticastDiscovery {
     }
 }
 
-fn select_interface_addresses(
-    addresses: impl IntoIterator<Item = (String, Ipv4Addr, Ipv4Addr)>,
-    interface_names: Option<&BTreeSet<String>>,
-    primary: Option<Ipv4Addr>,
-) -> Vec<Ipv4Addr> {
-    addresses
-        .into_iter()
-        .filter(|(name, _, _)| interface_names.is_none_or(|names| names.contains(name)))
-        .map(|(_, address, netmask)| (address, netmask))
-        .filter(|(address, _)| !address.is_unspecified() && !address.is_loopback())
-        .filter(|(address, netmask)| {
-            primary
-                .is_none_or(|primary| MulticastDiscovery::same_subnet(*address, primary, *netmask))
-        })
-        .map(|(address, _)| address)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
 /// Creates a UDP socket with port reuse enabled.
 ///
 /// This is critical for LocalSend discovery because:
@@ -487,134 +492,4 @@ fn create_reusable_udp_socket(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{MulticastConfig, MulticastDiscovery, select_interface_addresses};
-    use crate::LocalSendError;
-    use std::collections::BTreeSet;
-    use std::net::Ipv4Addr;
-
-    #[derive(Clone)]
-    struct TestInterface {
-        name: String,
-        address: Ipv4Addr,
-        netmask: Ipv4Addr,
-    }
-
-    impl TestInterface {
-        fn ipv4(name: &str, address: &str) -> Self {
-            Self {
-                name: name.into(),
-                address: address.parse().unwrap(),
-                netmask: Ipv4Addr::new(255, 255, 255, 0),
-            }
-        }
-    }
-
-    #[test]
-    fn multicast_config_rejects_non_multicast_address() {
-        let result = MulticastConfig::new("192.168.1.1".parse().unwrap(), 53317, None);
-        assert!(matches!(
-            result,
-            Err(LocalSendError::InvalidMulticastAddress(_))
-        ));
-    }
-
-    #[test]
-    fn live_discovery_identity_can_toggle_browser_download_advertising() {
-        let mut original = crate::DeviceInfo::new("CrossCopy".into(), 53317, crate::Protocol::Http);
-        original.download = false;
-        let mut discovery = MulticastDiscovery::new_with_device(original.clone());
-        original.download = true;
-
-        discovery.set_local_device(original.clone());
-
-        assert_eq!(discovery.local_device, original);
-    }
-
-    #[test]
-    fn interface_filter_keeps_only_named_ipv4_interfaces() {
-        let interfaces = vec![
-            TestInterface::ipv4("en0", "192.168.1.10"),
-            TestInterface::ipv4("utun3", "10.0.0.2"),
-        ];
-        let selected = select_interface_addresses(
-            interfaces
-                .into_iter()
-                .map(|interface| (interface.name, interface.address, interface.netmask)),
-            Some(&BTreeSet::from(["en0".into()])),
-            None,
-        );
-        assert_eq!(selected, vec!["192.168.1.10".parse::<Ipv4Addr>().unwrap()]);
-    }
-
-    #[cfg(feature = "https")]
-    use crate::{DeviceInfo, LocalSendServer, Protocol};
-
-    #[cfg(feature = "https")]
-    #[tokio::test]
-    async fn announcement_client_pins_the_discovered_https_certificate() {
-        let output = tempfile::tempdir().expect("output directory");
-        let (mut server, _events) = LocalSendServer::builder()
-            .alias("discovered HTTPS peer")
-            .port(0)
-            .save_dir(output.path())
-            .protocol(Protocol::Https)
-            .build()
-            .await
-            .expect("start HTTPS receiver");
-
-        let mut peer = server.device().clone();
-        peer.ip = Some("127.0.0.1".into());
-        let local = DeviceInfo::new("discovery client".into(), 0, Protocol::Https);
-        let client = MulticastDiscovery::client_for_announcement(local, &peer)
-            .expect("build a client for the announced peer");
-
-        client
-            .register(&peer)
-            .await
-            .expect("the announced certificate fingerprint should be pinned");
-
-        server.stop().await;
-    }
-
-    #[test]
-    fn multicast_uses_each_interface_on_the_primary_lan_only() {
-        assert_eq!(
-            select_interface_addresses(
-                [
-                    (
-                        "unspecified".into(),
-                        Ipv4Addr::UNSPECIFIED,
-                        Ipv4Addr::new(255, 255, 255, 0),
-                    ),
-                    (
-                        "loopback".into(),
-                        Ipv4Addr::LOCALHOST,
-                        Ipv4Addr::new(255, 0, 0, 0),
-                    ),
-                    (
-                        "en0".into(),
-                        Ipv4Addr::new(192, 168, 6, 10),
-                        Ipv4Addr::new(255, 255, 255, 0),
-                    ),
-                    (
-                        "en1".into(),
-                        Ipv4Addr::new(192, 168, 6, 101),
-                        Ipv4Addr::new(255, 255, 255, 0),
-                    ),
-                    (
-                        "bridge0".into(),
-                        Ipv4Addr::new(192, 168, 139, 3),
-                        Ipv4Addr::new(255, 255, 254, 0),
-                    ),
-                ],
-                None,
-                Some(Ipv4Addr::new(192, 168, 6, 101))
-            ),
-            vec![
-                Ipv4Addr::new(192, 168, 6, 10),
-                Ipv4Addr::new(192, 168, 6, 101),
-            ]
-        );
-    }
-}
+mod tests;
