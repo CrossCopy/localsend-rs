@@ -120,6 +120,99 @@ fn a_tunnel_primary_does_not_hide_a_physical_lan_candidate() {
     );
 }
 
+/// Widening past the primary subnet must not reach onto container bridges.
+///
+/// Every candidate becomes a socket bound to `0.0.0.0:53317` with SO_REUSEPORT,
+/// and the kernel matches multicast delivery on (group, port) — so one
+/// announcement is handed to EVERY such socket. A developer box with a dozen
+/// Docker networks therefore processes each announcement a dozen extra times,
+/// none of which can reach a peer: a container's own interface is `eth0` inside
+/// its namespace, never the host-side `docker0` / `br-*` / `veth*`.
+#[test]
+fn widening_skips_interfaces_that_cannot_host_a_peer() {
+    let selected = select_multicast_candidate_addresses(
+        [
+            ("enp7s0".into(), addr(192, 168, 6, 250), mask24()),
+            ("wlo1".into(), addr(192, 168, 1, 16), mask24()),
+            ("docker0".into(), addr(10, 0, 0, 1), mask24()),
+            ("docker_gwbridge".into(), addr(10, 0, 2, 1), mask24()),
+            ("br-d7532d405525".into(), addr(10, 0, 6, 1), mask24()),
+            ("veth9f3c1a2".into(), addr(10, 0, 9, 1), mask24()),
+            ("virbr0".into(), addr(192, 168, 122, 1), mask24()),
+            ("vboxnet0".into(), addr(192, 168, 56, 1), mask24()),
+        ],
+        None,
+        Some(addr(192, 168, 6, 250)),
+    );
+
+    assert_eq!(
+        selected,
+        vec![addr(192, 168, 6, 250), addr(192, 168, 1, 16)],
+        "a second physical NIC still widens; container bridges do not"
+    );
+}
+
+/// A tunnel is not a container bridge. `utun`/`wg`/`tun` carry real peers, and
+/// narrowing them away is what [`a_tunnel_primary_does_not_hide_a_physical_lan_candidate`]
+/// exists to prevent — this asserts the reverse direction of the same rule.
+#[test]
+fn widening_keeps_tunnels_and_overlay_interfaces() {
+    let selected = select_multicast_candidate_addresses(
+        [
+            ("en0".into(), addr(192, 168, 6, 50), mask24()),
+            ("utun5".into(), addr(198, 18, 0, 1), mask24()),
+            ("wg0".into(), addr(10, 8, 0, 2), mask24()),
+            ("ztyouoxmpo".into(), addr(172, 25, 1, 4), mask24()),
+        ],
+        None,
+        Some(addr(192, 168, 6, 50)),
+    );
+
+    assert_eq!(selected.len(), 4, "got {selected:?}");
+}
+
+/// The filter may only ever shrink a non-empty set to a smaller NON-EMPTY one.
+/// A CI runner or a build box whose only addresses are container bridges still
+/// has to announce somewhere.
+#[test]
+fn a_host_with_nothing_but_bridges_still_gets_candidates() {
+    let selected = select_multicast_candidate_addresses(
+        [
+            ("docker0".into(), addr(10, 0, 0, 1), mask24()),
+            ("br-abc123".into(), addr(10, 0, 6, 1), mask24()),
+        ],
+        None,
+        None,
+    );
+
+    assert_eq!(selected, vec![addr(10, 0, 0, 1), addr(10, 0, 6, 1)]);
+}
+
+/// Naming interfaces explicitly is the escape hatch for the one case the filter
+/// costs: a host that really does want to discover peers inside its own
+/// containers. Configuration wins over the heuristic, with no filtering at all.
+#[test]
+fn naming_a_bridge_explicitly_overrides_the_filter() {
+    let selected = select_multicast_candidate_addresses(
+        [
+            ("enp7s0".into(), addr(192, 168, 6, 250), mask24()),
+            ("docker0".into(), addr(10, 0, 0, 1), mask24()),
+        ],
+        Some(&BTreeSet::from(["docker0".to_string()])),
+        Some(addr(192, 168, 6, 250)),
+    );
+
+    assert_eq!(selected, vec![addr(10, 0, 0, 1)]);
+}
+
+fn addr(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+    Ipv4Addr::new(a, b, c, d)
+}
+
+fn mask24() -> Ipv4Addr {
+    Ipv4Addr::new(255, 255, 255, 0)
+}
+
 #[cfg(feature = "https")]
 use crate::{DeviceInfo, LocalSendServer, Protocol};
 
