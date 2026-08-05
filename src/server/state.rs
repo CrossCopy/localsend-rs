@@ -5,7 +5,8 @@ use crate::server::crosscopy_authorized::{
 };
 use axum::body::Body;
 use futures_util::StreamExt;
-use std::path::{Path, PathBuf};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncWriteExt;
@@ -73,17 +74,22 @@ impl CrossCopyAuthorizedSession {
     }
 }
 
+pub(crate) struct BodyWriteOutcome {
+    pub(crate) bytes_written: u64,
+    pub(crate) sha256: String,
+}
+
 pub(crate) async fn write_body_to_file_with_progress<F>(
     body: Body,
-    path: &Path,
+    file: &mut tokio::fs::File,
     rate_limit_bytes_per_second: Option<u64>,
     mut progress: F,
-) -> std::io::Result<u64>
+) -> std::io::Result<BodyWriteOutcome>
 where
     F: FnMut(u64),
 {
-    let mut file = tokio::fs::File::create(path).await?;
     let mut bytes_written = 0u64;
+    let mut hasher = Sha256::new();
     let mut stream = body.into_data_stream();
     let started_at = tokio::time::Instant::now();
     let rate_limit_bytes_per_second = rate_limit_bytes_per_second.filter(|rate| *rate > 0);
@@ -91,6 +97,7 @@ where
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
         bytes_written += chunk.len() as u64;
+        hasher.update(&chunk);
         file.write_all(&chunk).await?;
         if let Some(rate) = rate_limit_bytes_per_second {
             let target = std::time::Duration::from_secs_f64(bytes_written as f64 / rate as f64);
@@ -103,7 +110,10 @@ where
     }
 
     file.flush().await?;
-    Ok(bytes_written)
+    Ok(BodyWriteOutcome {
+        bytes_written,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
 }
 
 #[cfg(test)]
@@ -121,11 +131,16 @@ mod tests {
         ));
         let body = Body::from("streamed upload content");
 
-        let bytes_written = write_body_to_file_with_progress(body, &path, None, |_| {})
+        let mut file = tokio::fs::File::create(&path).await.unwrap();
+        let outcome = write_body_to_file_with_progress(body, &mut file, None, |_| {})
             .await
             .expect("body should stream to file");
 
-        assert_eq!(bytes_written, 23);
+        assert_eq!(outcome.bytes_written, 23);
+        assert_eq!(
+            outcome.sha256,
+            "615528af2a44eee05d6eac0d5efad3eebb1b98ebf96b3cdc57edeb760d86743e"
+        );
         assert_eq!(
             tokio::fs::read(&path).await.expect("file should exist"),
             b"streamed upload content"
@@ -148,14 +163,15 @@ mod tests {
         let body = Body::from_stream(chunks);
         let mut samples = Vec::new();
 
-        let bytes_written = write_body_to_file_with_progress(body, &path, None, |cumulative| {
+        let mut file = tokio::fs::File::create(&path).await.unwrap();
+        let outcome = write_body_to_file_with_progress(body, &mut file, None, |cumulative| {
             samples.push(cumulative);
         })
         .await
         .expect("body should stream with progress");
 
         assert_eq!(samples, vec![3, 5, 9]);
-        assert_eq!(bytes_written, 9);
+        assert_eq!(outcome.bytes_written, 9);
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"abcdefghi");
 
         let _ = tokio::fs::remove_file(path).await;
@@ -170,11 +186,12 @@ mod tests {
         let body = Body::from(vec![0_u8; 4_096]);
         let started_at = tokio::time::Instant::now();
 
-        let bytes_written = write_body_to_file_with_progress(body, &path, Some(8_192), |_| {})
+        let mut file = tokio::fs::File::create(&path).await.unwrap();
+        let outcome = write_body_to_file_with_progress(body, &mut file, Some(8_192), |_| {})
             .await
             .expect("throttled body should stream to file");
 
-        assert_eq!(bytes_written, 4_096);
+        assert_eq!(outcome.bytes_written, 4_096);
         assert!(started_at.elapsed() >= std::time::Duration::from_millis(450));
         assert_eq!(tokio::fs::metadata(&path).await.unwrap().len(), 4_096);
 

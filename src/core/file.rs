@@ -1,7 +1,8 @@
 use crate::error::Result;
 use crate::protocol::{FileId, FileMetadata};
+use crosscopy_safe_fs::{CollisionPolicy, PendingReceiveFile, SafeReceiveError, SafeReceiveRoot};
 use mime_guess::from_path;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::fs;
 
 pub fn generate_file_id() -> FileId {
@@ -48,53 +49,53 @@ pub fn build_file_metadata_from_bytes(
     }
 }
 
-/// Resolve a collision-free, traversal-safe save path inside `save_dir`.
-/// Existing files are never overwritten: "a.txt" -> "a (1).txt" -> "a (2).txt".
-pub fn unique_save_path(save_dir: &Path, file_name: &str) -> crate::Result<PathBuf> {
-    let candidate = crate::path_safety::safe_join(save_dir, file_name)?;
-    if !candidate.exists() {
-        return Ok(candidate);
-    }
-    let stem = candidate
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let ext = candidate
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    let parent = candidate.parent().unwrap_or(save_dir).to_path_buf();
-    for i in 1u32.. {
-        let next = parent.join(format!("{stem} ({i}){ext}"));
-        if !next.exists() {
-            return Ok(next);
-        }
-    }
-    unreachable!()
+/// Pin the receiver-selected root and atomically create one collision-renamed
+/// destination beneath it. The returned display path is diagnostic only; the
+/// pending file's held writer remains the filesystem authority until commit.
+pub(crate) async fn create_pending_receive(
+    save_dir: &Path,
+    file_name: &str,
+) -> std::result::Result<PendingReceiveFile, SafeReceiveError> {
+    // Preserve LocalSend's existing cross-platform filename restrictions;
+    // the returned PathBuf is deliberately discarded because authority comes
+    // only from crosscopy-safe-fs's held directory/file handles below.
+    crate::path_safety::safe_join(save_dir, file_name)
+        .map_err(|_| SafeReceiveError::UnsafeRelativePath)?;
+    SafeReceiveRoot::open_or_create(save_dir)
+        .await?
+        .create_file(file_name, CollisionPolicy::Rename)
+        .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::unique_save_path;
+    use super::create_pending_receive;
 
-    #[test]
-    fn unique_save_path_appends_counter_on_collision() {
-        let dir = std::env::temp_dir().join(format!("lsrs-col-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let first = unique_save_path(&dir, "a.txt").unwrap();
-        assert_eq!(first, dir.join("a.txt"));
-        std::fs::write(&first, "x").unwrap();
-        let second = unique_save_path(&dir, "a.txt").unwrap();
-        assert_eq!(second, dir.join("a (1).txt"));
-        std::fs::write(&second, "y").unwrap();
-        let third = unique_save_path(&dir, "a.txt").unwrap();
-        assert_eq!(third, dir.join("a (2).txt"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_abort_detects_substitution_and_preserves_replacement() {
+        use crosscopy_safe_fs::SafeReceiveError;
+        use tokio::io::AsyncWriteExt;
 
-    #[test]
-    fn unique_save_path_still_rejects_traversal() {
-        let dir = std::env::temp_dir();
-        assert!(unique_save_path(&dir, "../evil.txt").is_err());
+        let dir = tempfile::tempdir().expect("receive root");
+        let mut pending = create_pending_receive(dir.path(), "replace.txt")
+            .await
+            .expect("create pending receive");
+        pending
+            .writer()
+            .write_all(b"owned partial")
+            .await
+            .expect("write owned partial");
+        let named_path = pending.display_path().to_owned();
+        let displaced_path = dir.path().join("displaced-owned.txt");
+        std::fs::rename(&named_path, &displaced_path).expect("substitute pending name");
+        std::fs::write(&named_path, b"replacement").expect("plant replacement");
+
+        assert_eq!(
+            pending.abort().await,
+            Err(SafeReceiveError::EntrySubstituted)
+        );
+        assert_eq!(std::fs::read(&named_path).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&displaced_path).unwrap(), b"owned partial");
     }
 }

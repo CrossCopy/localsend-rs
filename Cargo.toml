@@ -99,6 +99,7 @@ parking_lot = "0.12"
 # The optional protected client accepts the File service's linear redacting
 # request by value.  Standard LocalSend APIs remain independent and unchanged.
 crosscopy-file-service = { path = "../../packages/crosscopy-file-service" }
+crosscopy-safe-fs = { path = "../../packages/crosscopy-safe-fs" }
 
 [dev-dependencies]
 crosscopy-ipc = { path = "../../packages/crosscopy-ipc" }

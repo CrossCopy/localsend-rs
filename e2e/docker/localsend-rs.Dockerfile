@@ -12,6 +12,7 @@ RUN printf '%s\n' \
   'resolver = "2"' \
   'members = [' \
   '  "vendors/localsend-rs",' \
+  '  "packages/crosscopy-safe-fs",' \
   '  "packages/crosscopy-file-service",' \
   '  "packages/crosscopy-ipc",' \
   '  "packages/crosscopy-service",' \
@@ -30,6 +31,7 @@ RUN printf '%s\n' \
   'license = "MIT"' \
   'repository = "https://github.com/CrossCopy/CrossCopy"' \
   > Cargo.toml
+COPY packages/crosscopy-safe-fs ./packages/crosscopy-safe-fs
 COPY packages/crosscopy-file-service ./packages/crosscopy-file-service
 COPY packages/crosscopy-ipc ./packages/crosscopy-ipc
 COPY packages/crosscopy-service ./packages/crosscopy-service

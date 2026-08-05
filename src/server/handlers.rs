@@ -12,6 +12,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use crosscopy_safe_fs::SafeReceiveError;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -479,6 +480,7 @@ pub(crate) async fn handle_upload(
         total_bytes,
         file_count,
         receive_rate_limit_bytes_per_second,
+        save_dir,
     ) = if let Some(session) = &state.current_session {
         if session.id != params.session_id {
             tracing::warn!(
@@ -513,6 +515,7 @@ pub(crate) async fn handle_upload(
                     .fold(0_u64, u64::saturating_add),
                 session.files.len(),
                 state.receive_rate_limit_bytes_per_second,
+                state.save_dir.clone(),
             )
         } else {
             tracing::warn!(
@@ -526,24 +529,23 @@ pub(crate) async fn handle_upload(
         return StatusCode::FORBIDDEN.into_response();
     };
 
-    let save_path = match crate::core::unique_save_path(&state.save_dir, &file_name) {
-        Ok(path) => path,
-        Err(e) => {
-            tracing::warn!("Upload rejected: {}", e);
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-    };
-
-    // Release the lock before async I/O operations
+    // Release the session lock before filesystem work or body I/O. Name
+    // selection and exclusive creation happen together below, relative to a
+    // pinned receiver-selected root.
     drop(state);
 
-    // Ensure parent directory exists (async)
-    if let Some(parent) = save_path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await
-    {
-        tracing::error!("Failed to create directory {:?}: {}", parent, e);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    let mut pending = match crate::core::file::create_pending_receive(&save_dir, &file_name).await {
+        Ok(pending) => pending,
+        Err(SafeReceiveError::UnsafeRelativePath) => {
+            tracing::warn!("Upload rejected: unsafe remote file name {file_name:?}");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "Failed to create safe receive destination");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let save_path = pending.display_path().to_owned();
 
     let progress = ReceiveProgressContext {
         session_id: session_id.clone(),
@@ -559,9 +561,9 @@ pub(crate) async fn handle_upload(
     let file_reported = Arc::new(AtomicU64::new(0));
     let callback_file_reported = file_reported.clone();
     let mut previous_file_bytes = 0_u64;
-    let body_len = match write_body_to_file_with_progress(
+    let body = match write_body_to_file_with_progress(
         body,
-        &save_path,
+        pending.writer(),
         receive_rate_limit_bytes_per_second,
         move |file_bytes| {
             let delta = file_bytes.saturating_sub(previous_file_bytes);
@@ -572,13 +574,17 @@ pub(crate) async fn handle_upload(
     )
     .await
     {
-        Ok(bytes_written) => bytes_written,
+        Ok(outcome) => outcome,
         Err(e) => {
             progress.rollback(file_reported.load(Ordering::Relaxed));
             tracing::error!("Failed to save file to {:?}: {}", save_path, e);
+            if let Err(cleanup_error) = pending.abort().await {
+                tracing::error!(%cleanup_error, "Failed to clean up rejected upload");
+            }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let body_len = body.bytes_written;
 
     // Validate the received bytes against the metadata declared in
     // prepare-upload. A truncated body (network cut, or a misbehaving client
@@ -596,35 +602,40 @@ pub(crate) async fn handle_upload(
             declared_size,
             body_len
         );
-        let _ = tokio::fs::remove_file(&save_path).await;
+        if let Err(cleanup_error) = pending.abort().await {
+            tracing::error!(%cleanup_error, "Failed to clean up size-mismatched upload");
+        }
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     // When the sender advertised a sha256, verify the bytes on disk match it
     // (case-insensitive hex). Size can be right while the contents are
     // corrupt; reject those the same way.
-    if let Some(expected_sha) = declared_sha {
-        match crate::sha256_from_file(&save_path).await {
-            Ok(actual) if actual.eq_ignore_ascii_case(&expected_sha) => {}
-            Ok(actual) => {
-                progress.rollback(body_len);
-                tracing::warn!(
-                    "Upload sha256 mismatch for {:?}: declared {}, computed {}; discarding",
-                    save_path,
-                    expected_sha,
-                    actual
-                );
-                let _ = tokio::fs::remove_file(&save_path).await;
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            Err(e) => {
-                progress.rollback(body_len);
-                tracing::error!("Failed to hash uploaded file {:?}: {}", save_path, e);
-                let _ = tokio::fs::remove_file(&save_path).await;
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+    if let Some(expected_sha) = declared_sha
+        && !body.sha256.eq_ignore_ascii_case(&expected_sha)
+    {
+        let actual = &body.sha256;
+        progress.rollback(body_len);
+        tracing::warn!(
+            "Upload sha256 mismatch for {:?}: declared {}, computed {}; discarding",
+            save_path,
+            expected_sha,
+            actual
+        );
+        if let Err(cleanup_error) = pending.abort().await {
+            tracing::error!(%cleanup_error, "Failed to clean up hash-mismatched upload");
         }
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+
+    let save_path = match pending.commit().await {
+        Ok(path) => path,
+        Err(error) => {
+            progress.rollback(body_len);
+            tracing::error!(%error, "Failed to commit safe receive destination");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     tracing::info!("Received file: {:?} for session {}", save_path, session_id);
 
@@ -666,9 +677,9 @@ pub(crate) async fn handle_upload(
     // -- a slow or absent event consumer must not stall the transfer.
     // The bytes genuinely landed on disk, so FileReceived is still accurate
     // to emit even if the owning session has since changed. Report the
-    // *final* on-disk name -- unique_save_path may have renamed the file on
-    // collision, and a consumer needs to see where the bytes actually went,
-    // not the name originally requested by the sender.
+    // *final* on-disk name -- the atomic materializer may have renamed the
+    // file on collision, and a consumer needs to see where the bytes actually
+    // went, not the name originally requested by the sender.
     let final_file_name = save_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
