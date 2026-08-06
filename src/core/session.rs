@@ -1,8 +1,126 @@
 use crate::protocol::{FileId, FileMetadata, SessionId, Token};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceivePhase {
+    Ready,
+    Receiving,
+    Publishing,
+    Published,
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct ReceiveSlot {
+    phase: ReceivePhase,
+    cancellation: CancellationToken,
+}
+
+#[derive(Debug)]
+struct ReceiveLifecycle {
+    slots: HashMap<FileId, ReceiveSlot>,
+}
+
+/// Exclusive ownership of one standard LocalSend upload body.
+///
+/// Dropping a live lease makes an ordinary I/O/validation failure retryable.
+/// Session cancellation changes the slot to `Cancelled` first, so a dropped
+/// cancelled lease can never resurrect it.
+#[derive(Debug)]
+pub(crate) struct StandardReceiveLease {
+    lifecycle: Arc<Mutex<ReceiveLifecycle>>,
+    file_id: FileId,
+    cancellation: CancellationToken,
+    armed: bool,
+}
+
+impl StandardReceiveLease {
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    /// Atomically chooses publication over cancellation. Once this succeeds,
+    /// session cancellation must wait for the handler to publish and record
+    /// the file rather than clearing its owning session underneath it.
+    pub(crate) fn begin_publication(mut self) -> Option<StandardPublicationPermit> {
+        let transitioned = {
+            let mut lifecycle = self.lifecycle.lock();
+            let slot = lifecycle.slots.get_mut(&self.file_id)?;
+            if slot.phase == ReceivePhase::Receiving {
+                slot.phase = ReceivePhase::Publishing;
+                true
+            } else {
+                false
+            }
+        };
+
+        if !transitioned {
+            return None;
+        }
+
+        self.armed = false;
+        Some(StandardPublicationPermit {
+            lifecycle: self.lifecycle.clone(),
+            file_id: self.file_id.clone(),
+            armed: true,
+        })
+    }
+}
+
+impl Drop for StandardReceiveLease {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut lifecycle = self.lifecycle.lock();
+        if let Some(slot) = lifecycle.slots.get_mut(&self.file_id)
+            && slot.phase == ReceivePhase::Receiving
+        {
+            slot.phase = ReceivePhase::Ready;
+        }
+    }
+}
+
+/// Holds the cancellation/publication linearization point until the file has
+/// both landed on disk and been recorded in the owning session.
+#[derive(Debug)]
+pub(crate) struct StandardPublicationPermit {
+    lifecycle: Arc<Mutex<ReceiveLifecycle>>,
+    file_id: FileId,
+    armed: bool,
+}
+
+impl StandardPublicationPermit {
+    pub(crate) fn finish(mut self) {
+        let mut lifecycle = self.lifecycle.lock();
+        let slot = lifecycle
+            .slots
+            .get_mut(&self.file_id)
+            .expect("publication file remains in its session lifecycle");
+        debug_assert_eq!(slot.phase, ReceivePhase::Publishing);
+        slot.phase = ReceivePhase::Published;
+        self.armed = false;
+    }
+}
+
+impl Drop for StandardPublicationPermit {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut lifecycle = self.lifecycle.lock();
+        if let Some(slot) = lifecycle.slots.get_mut(&self.file_id)
+            && slot.phase == ReceivePhase::Publishing
+        {
+            slot.phase = ReceivePhase::Ready;
+        }
+    }
+}
 
 /// Active file transfer session
 #[derive(Clone, Debug)]
@@ -15,6 +133,7 @@ pub struct Session {
     pub sender_alias: String,
     pub created_at: Instant,
     pub last_activity: Instant,
+    receive_lifecycle: Arc<Mutex<ReceiveLifecycle>>,
 }
 
 impl Session {
@@ -29,6 +148,20 @@ impl Session {
             .keys()
             .map(|file_id| (file_id.clone(), Token::random()))
             .collect();
+        let receive_lifecycle = ReceiveLifecycle {
+            slots: files
+                .keys()
+                .map(|file_id| {
+                    (
+                        file_id.clone(),
+                        ReceiveSlot {
+                            phase: ReceivePhase::Ready,
+                            cancellation: CancellationToken::new(),
+                        },
+                    )
+                })
+                .collect(),
+        };
 
         Self {
             id,
@@ -39,6 +172,7 @@ impl Session {
             sender_alias,
             created_at: now,
             last_activity: now,
+            receive_lifecycle: Arc::new(Mutex::new(receive_lifecycle)),
         }
     }
 
@@ -48,8 +182,8 @@ impl Session {
     }
 
     /// Check if the session has timed out (default: 5 minutes)
-    pub fn is_timed_out(&self, timeout_secs: u64) -> bool {
-        self.last_activity.elapsed().as_secs() > timeout_secs
+    pub fn is_timed_out(&self, timeout: Duration) -> bool {
+        self.last_activity.elapsed() > timeout
     }
 
     /// Verify that a token is valid for a given file
@@ -63,6 +197,49 @@ impl Session {
     /// Get the token for a file
     pub fn get_token(&self, file_id: &FileId) -> Option<&Token> {
         self.tokens.get(file_id)
+    }
+
+    /// Claim the one receive body allowed for a file id. Concurrent/replayed
+    /// uploads for the same token cannot race two filesystem publications.
+    pub(crate) fn begin_receive(&self, file_id: &FileId) -> Option<StandardReceiveLease> {
+        let cancellation = {
+            let mut lifecycle = self.receive_lifecycle.lock();
+            let slot = lifecycle.slots.get_mut(file_id)?;
+            if slot.phase != ReceivePhase::Ready {
+                return None;
+            }
+            slot.phase = ReceivePhase::Receiving;
+            slot.cancellation.clone()
+        };
+        Some(StandardReceiveLease {
+            lifecycle: self.receive_lifecycle.clone(),
+            file_id: file_id.clone(),
+            cancellation,
+            armed: true,
+        })
+    }
+
+    /// Cancel every not-yet-published receive owned by this session.
+    ///
+    /// A publishing permit wins the race atomically. Callers must then leave
+    /// the session installed until the handler records the committed file and
+    /// releases the permit.
+    pub(crate) fn try_cancel_receives(&self) -> bool {
+        let mut lifecycle = self.receive_lifecycle.lock();
+        if lifecycle
+            .slots
+            .values()
+            .any(|slot| slot.phase == ReceivePhase::Publishing)
+        {
+            return false;
+        }
+        for slot in lifecycle.slots.values_mut() {
+            if matches!(slot.phase, ReceivePhase::Ready | ReceivePhase::Receiving) {
+                slot.phase = ReceivePhase::Cancelled;
+                slot.cancellation.cancel();
+            }
+        }
+        true
     }
 
     /// Record a completed file. Returns true when every file has arrived.
@@ -114,7 +291,7 @@ mod tests {
         assert_eq!(session.sender_alias, "Test Sender");
         assert_eq!(session.files.len(), 1);
         assert_eq!(session.tokens.len(), 1);
-        assert!(!session.is_timed_out(300));
+        assert!(!session.is_timed_out(Duration::from_secs(300)));
     }
 
     #[test]
@@ -138,17 +315,17 @@ mod tests {
         let mut session = Session::new("Test".to_string(), files);
 
         // Should not timeout immediately
-        assert!(!session.is_timed_out(1));
+        assert!(!session.is_timed_out(Duration::from_secs(1)));
 
         // Sleep for 2 seconds
         thread::sleep(Duration::from_secs(2));
 
         // Should timeout after 1 second threshold
-        assert!(session.is_timed_out(1));
+        assert!(session.is_timed_out(Duration::from_secs(1)));
 
         // Touch should reset timeout
         session.touch();
-        assert!(!session.is_timed_out(1));
+        assert!(!session.is_timed_out(Duration::from_secs(1)));
     }
 
     #[test]

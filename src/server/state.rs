@@ -21,6 +21,7 @@ pub struct ServerState {
     /// `set_auto_accept` toggle is observed by the request handler.
     pub auto_accept: Arc<AtomicBool>,
     pub accept_timeout: std::time::Duration,
+    pub session_timeout: std::time::Duration,
     pub receive_rate_limit_bytes_per_second: Option<u64>,
     pub pin_gate: crate::server::pin::PinGate,
     pub web_share: Option<crate::server::web_share::WebShareState>,

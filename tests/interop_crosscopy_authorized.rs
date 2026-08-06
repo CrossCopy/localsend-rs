@@ -251,6 +251,10 @@ async fn authorized_request(
         // The listener serves plain HTTP. Only the HTTPS path requires a pinned
         // fingerprint, and it treats an empty one as fail-closed.
         localsend_certificate_fingerprint: String::new(),
+        // This fixture exercises the retained legacy LocalSend selection.
+        // Zero/empty is the frozen wire representation for that case.
+        selected_data_plane_kind: 0,
+        data_plane_selection_binding_sha256: Vec::new(),
     };
     let payload = ready.encode_to_vec();
     let (mut writer, mut reader) = tokio::io::duplex(1024);

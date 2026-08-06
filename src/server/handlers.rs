@@ -215,8 +215,13 @@ async fn handle_standard_prepare_upload(
 
         // Check for existing session timeout (e.g. 5 minutes or session finished)
         if let Some(session) = &state.current_session {
-            if session.is_timed_out(300) {
-                state.current_session = None;
+            if session.is_timed_out(state.session_timeout) {
+                if session.try_cancel_receives() {
+                    state.current_session = None;
+                } else {
+                    tracing::warn!("Timed-out session is publishing a file; rejecting replacement");
+                    return StatusCode::CONFLICT.into_response();
+                }
             } else {
                 tracing::warn!("Session already exists, rejecting new session");
                 return StatusCode::CONFLICT.into_response();
@@ -269,6 +274,9 @@ async fn handle_standard_prepare_upload(
 
     if accepted_ids.is_empty() {
         let mut state = state_ref.write().await;
+        if let Some(session) = &state.current_session {
+            let _ = session.try_cancel_receives();
+        }
         state.current_session = None;
         tracing::info!("Transfer declined (or timed out)");
         return StatusCode::FORBIDDEN.into_response();
@@ -289,6 +297,9 @@ async fn handle_standard_prepare_upload(
 
     {
         let mut state = state_ref.write().await;
+        if let Some(placeholder) = &state.current_session {
+            let _ = placeholder.try_cancel_receives();
+        }
         state.current_session = Some(session);
     }
 
@@ -481,6 +492,7 @@ pub(crate) async fn handle_upload(
         file_count,
         receive_rate_limit_bytes_per_second,
         save_dir,
+        receive_lease,
     ) = if let Some(session) = &state.current_session {
         if session.id != params.session_id {
             tracing::warn!(
@@ -500,6 +512,13 @@ pub(crate) async fn handle_upload(
 
         // Find file metadata
         if let Some(meta) = session.files.get(&params.file_id) {
+            let Some(receive_lease) = session.begin_receive(&params.file_id) else {
+                tracing::warn!(
+                    "Upload rejected: file {} is already receiving, published, or cancelled",
+                    params.file_id
+                );
+                return StatusCode::CONFLICT.into_response();
+            };
             (
                 meta.file_name.clone(),
                 session.id.clone(),
@@ -516,6 +535,7 @@ pub(crate) async fn handle_upload(
                 session.files.len(),
                 state.receive_rate_limit_bytes_per_second,
                 state.save_dir.clone(),
+                receive_lease,
             )
         } else {
             tracing::warn!(
@@ -561,21 +581,33 @@ pub(crate) async fn handle_upload(
     let file_reported = Arc::new(AtomicU64::new(0));
     let callback_file_reported = file_reported.clone();
     let mut previous_file_bytes = 0_u64;
-    let body = match write_body_to_file_with_progress(
-        body,
-        pending.writer(),
-        receive_rate_limit_bytes_per_second,
-        move |file_bytes| {
-            let delta = file_bytes.saturating_sub(previous_file_bytes);
-            previous_file_bytes = file_bytes;
-            callback_file_reported.store(file_bytes, Ordering::Relaxed);
-            callback_progress.add(delta);
-        },
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(e) => {
+    let cancellation = receive_lease.cancellation();
+    let body_result = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = write_body_to_file_with_progress(
+            body,
+            pending.writer(),
+            receive_rate_limit_bytes_per_second,
+            move |file_bytes| {
+                let delta = file_bytes.saturating_sub(previous_file_bytes);
+                previous_file_bytes = file_bytes;
+                callback_file_reported.store(file_bytes, Ordering::Relaxed);
+                callback_progress.add(delta);
+            },
+        ) => Some(result),
+    };
+    let body = match body_result {
+        None => {
+            progress.rollback(file_reported.load(Ordering::Relaxed));
+            tracing::info!(%session_id, "Upload cancelled before publication");
+            if let Err(cleanup_error) = pending.abort().await {
+                tracing::error!(%cleanup_error, "Failed to clean up cancelled upload");
+            }
+            return StatusCode::CONFLICT.into_response();
+        }
+        Some(Ok(outcome)) => outcome,
+        Some(Err(e)) => {
             progress.rollback(file_reported.load(Ordering::Relaxed));
             tracing::error!("Failed to save file to {:?}: {}", save_path, e);
             if let Err(cleanup_error) = pending.abort().await {
@@ -628,6 +660,15 @@ pub(crate) async fn handle_upload(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
+    let Some(publication) = receive_lease.begin_publication() else {
+        progress.rollback(body_len);
+        tracing::info!(%session_id, "Upload cancelled before publication");
+        if let Err(cleanup_error) = pending.abort().await {
+            tracing::error!(%cleanup_error, "Failed to clean up cancelled upload");
+        }
+        return StatusCode::CONFLICT.into_response();
+    };
+
     let save_path = match pending.commit().await {
         Ok(path) => path,
         Err(error) => {
@@ -642,13 +683,9 @@ pub(crate) async fn handle_upload(
     // Reacquire lock for state updates
     let mut state = state_ref.write().await;
 
-    // The write above was lock-free and may have taken a long time (large /
-    // multi-GB files). The session validated before the write started may
-    // have since been cancelled or timed out and replaced by a brand-new
-    // session. Re-validate identity before touching session state: a stale
-    // upload must never be recorded against a different session's
-    // accounting, since a foreign file id could otherwise push an unrelated
-    // session to "all done".
+    // The publication permit prevents cancellation/replacement from clearing
+    // this exact session between the atomic filesystem commit and its state /
+    // event transition.
     let still_current = state
         .current_session
         .as_ref()
@@ -658,26 +695,22 @@ pub(crate) async fn handle_upload(
     // Record this file as received on the (still-current) session; a
     // multi-file transfer only closes once every accepted file has arrived,
     // not after the first one (R5).
-    let all_done = if still_current {
-        state
-            .current_session
-            .as_mut()
-            .map(|session| session.mark_received(&params.file_id))
-            .unwrap_or(false)
-    } else {
-        tracing::warn!(
-            "Upload for session {} completed after the session was replaced; \
-             file saved to disk but not recorded against the new session",
-            session_id
+    if !still_current {
+        tracing::error!(
+            %session_id,
+            "Receive lifecycle invariant violated after publication"
         );
-        false
-    };
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let all_done = state
+        .current_session
+        .as_mut()
+        .expect("publication permit keeps its session installed")
+        .mark_received(&params.file_id);
 
     // Events must never block the upload path: `try_send`, not `.send().await`
     // -- a slow or absent event consumer must not stall the transfer.
-    // The bytes genuinely landed on disk, so FileReceived is still accurate
-    // to emit even if the owning session has since changed. Report the
-    // *final* on-disk name -- the atomic materializer may have renamed the
+    // Report the *final* on-disk name -- the atomic materializer may have renamed the
     // file on collision, and a consumer needs to see where the bytes actually
     // went, not the name originally requested by the sender.
     let final_file_name = save_path
@@ -697,7 +730,9 @@ pub(crate) async fn handle_upload(
             message_text: None,
         });
 
-    if still_current && all_done {
+    publication.finish();
+
+    if all_done {
         let _ = state
             .events_tx
             .try_send(crate::server::events::ServerEvent::SessionDone { session_id });
@@ -750,6 +785,13 @@ pub(crate) async fn handle_cancel(
     if let Some(session) = &state.current_session
         && session.id.as_str() == params.session_id.as_str()
     {
+        if !session.try_cancel_receives() {
+            tracing::info!(
+                "Session {} is already publishing and cannot be cancelled",
+                params.session_id
+            );
+            return StatusCode::CONFLICT.into_response();
+        }
         let _ = state
             .events_tx
             .try_send(crate::server::events::ServerEvent::SessionDone {

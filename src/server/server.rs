@@ -26,6 +26,7 @@ pub struct LocalSendServer {
     /// effect on in-flight requests, not just at `start()` time.
     auto_accept: Arc<AtomicBool>,
     accept_timeout: Duration,
+    session_timeout: Duration,
     receive_rate_limit_bytes_per_second: Option<u64>,
     /// Receiver-side PIN, enforced by `pin::PinGate` in the request handler.
     pin: Option<String>,
@@ -35,35 +36,6 @@ pub struct LocalSendServer {
 }
 
 impl LocalSendServer {
-    /// Private constructor used by [`LocalSendServerBuilder::build`].
-    fn from_parts(
-        device: DeviceInfo,
-        save_dir: PathBuf,
-        https: bool,
-        pin: Option<String>,
-        auto_accept: bool,
-        accept_timeout: Duration,
-        receive_rate_limit_bytes_per_second: Option<u64>,
-    ) -> std::result::Result<Self, crate::error::LocalSendError> {
-        Ok(Self {
-            device,
-            save_dir,
-            handle: None,
-            sweep_handle: None,
-            shutdown_tx: None,
-            https,
-            #[cfg(feature = "https")]
-            tls_cert: None,
-            events_rx: None,
-            auto_accept: Arc::new(AtomicBool::new(auto_accept)),
-            accept_timeout,
-            receive_rate_limit_bytes_per_second,
-            pin,
-            crosscopy_authorized_upload_gate: None,
-            state: None,
-        })
-    }
-
     /// Returns the actual bound port. If the server was started with an
     /// ephemeral port (`0`), this reflects the OS-assigned port after
     /// `start()`/`builder().build()` has returned.
@@ -84,6 +56,7 @@ impl LocalSendServer {
             pin: None,
             auto_accept: false,
             accept_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(300),
             receive_rate_limit_bytes_per_second: None,
             crosscopy_authorized_upload_gate: None,
             #[cfg(feature = "https")]
@@ -105,13 +78,6 @@ impl LocalSendServer {
     /// Current auto-accept setting.
     pub fn auto_accept(&self) -> bool {
         self.auto_accept.load(Ordering::Relaxed)
-    }
-
-    fn set_crosscopy_authorized_upload_gate(
-        &mut self,
-        gate: Option<Arc<dyn super::crosscopy_authorized::CrossCopyAuthorizedUploadGate>>,
-    ) {
-        self.crosscopy_authorized_upload_gate = gate;
     }
 
     #[cfg(feature = "https")]
@@ -162,6 +128,7 @@ impl LocalSendServer {
                     events_tx,
                     auto_accept: self.auto_accept.clone(),
                     accept_timeout: self.accept_timeout,
+                    session_timeout: self.session_timeout,
                     receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
                     pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
                     web_share: None,
@@ -222,6 +189,7 @@ impl LocalSendServer {
                 events_tx,
                 auto_accept: self.auto_accept.clone(),
                 accept_timeout: self.accept_timeout,
+                session_timeout: self.session_timeout,
                 receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
                 pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
                 web_share: None,
@@ -265,6 +233,13 @@ impl LocalSendServer {
             // prepare cannot consume a new gate slot while cancellation is
             // awaited below.
             state.crosscopy_authorized_stopping = true;
+            if state
+                .current_session
+                .as_ref()
+                .is_some_and(crate::core::Session::try_cancel_receives)
+            {
+                state.current_session = None;
+            }
             (
                 state
                     .crosscopy_authorized_session
@@ -390,7 +365,8 @@ fn spawn_session_sweep(state: Arc<RwLock<ServerState>>) -> JoinHandle<()> {
             let protected_owner = {
                 let mut s = state.write().await;
                 if let Some(session) = &s.current_session
-                    && session.is_timed_out(300)
+                    && session.is_timed_out(s.session_timeout)
+                    && session.try_cancel_receives()
                 {
                     tracing::info!("Sweeping timed-out session {}", session.id);
                     s.current_session = None;
@@ -427,6 +403,7 @@ pub struct LocalSendServerBuilder {
     pin: Option<String>,
     auto_accept: bool,
     accept_timeout: Duration,
+    session_timeout: Duration,
     receive_rate_limit_bytes_per_second: Option<u64>,
     crosscopy_authorized_upload_gate:
         Option<Arc<dyn super::crosscopy_authorized::CrossCopyAuthorizedUploadGate>>,
@@ -467,6 +444,13 @@ impl LocalSendServerBuilder {
 
     pub fn accept_timeout(mut self, d: Duration) -> Self {
         self.accept_timeout = d;
+        self
+    }
+
+    /// Configure how long an idle standard upload session may block a new
+    /// prepare. Production callers normally keep the five-minute default.
+    pub fn session_timeout(mut self, timeout: Duration) -> Self {
+        self.session_timeout = timeout;
         self
     }
 
@@ -539,16 +523,24 @@ impl LocalSendServerBuilder {
             ip: None,
         };
 
-        let mut server = LocalSendServer::from_parts(
+        let mut server = LocalSendServer {
             device,
-            self.save_dir,
+            save_dir: self.save_dir,
+            handle: None,
+            sweep_handle: None,
+            shutdown_tx: None,
             https,
-            self.pin,
-            self.auto_accept,
-            self.accept_timeout,
-            self.receive_rate_limit_bytes_per_second,
-        )?;
-        server.set_crosscopy_authorized_upload_gate(self.crosscopy_authorized_upload_gate);
+            #[cfg(feature = "https")]
+            tls_cert: None,
+            events_rx: None,
+            auto_accept: Arc::new(AtomicBool::new(self.auto_accept)),
+            accept_timeout: self.accept_timeout,
+            session_timeout: self.session_timeout,
+            receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
+            pin: self.pin,
+            crosscopy_authorized_upload_gate: self.crosscopy_authorized_upload_gate,
+            state: None,
+        };
         #[cfg(feature = "https")]
         if let Some(cert) = tls_cert {
             server.set_tls_certificate(cert);

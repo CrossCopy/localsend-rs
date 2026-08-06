@@ -92,7 +92,7 @@ Settings toggle relies on this). `server.auto_accept()` reads it back.
 | Event stream + accept/decline handle | `src/server/events.rs` |
 | PIN gate (401/429 lockout) | `src/server/pin.rs` |
 | Session store (random tokens, multi-file tracking) | `src/core/session.rs` |
-| Save-path resolution (traversal-safe, collision-safe) | `src/core/file.rs` (`unique_save_path`) |
+| Safe receive materialization (traversal/symlink/collision-safe, atomic publish) | `src/core/file.rs` (`create_pending_receive`, backed by `crosscopy-safe-fs`) |
 | HTTP client | `src/client/client.rs`, `src/client/trust_policy.rs` |
 | Protocol DTOs / newtypes / serde | `src/protocol/types.rs` |
 | Constants (version, ports, multicast, API paths) | `src/protocol/constants.rs` |
@@ -115,7 +115,7 @@ Settings toggle relies on this). `server.auto_accept()` reads it back.
 
 - **Don't hold the state lock across an await** (see concurrency rule) — it deadlocks/serializes uploads.
 - **Don't derive upload tokens from ids** — `Token::random()` only (guessable tokens were a security bug).
-- **Don't overwrite on save** — always go through `unique_save_path` (traversal-safe + collision-numbered).
+- **Don't open a receiver-selected final path directly** — create a held pending receive with `create_pending_receive`, stream into its writer, then commit atomically (or abort on every failure/cancellation path).
 - **Don't reintroduce a "clear session after 1 file" heuristic** — multi-file sessions close on all-files-received or TTL only.
 - **Don't add reviewer-facing dead code** — the crate is warning-clean under `-D warnings`.
 
