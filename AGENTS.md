@@ -16,10 +16,16 @@ Rust implementation of the **LocalSend v2.1** protocol, consumed as a **library*
 - Client: `register`, `prepare_upload`, `upload_file` (one POST, `Content-Length`, per-chunk progress), `cancel`.
 - Discovery: UDP multicast (`224.0.0.167:53317`) announce/respond + HTTP-register fallback; subnet scan (`HttpDiscovery::scan_subnet`).
 - HTTPS server via self-signed cert; `DeviceInfo.fingerprint = SHA-256(cert DER)` when HTTPS.
+- **True client-side cert pinning** (R3/R4). `with_trust_policy` builds a rustls `ClientConfig`
+  whose *only* certificate verifier is `FingerprintVerifier` — no other trust anchor — so a
+  fingerprint that does not match fails the handshake (`src/client/client.rs:37-47`). The
+  `danger_accept_invalid_certs` path is `InsecureForTests` and nothing else.
+- `tls_certificate_from_pem` rebuilds a persisted certificate and re-derives its fingerprint from
+  the same DER by the same code, so a consumer that keeps its certificate across restarts is the
+  same device to its peers. Never re-derive that hash in a consumer.
 
 **Not yet implemented (deferred — see the plan doc):**
 - Download / reverse mode: `prepare-download`, `download`, `GET /` browser share page (**G1**).
-- True client-side cert **pinning** (`TlsTrustPolicy` currently only toggles `danger_accept_invalid_certs`) (**R3/R4**).
 - Official-core **oracle** cross-impl tests, and https/pin/download/discovery e2e container scenarios.
 - WebRTC / internet transfer (lives in `apps/xc`, not this crate).
 
