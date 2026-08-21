@@ -12,9 +12,25 @@ use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
+/// The placeholder reservation held while somebody decides, and enough about it
+/// to answer a `/cancel` that arrives before there is a session to name.
+pub(crate) struct ConsentReservation {
+    pub(crate) session_id: SessionId,
+    pub(crate) from: std::net::IpAddr,
+    /// Wakes the parked `prepare-upload` handler when the sender gives up, so
+    /// the slot is released at once rather than at the accept timeout.
+    pub(crate) withdraw: CancellationToken,
+}
+
 pub struct ServerState {
     pub device: DeviceInfo,
     pub current_session: Option<crate::core::Session>,
+    /// Who reserved the current session. The official receiver authorizes a
+    /// `/cancel` by **source IP** rather than by possession of the session id,
+    /// and so does this one.
+    pub(crate) current_session_from: Option<std::net::IpAddr>,
+    /// Present only between the reservation and the decision.
+    pub(crate) awaiting_consent: Option<ConsentReservation>,
     pub save_dir: PathBuf,
     /// Where received bytes land. Defaults to [`crate::core::AtomicFileSink`];
     /// an embedder replaces it to route a receive into its own staging, its

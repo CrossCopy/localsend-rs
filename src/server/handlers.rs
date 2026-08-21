@@ -49,6 +49,45 @@ pub(crate) struct PrepareUploadParams {
     pin: Option<String>,
 }
 
+/// Releases a consent reservation if the request that made it goes away.
+///
+/// Dropped on every exit from `prepare-upload`, including the one that is not a
+/// return: an axum handler whose client disconnected is simply dropped, and
+/// before this the placeholder it had installed stayed until the sweep.
+struct ReservationGuard {
+    state: Arc<RwLock<ServerState>>,
+    reserved: SessionId,
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        let reserved = self.reserved.clone();
+        // `Drop` cannot await, and taking the lock is the whole job. A task is
+        // the only way, and it is cheap: it runs once and only if the
+        // reservation is still this one.
+        tokio::spawn(async move {
+            let mut state = state.write().await;
+            let ours = state
+                .awaiting_consent
+                .as_ref()
+                .is_some_and(|reservation| reservation.session_id == reserved);
+            if !ours {
+                return;
+            }
+            state.awaiting_consent = None;
+            if let Some(session) = &state.current_session
+                && session.id == reserved
+            {
+                let _ = session.try_cancel_receives();
+                state.current_session = None;
+                state.current_session_from = None;
+                tracing::info!(%reserved, "Released a reservation nobody is waiting on any more");
+            }
+        });
+    }
+}
+
 pub(crate) async fn handle_prepare_upload(
     State(state_ref): State<Arc<RwLock<ServerState>>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -209,6 +248,10 @@ async fn handle_standard_prepare_upload(
     // Never hold this guard across the `timeout(...).await` below -- that
     // would deadlock every other concurrent request (including the upload
     // that follows acceptance).
+    // Declared outside the lock so the guard below can name them.
+    let reserved: SessionId;
+    let withdraw: tokio_util::sync::CancellationToken;
+
     let (events_tx, auto_accept, accept_timeout) = {
         let mut state = state_ref.write().await;
 
@@ -227,16 +270,38 @@ async fn handle_standard_prepare_upload(
             }
         }
 
-        state.current_session = Some(crate::core::Session::new(
-            request.info.alias.clone(),
-            request.files.clone(),
-        ));
+        let placeholder =
+            crate::core::Session::new(request.info.alias.clone(), request.files.clone());
+        reserved = placeholder.id.clone();
+        withdraw = tokio_util::sync::CancellationToken::new();
+        state.awaiting_consent = Some(crate::server::state::ConsentReservation {
+            session_id: reserved.clone(),
+            from: peer.ip(),
+            withdraw: withdraw.clone(),
+        });
+        state.current_session_from = Some(peer.ip());
+        state.current_session = Some(placeholder);
 
         (
             state.events_tx.clone(),
             state.auto_accept.load(std::sync::atomic::Ordering::Relaxed),
             state.accept_timeout,
         )
+    };
+
+    // **The reservation is released if this future is dropped.** A sender that
+    // closes the connection while somebody is deciding used to leave the
+    // placeholder in place until the sweep reclaimed it — up to
+    // `session_timeout`, default five minutes — and every other LocalSend peer
+    // on the network got 409 in the meantime. Nothing woke that up, because a
+    // dropped axum handler runs no more code of its own.
+    //
+    // The guard is keyed on the reservation id and checks it before clearing,
+    // so a guard that outlives its own decision cannot cancel somebody else's
+    // session.
+    let _release = ReservationGuard {
+        state: state_ref.clone(),
+        reserved: reserved.clone(),
     };
 
     // Decide: auto-accept, or ask the event consumer.
@@ -255,12 +320,36 @@ async fn handle_standard_prepare_upload(
             // No consumer listening -> decline.
             crate::server::events::TransferDecision::Decline
         } else {
-            match tokio::time::timeout(accept_timeout, decision_rx).await {
-                Ok(Ok(d)) => d,
-                _ => crate::server::events::TransferDecision::Decline, // dropped or timed out
+            tokio::select! {
+                biased;
+                // The sender said `/cancel` before anybody answered. Treat it
+                // as a decline so the one unwind path below still runs.
+                _ = withdraw.cancelled() => {
+                    tracing::info!("Sender withdrew its offer before it was answered");
+                    crate::server::events::TransferDecision::Decline
+                }
+                answer = tokio::time::timeout(accept_timeout, decision_rx) => match answer {
+                    Ok(Ok(d)) => d,
+                    _ => crate::server::events::TransferDecision::Decline, // dropped or timed out
+                },
             }
         }
     };
+
+    {
+        // The answer arrived, so this is no longer a reservation waiting on one.
+        // Clearing it here rather than in the guard is what makes the guard's
+        // id check meaningful: past this line the guard finds nothing of its
+        // own and does nothing.
+        let mut state = state_ref.write().await;
+        if state
+            .awaiting_consent
+            .as_ref()
+            .is_some_and(|reservation| reservation.session_id == reserved)
+        {
+            state.awaiting_consent = None;
+        }
+    }
 
     // A refusal is not a decline and unwinds on its own path, because the two
     // answer the sender differently and only one of them is worth retrying.
@@ -763,20 +852,69 @@ pub(crate) async fn handle_upload(
 
 #[derive(Deserialize)]
 pub(crate) struct CancelParams {
+    /// **Optional, and that is the spec's shape rather than laxity.** The
+    /// official receiver requires a session id only when it is *not* in the
+    /// waiting state: a sender that gives up while somebody is still deciding
+    /// has never been told a session id, because the reservation's id is
+    /// internal until the offer is accepted.
     #[serde(rename = "sessionId")]
-    session_id: SessionId,
+    session_id: Option<SessionId>,
 }
 
 pub(crate) async fn handle_cancel(
     State(state_ref): State<Arc<RwLock<ServerState>>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     Query(params): Query<CancelParams>,
 ) -> Response {
     let mut state = state_ref.write().await;
 
+    // **Authorized by source IP, not by knowing the session id.** That is what
+    // the official receiver does, and the difference matters on a shared
+    // network: a session id travels in a `prepare-upload` response over plain
+    // HTTP by default, so treating possession of one as authority to cancel
+    // hands the transfer to anybody who watched it go past.
+    let claimed_by_sender = state
+        .current_session_from
+        .is_some_and(|reserved_by| reserved_by == peer.ip());
+
+    // The sender gave up while somebody was still deciding. It has no session
+    // id to name, so not naming one is the request rather than a malformed one.
+    if params.session_id.is_none() {
+        let Some(reservation) = state.awaiting_consent.take() else {
+            tracing::warn!("Cancel with no session id, and nothing is awaiting consent");
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if reservation.from != peer.ip() {
+            state.awaiting_consent = Some(reservation);
+            tracing::warn!("Cancel from {} is not the peer that reserved", peer.ip());
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        if let Some(session) = &state.current_session
+            && session.id == reservation.session_id
+        {
+            let _ = session.try_cancel_receives();
+            state.current_session = None;
+            state.current_session_from = None;
+        }
+        // Wakes the parked handler, which unwinds through its own decline path.
+        reservation.withdraw.cancel();
+        tracing::info!("Sender withdrew its offer before it was answered");
+        return StatusCode::OK.into_response();
+    }
+    let session_id = params
+        .session_id
+        .clone()
+        .expect("the None arm returned above");
+
+    if !claimed_by_sender && state.current_session_from.is_some() {
+        tracing::warn!("Cancel from {} is not the peer that reserved", peer.ip());
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     if state
         .crosscopy_authorized_session
         .as_ref()
-        .is_some_and(|session| session.session_id == params.session_id)
+        .is_some_and(|session| session.session_id == session_id)
     {
         let session = state
             .crosscopy_authorized_session
@@ -790,7 +928,7 @@ pub(crate) async fn handle_cancel(
     if state
         .crosscopy_authorized_active_upload
         .as_ref()
-        .is_some_and(|active| active.session_id == params.session_id)
+        .is_some_and(|active| active.session_id == session_id)
     {
         state
             .crosscopy_authorized_active_upload
@@ -802,23 +940,88 @@ pub(crate) async fn handle_cancel(
     }
 
     if let Some(session) = &state.current_session
-        && session.id.as_str() == params.session_id.as_str()
+        && session.id == session_id
     {
         if !session.try_cancel_receives() {
             tracing::info!(
                 "Session {} is already publishing and cannot be cancelled",
-                params.session_id
+                session_id
             );
             return StatusCode::CONFLICT.into_response();
         }
         let _ = state
             .events_tx
             .try_send(crate::server::events::ServerEvent::SessionDone {
-                session_id: params.session_id.clone(),
+                session_id: session_id.clone(),
             });
         state.current_session = None;
-        tracing::info!("Session {} cancelled", params.session_id);
+        state.current_session_from = None;
+        tracing::info!("Session {} cancelled", session_id);
     }
 
     StatusCode::OK.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Protocol;
+
+    /// A cancel is authorized by **source IP**, and this is the row that says
+    /// knowing the session id is not enough.
+    ///
+    /// It is a unit test rather than one over the wire because two source
+    /// addresses on loopback is a platform question — Linux gives you the whole
+    /// `127.0.0.0/8`, macOS aliases only `127.0.0.1` — and a security property
+    /// should not be asserted only where the aliasing happens to work.
+    #[tokio::test]
+    async fn a_cancel_from_a_different_peer_is_refused_even_with_the_right_session_id() {
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+        let session = crate::core::Session::new("sender".to_string(), HashMap::new());
+        let session_id = session.id.clone();
+        let state = Arc::new(RwLock::new(ServerState {
+            device: DeviceInfo::new("receiver".to_string(), 53317, Protocol::Http),
+            current_session: Some(session),
+            current_session_from: Some("10.0.0.5".parse().unwrap()),
+            awaiting_consent: None,
+            save_dir: std::path::PathBuf::from("."),
+            events_tx,
+            auto_accept: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            accept_timeout: std::time::Duration::from_secs(60),
+            session_timeout: std::time::Duration::from_secs(300),
+            receive_rate_limit_bytes_per_second: None,
+            pin_gate: crate::server::pin::PinGate::new(None),
+            web_share: None,
+            sink: Arc::new(crate::core::AtomicFileSink),
+            crosscopy_authorized_upload_gate: None,
+            crosscopy_authorized_session: None,
+            crosscopy_authorized_active_upload: None,
+            crosscopy_authorized_stopping: false,
+        }));
+
+        let stranger = handle_cancel(
+            State(state.clone()),
+            ConnectInfo("10.0.0.9:40000".parse().unwrap()),
+            Query(CancelParams {
+                session_id: Some(session_id.clone()),
+            }),
+        )
+        .await;
+        assert_eq!(stranger.status(), StatusCode::FORBIDDEN);
+        assert!(
+            state.read().await.current_session.is_some(),
+            "a stranger cancelled somebody else's session"
+        );
+
+        let sender = handle_cancel(
+            State(state.clone()),
+            ConnectInfo("10.0.0.5:40000".parse().unwrap()),
+            Query(CancelParams {
+                session_id: Some(session_id),
+            }),
+        )
+        .await;
+        assert_eq!(sender.status(), StatusCode::OK);
+        assert!(state.read().await.current_session.is_none());
+    }
 }

@@ -126,6 +126,8 @@ impl LocalSendServer {
                 let state = Arc::new(RwLock::new(ServerState {
                     device: self.device.clone(),
                     current_session: None,
+                    current_session_from: None,
+                    awaiting_consent: None,
                     save_dir: self.save_dir.clone(),
                     sink: self.sink.clone(),
                     events_tx,
@@ -188,6 +190,8 @@ impl LocalSendServer {
             let state = Arc::new(RwLock::new(ServerState {
                 device: self.device.clone(),
                 current_session: None,
+                current_session_from: None,
+                awaiting_consent: None,
                 save_dir: self.save_dir.clone(),
                 sink: self.sink.clone(),
                 events_tx,
