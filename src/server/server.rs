@@ -32,6 +32,7 @@ pub struct LocalSendServer {
     pin: Option<String>,
     crosscopy_authorized_upload_gate:
         Option<Arc<dyn super::crosscopy_authorized::CrossCopyAuthorizedUploadGate>>,
+    sink: Arc<dyn crate::core::ReceiveSink>,
     state: Option<Arc<RwLock<ServerState>>>,
 }
 
@@ -59,6 +60,7 @@ impl LocalSendServer {
             session_timeout: Duration::from_secs(300),
             receive_rate_limit_bytes_per_second: None,
             crosscopy_authorized_upload_gate: None,
+            sink: Arc::new(crate::core::AtomicFileSink),
             #[cfg(feature = "https")]
             tls_certificate: None,
         }
@@ -125,6 +127,7 @@ impl LocalSendServer {
                     device: self.device.clone(),
                     current_session: None,
                     save_dir: self.save_dir.clone(),
+                    sink: self.sink.clone(),
                     events_tx,
                     auto_accept: self.auto_accept.clone(),
                     accept_timeout: self.accept_timeout,
@@ -186,6 +189,7 @@ impl LocalSendServer {
                 device: self.device.clone(),
                 current_session: None,
                 save_dir: self.save_dir.clone(),
+                sink: self.sink.clone(),
                 events_tx,
                 auto_accept: self.auto_accept.clone(),
                 accept_timeout: self.accept_timeout,
@@ -407,6 +411,7 @@ pub struct LocalSendServerBuilder {
     receive_rate_limit_bytes_per_second: Option<u64>,
     crosscopy_authorized_upload_gate:
         Option<Arc<dyn super::crosscopy_authorized::CrossCopyAuthorizedUploadGate>>,
+    sink: Arc<dyn crate::core::ReceiveSink>,
     #[cfg(feature = "https")]
     tls_certificate: Option<crate::crypto::TlsCertificate>,
 }
@@ -424,6 +429,19 @@ impl LocalSendServerBuilder {
 
     pub fn save_dir(mut self, dir: impl AsRef<std::path::Path>) -> Self {
         self.save_dir = dir.as_ref().to_path_buf();
+        self
+    }
+
+    /// Route received bytes somewhere other than straight onto the disk.
+    ///
+    /// The default is [`crate::core::AtomicFileSink`], which writes under
+    /// `save_dir`. An embedder that has its own notion of a received file —
+    /// a staging tree it publishes atomically, an operation it can resume —
+    /// supplies it here, and this crate then holds no path and no file handle
+    /// of its own. `save_dir` is still passed to the sink on every create, so
+    /// an implementation that ignores it may leave it at the default.
+    pub fn sink(mut self, sink: Arc<dyn crate::core::ReceiveSink>) -> Self {
+        self.sink = sink;
         self
     }
 
@@ -539,6 +557,7 @@ impl LocalSendServerBuilder {
             receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
             pin: self.pin,
             crosscopy_authorized_upload_gate: self.crosscopy_authorized_upload_gate,
+            sink: self.sink,
             state: None,
         };
         #[cfg(feature = "https")]

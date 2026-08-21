@@ -12,7 +12,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use crosscopy_safe_fs::SafeReceiveError;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -492,6 +491,7 @@ pub(crate) async fn handle_upload(
         file_count,
         receive_rate_limit_bytes_per_second,
         save_dir,
+        sink,
         receive_lease,
     ) = if let Some(session) = &state.current_session {
         if session.id != params.session_id {
@@ -535,6 +535,7 @@ pub(crate) async fn handle_upload(
                 session.files.len(),
                 state.receive_rate_limit_bytes_per_second,
                 state.save_dir.clone(),
+                state.sink.clone(),
                 receive_lease,
             )
         } else {
@@ -554,14 +555,19 @@ pub(crate) async fn handle_upload(
     // pinned receiver-selected root.
     drop(state);
 
-    let mut pending = match crate::core::file::create_pending_receive(&save_dir, &file_name).await {
+    // The sink's error is classified rather than opaque, because the two halves
+    // land on different status codes and the LocalSend spec's upload table
+    // treats them as different things: 400 is "you sent something wrong", 500
+    // is "this receiver broke". Collapsing them would tell a sender that named
+    // `../../etc/passwd` to retry.
+    let mut pending = match sink.create(&save_dir, &file_name).await {
         Ok(pending) => pending,
-        Err(SafeReceiveError::UnsafeRelativePath) => {
-            tracing::warn!("Upload rejected: unsafe remote file name {file_name:?}");
+        Err(crate::core::SinkError::Rejected(reason)) => {
+            tracing::warn!(%reason, "Upload rejected: unusable remote file name {file_name:?}");
             return StatusCode::BAD_REQUEST.into_response();
         }
         Err(error) => {
-            tracing::error!(%error, "Failed to create safe receive destination");
+            tracing::error!(%error, "Failed to create a receive destination");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };

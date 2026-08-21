@@ -16,6 +16,10 @@ pub struct ServerState {
     pub device: DeviceInfo,
     pub current_session: Option<crate::core::Session>,
     pub save_dir: PathBuf,
+    /// Where received bytes land. Defaults to [`crate::core::AtomicFileSink`];
+    /// an embedder replaces it to route a receive into its own staging, its
+    /// own history, or its own hardened filesystem layer. See `core::sink`.
+    pub sink: Arc<dyn crate::core::ReceiveSink>,
     pub events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
     /// Shared with [`crate::server::LocalSendServer`] so a live
     /// `set_auto_accept` toggle is observed by the request handler.
@@ -82,7 +86,10 @@ pub(crate) struct BodyWriteOutcome {
 
 pub(crate) async fn write_body_to_file_with_progress<F>(
     body: Body,
-    file: &mut tokio::fs::File,
+    // Not `&mut tokio::fs::File`. The destination belongs to whatever sink the
+    // embedder installed, and a staging implementation's writer is not a file
+    // on the path anybody will read from.
+    file: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     rate_limit_bytes_per_second: Option<u64>,
     mut progress: F,
 ) -> std::io::Result<BodyWriteOutcome>
