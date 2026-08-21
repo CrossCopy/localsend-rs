@@ -27,4 +27,4 @@ pub fn ensure_crypto_provider() {
 }
 
 #[cfg(feature = "https")]
-pub use tls::{TlsCertificate, generate_tls_certificate};
+pub use tls::{TlsCertificate, generate_tls_certificate, tls_certificate_from_pem};
