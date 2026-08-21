@@ -262,6 +262,18 @@ async fn handle_standard_prepare_upload(
         }
     };
 
+    // A refusal is not a decline and unwinds on its own path, because the two
+    // answer the sender differently and only one of them is worth retrying.
+    if let crate::server::events::TransferDecision::Refuse { reason } = &decision {
+        let mut state = state_ref.write().await;
+        if let Some(session) = &state.current_session {
+            let _ = session.try_cancel_receives();
+        }
+        state.current_session = None;
+        tracing::warn!(%reason, "Offer refused as unusable");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     let accepted_ids: Vec<FileId> = match decision {
         crate::server::events::TransferDecision::Accept => request.files.keys().cloned().collect(),
         crate::server::events::TransferDecision::AcceptFiles(ids) => ids
@@ -269,6 +281,7 @@ async fn handle_standard_prepare_upload(
             .filter(|id| request.files.contains_key(id))
             .collect(),
         crate::server::events::TransferDecision::Decline => Vec::new(),
+        crate::server::events::TransferDecision::Refuse { .. } => unreachable!("handled above"),
     };
 
     if accepted_ids.is_empty() {

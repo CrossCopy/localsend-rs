@@ -96,6 +96,22 @@ pub enum TransferDecision {
     Accept,
     AcceptFiles(Vec<FileId>),
     Decline,
+    /// The offer cannot be accepted by anybody, and saying "declined" would be
+    /// a lie that costs the sender a retry.
+    ///
+    /// This exists because a host's admission rules can be stricter than the
+    /// protocol's. A receiver may require the `sha256` LocalSend leaves
+    /// optional, refuse two offered files that claim one name rather than
+    /// renaming one of them, or reject a file name it cannot make safe. None of
+    /// those is a person saying no, and none of them changes if the sender asks
+    /// again — so the answer is **400**, not the 403 a decline gets.
+    ///
+    /// The reason is for this receiver's log. It is not put on the wire: a
+    /// stranger on the LAN learns that its offer was malformed and nothing about
+    /// what this device requires.
+    Refuse {
+        reason: String,
+    },
 }
 
 /// Handle to answer an incoming `prepare-upload`. Consume it exactly once.
@@ -144,6 +160,14 @@ impl PendingRequest {
 
     pub fn decline(self) {
         let _ = self.responder.send(TransferDecision::Decline);
+    }
+
+    /// Refuse the offer as unusable. See [`TransferDecision::Refuse`] — this is
+    /// not a decline, and the sender is told 400 rather than 403.
+    pub fn refuse(self, reason: impl Into<String>) {
+        let _ = self.responder.send(TransferDecision::Refuse {
+            reason: reason.into(),
+        });
     }
 }
 
