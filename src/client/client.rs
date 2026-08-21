@@ -252,6 +252,50 @@ impl LocalSendClient {
         }
     }
 
+    /// Uploads a body already in memory, for a payload that has no file.
+    ///
+    /// **A text message is the case this exists for.** Most receivers answer a
+    /// message with 204 and never ask for bytes — the whole body travelled in
+    /// the offer's `preview` — but one that *does* open a session leaves a
+    /// sender with a string and an endpoint that wants a file. Writing the
+    /// message to a temporary file to satisfy that is what the CLI does, and it
+    /// puts a person's private text on disk, unasked, on the sending machine.
+    pub async fn upload_bytes(
+        &self,
+        target: &DeviceInfo,
+        session_id: &SessionId,
+        file_id: &FileId,
+        token: &Token,
+        body: Vec<u8>,
+    ) -> Result<()> {
+        let ip = target
+            .ip
+            .as_ref()
+            .ok_or_else(|| LocalSendError::network("Target IP not provided"))?;
+        let url = format!(
+            "{}://{}:{}/api/localsend/v2/upload?sessionId={}&fileId={}&token={}",
+            target.protocol, ip, target.port, session_id, file_id, token
+        );
+
+        let length = body.len() as u64;
+        let response = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_LENGTH, length)
+            .body(body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        match status {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            _ => Err(LocalSendError::http_failed(
+                status.as_u16(),
+                "Upload failed",
+            )),
+        }
+    }
+
     pub async fn cancel(&self, target: &DeviceInfo, session_id: &SessionId) -> Result<()> {
         let ip = target
             .ip
