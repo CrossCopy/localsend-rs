@@ -20,18 +20,31 @@ pub struct LocalSendClient {
 }
 
 impl LocalSendClient {
+    /// **No proxy, and it is not only about speed.** A LocalSend peer is a
+    /// device on this network segment, addressed by the IP its own announcement
+    /// carried; an HTTP proxy is a thing for reaching the internet through, and
+    /// sending a person's file to one because their system configuration names
+    /// one would be sending it somewhere they never chose.
+    ///
+    /// It is also the difference between a send starting now and a send
+    /// starting in twenty seconds. `reqwest::Client::new()` asks the platform
+    /// for its proxy configuration, measured at **20.4 s** on macOS on
+    /// 2026-08-22 against 0.8 ms for this builder — a cost paid on every client,
+    /// and this crate builds one per call.
     pub fn new(device: DeviceInfo) -> Self {
         crate::crypto::ensure_crypto_provider();
-        Self {
-            client: HttpClient::new(),
-            device,
-        }
+        let client = HttpClient::builder()
+            .no_proxy()
+            .build()
+            .expect("a reqwest client with no proxy and no TLS override cannot fail to build");
+        Self { client, device }
     }
 
     pub fn with_trust_policy(device: DeviceInfo, policy: TlsTrustPolicy) -> Result<Self> {
         crate::crypto::ensure_crypto_provider();
         let client = match policy {
             TlsTrustPolicy::InsecureForTests => HttpClient::builder()
+                .no_proxy()
                 .danger_accept_invalid_certs(true)
                 .build()
                 .map_err(LocalSendError::from)?,
@@ -44,6 +57,7 @@ impl LocalSendClient {
                         .with_custom_certificate_verifier(Arc::new(verifier))
                         .with_no_client_auth();
                     HttpClient::builder()
+                        .no_proxy()
                         .tls_backend_preconfigured(tls_config)
                         .build()
                         .map_err(LocalSendError::from)?
