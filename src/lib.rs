@@ -19,6 +19,7 @@ pub use crypto::{TlsCertificate, generate_tls_certificate};
 pub use crypto::{generate_fingerprint, sha256_from_bytes, sha256_from_file};
 pub use discovery::{
     Discovery, HttpDiscovery, MulticastConfig, MulticastDiscovery, local_ipv4_addresses,
+    local_ipv4_interfaces,
 };
 pub use error::{LocalSendError, Result};
 pub use protocol::{

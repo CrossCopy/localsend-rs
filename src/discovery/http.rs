@@ -229,18 +229,38 @@ fn subnet_hosts(base_ip: &str) -> Result<Vec<String>> {
 /// capability can point the probe at a network the operator is not on. A
 /// multi-homed host has several, and each is a different segment.
 pub fn local_ipv4_addresses() -> Result<Vec<std::net::Ipv4Addr>> {
+    Ok(local_ipv4_interfaces()?
+        .into_iter()
+        .map(|(_, address)| address)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+/// Every non-loopback IPv4 address this machine holds, with the interface it is on.
+///
+/// The pair, because two parts of a LocalSend consumer speak different halves of
+/// it and both are right: a sweep needs the **address** (it is what a person
+/// reads off `ifconfig`, and what a `/24` is derived from), while joining a
+/// multicast group needs the **interface name** (`MulticastConfig::interface_names`).
+/// Deriving one from the other at the call site is how a policy expressed in one
+/// vocabulary silently fails to apply in the other.
+pub fn local_ipv4_interfaces() -> Result<Vec<(String, std::net::Ipv4Addr)>> {
     use if_addrs::{IfAddr, get_if_addrs};
-    Ok(get_if_addrs()
+    let mut found = get_if_addrs()
         .map_err(|error| LocalSendError::network(format!("Failed to list interfaces: {error}")))?
         .into_iter()
         .filter(|interface| !interface.is_loopback())
         .filter_map(|interface| match interface.addr {
-            IfAddr::V4(address) if !address.ip.is_unspecified() => Some(address.ip),
+            IfAddr::V4(address) if !address.ip.is_unspecified() => {
+                Some((interface.name, address.ip))
+            }
             _ => None,
         })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect())
+        .collect::<Vec<_>>();
+    found.sort();
+    found.dedup();
+    Ok(found)
 }
 
 /// A reqwest client tuned for LAN discovery: accepts the self-signed certificates that
