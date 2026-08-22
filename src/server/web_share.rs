@@ -437,9 +437,7 @@ impl WebShareProgressStream {
     }
 }
 
-async fn handle_web_index(
-    State(state_ref): State<Arc<RwLock<WebShareHost>>>,
-) -> Response {
+async fn handle_web_index(State(state_ref): State<Arc<RwLock<WebShareHost>>>) -> Response {
     if state_ref.read().await.share.is_none() {
         return (
             StatusCode::FORBIDDEN,

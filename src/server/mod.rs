@@ -6,7 +6,14 @@ pub mod server;
 pub mod web_share;
 
 pub(crate) mod handlers;
-pub(crate) mod pin;
+/// Receiver-side PIN enforcement.
+///
+/// **Public because a consumer that serves the v2 routes from its own router
+/// has to enforce the same rule.** The gate is behaviour the protocol
+/// specifies — 401 on a mismatch, three failures then 429 for five minutes,
+/// per peer — and a consumer left to write its own would write a different
+/// one. The same reasoning that made `web_share_router` public.
+pub mod pin;
 pub(crate) mod routes;
 pub(crate) mod state;
 
@@ -17,7 +24,6 @@ pub use crosscopy_authorized::{
     CrossCopyAuthorizedUploadReceipt,
 };
 pub use events::{PendingRequest, PendingWebShareRequest, ServerEvent, TransferDecision};
+pub use pin::{LOCKOUT, MAX_FAILURES, PinGate, PinVerdict};
 pub use server::{LocalSendServer, LocalSendServerBuilder};
-pub use web_share::{
-    WebShareFile, WebShareHost, WebShareSource, WebShareState, web_share_router,
-};
+pub use web_share::{WebShareFile, WebShareHost, WebShareSource, WebShareState, web_share_router};

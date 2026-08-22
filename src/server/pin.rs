@@ -29,6 +29,34 @@ impl PinGate {
         }
     }
 
+    /// Replaces the PIN while the server is running. `None` takes the gate off.
+    ///
+    /// **The lockout table is cleared with it.** A person changing the PIN has
+    /// decided the old value no longer means anything, and leaving the counters
+    /// behind would keep a peer locked out for guessing at a secret that has
+    /// since been retired — which reads to them as "the new PIN does not work".
+    /// Nothing is loosened by this that the caller did not already control: only
+    /// something holding the gate can call it.
+    pub fn set(&mut self, pin: Option<String>) {
+        self.pin = pin;
+        self.failures.clear();
+    }
+
+    /// Whether a sender has to present a PIN at all.
+    pub fn required(&self) -> bool {
+        self.pin.is_some()
+    }
+
+    /// The PIN itself, for a consumer that gates a *second* surface with the
+    /// same secret — a Web Share on the same port, in practice.
+    ///
+    /// Kept here rather than copied into the consumer because two copies of a
+    /// mutable secret is how one of them ends up stale after [`Self::set`].
+    /// Never put this in a log line or a response body.
+    pub fn pin(&self) -> Option<&str> {
+        self.pin.as_deref()
+    }
+
     pub fn check(&mut self, provided: Option<&str>, peer: IpAddr) -> PinVerdict {
         let Some(expected) = self.pin.as_deref() else {
             return PinVerdict::Ok;
@@ -43,7 +71,18 @@ impl PinGate {
             self.failures.remove(&peer);
         }
 
-        if provided.is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes())) {
+        // **Presenting nothing is not a guess.** A sender that sent no PIN at
+        // all has not tried a value, cannot be enumerating, and most often is a
+        // client with no PIN field on the screen it was driven from. Counting
+        // that as a strike means three innocent requests spend the lockout
+        // budget of a sender who knows the PIN perfectly well, and the peer is
+        // then locked out for `LOCKOUT` from a machine that could have got in.
+        // Only a wrong *value* moves the counter.
+        let Some(provided) = provided else {
+            return PinVerdict::Unauthorized;
+        };
+
+        if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
             self.failures.remove(&peer);
             PinVerdict::Ok
         } else {
@@ -83,6 +122,17 @@ mod tests {
         let mut g = PinGate::new(Some("123456".to_string()));
         assert_eq!(g.check(None, PEER), PinVerdict::Unauthorized);
         assert_eq!(g.check(Some("000000"), PEER), PinVerdict::Unauthorized);
+        assert_eq!(g.check(Some("123456"), PEER), PinVerdict::Ok);
+    }
+
+    #[test]
+    fn a_sender_that_offered_no_pin_never_spends_the_lockout_budget() {
+        let mut g = PinGate::new(Some("123456".to_string()));
+        for _ in 0..10 {
+            assert_eq!(g.check(None, PEER), PinVerdict::Unauthorized);
+        }
+        // Ten refusals later the peer is still allowed to present the real one.
+        // A client with no PIN field cannot lock its user out of a receiver.
         assert_eq!(g.check(Some("123456"), PEER), PinVerdict::Ok);
     }
 
