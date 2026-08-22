@@ -54,6 +54,23 @@ impl HttpDiscovery {
         })
     }
 
+    /// The same, for a consumer that already **is** a LocalSend device.
+    ///
+    /// [`Self::new`] mints a fresh fingerprint, which is right for a scanner
+    /// that is nothing else. It is wrong for a running receiver: the scan skips
+    /// `local_device.fingerprint` so that a device does not discover itself,
+    /// and a minted one never matches the value this process actually
+    /// announces — so the caller's own machine comes back as a peer, gets a row
+    /// in its own device list, and can be "sent to".
+    pub fn for_device(device: DeviceInfo) -> Result<Self> {
+        Ok(Self {
+            local_device: device,
+            client: build_discovery_client()?,
+            running: Arc::new(AtomicBool::new(false)),
+            tx: None,
+        })
+    }
+
     /// Sweeps every host `x.y.z.1..=254` in the `/24` subnet of `base_ip` (excluding
     /// our own address), asking each one `GET /api/localsend/v2/info`, and returns the
     /// LocalSend devices that answered. This is the protocol's "legacy" HTTP discovery
@@ -205,11 +222,38 @@ fn subnet_hosts(base_ip: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Every non-loopback IPv4 address this machine holds.
+///
+/// What a subnet sweep needs and what a caller must not be allowed to invent: a
+/// scan is named by where **this** device is, so that nothing holding the
+/// capability can point the probe at a network the operator is not on. A
+/// multi-homed host has several, and each is a different segment.
+pub fn local_ipv4_addresses() -> Result<Vec<std::net::Ipv4Addr>> {
+    use if_addrs::{IfAddr, get_if_addrs};
+    Ok(get_if_addrs()
+        .map_err(|error| LocalSendError::network(format!("Failed to list interfaces: {error}")))?
+        .into_iter()
+        .filter(|interface| !interface.is_loopback())
+        .filter_map(|interface| match interface.addr {
+            IfAddr::V4(address) if !address.ip.is_unspecified() => Some(address.ip),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
 /// A reqwest client tuned for LAN discovery: accepts the self-signed certificates that
 /// every LocalSend device presents, and bounds each probe so the scan finishes promptly.
 fn build_discovery_client() -> Result<Client> {
     crate::crypto::ensure_crypto_provider();
     Client::builder()
+        // **No proxy**, for the reason `LocalSendClient::new` says: the hosts
+        // being probed are on this segment and a proxy is not on the way to
+        // them — and asking the platform for its proxy configuration measured
+        // 20.4 s on macOS on 2026-08-22, which a scan of 254 hosts pays before
+        // the first probe leaves.
+        .no_proxy()
         .danger_accept_invalid_certs(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
