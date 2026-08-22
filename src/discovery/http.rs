@@ -25,6 +25,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
 /// Overall per-probe timeout (connect + response).
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// What a bounded sweep found, and whether it got to the end of its list.
+///
+/// **Two fields rather than a `Vec`**, because they are two facts and the second
+/// one changes what the first means: an empty list from a completed sweep says
+/// nobody is there, and an empty list from an abandoned one says nothing at all.
+/// A caller shown only the devices cannot tell those apart, which is the whole
+/// failure a deadline introduces if it is not reported.
+#[derive(Debug, Clone)]
+pub struct ScanOutcome {
+    pub devices: Vec<DeviceInfo>,
+    /// False when the deadline arrived before the last probe did. The probes
+    /// still in flight were cancelled.
+    pub complete: bool,
+}
+
 pub struct HttpDiscovery {
     local_device: DeviceInfo,
     client: Client,
@@ -82,7 +97,16 @@ impl HttpDiscovery {
     /// is read from the response, so nothing is trusted blindly. Mirrors localsend-ts
     /// `HttpDiscovery` and the official `HttpScanDiscoveryService`.
     pub async fn scan_subnet(&self, base_ip: &str) -> Result<Vec<DeviceInfo>> {
-        Ok(self.scan_hosts(subnet_hosts(base_ip)?).await)
+        Ok(self.scan_hosts(subnet_hosts(base_ip)?, None).await.devices)
+    }
+
+    /// [`Self::scan_subnet`], abandoned after `within`.
+    ///
+    /// See [`ScanOutcome`] for why this returns one rather than a `Vec`, and
+    /// [`Self::scan_hosts`] for what "abandoned" does to the probes still in
+    /// flight.
+    pub async fn scan_subnet_within(&self, base_ip: &str, within: Duration) -> Result<ScanOutcome> {
+        Ok(self.scan_hosts(subnet_hosts(base_ip)?, Some(within)).await)
     }
 
     /// Probe a caller-supplied set of hosts over the normal LocalSend `/info`
@@ -91,18 +115,60 @@ impl HttpDiscovery {
     /// performs the same TLS/HTTP negotiation, response decoding and
     /// fingerprint-based de-duplication as a subnet scan.
     pub async fn scan_ips(&self, ips: Vec<String>) -> Result<Vec<DeviceInfo>> {
-        Ok(self.scan_hosts(ips).await)
+        Ok(self.scan_hosts(ips, None).await.devices)
+    }
+
+    /// [`Self::scan_ips`], abandoned after `within`.
+    pub async fn scan_ips_within(&self, ips: Vec<String>, within: Duration) -> Result<ScanOutcome> {
+        Ok(self.scan_hosts(ips, Some(within)).await)
     }
 
     /// Probe an explicit list of hosts concurrently and return the de-duplicated set of
     /// LocalSend devices that answered (ourselves excluded). Shared core of `scan_subnet`.
-    async fn scan_hosts(&self, targets: Vec<String>) -> Vec<DeviceInfo> {
-        let discovered = stream::iter(targets)
+    ///
+    /// # What a deadline does, and what it deliberately does not do
+    ///
+    /// `within` bounds the **whole sweep**, not each probe — the per-probe
+    /// bounds are [`CONNECT_TIMEOUT`] and [`REQUEST_TIMEOUT`] and they are
+    /// unaffected. Results are taken from the stream as they arrive, so a
+    /// deadline keeps everything that answered before it and reports
+    /// [`ScanOutcome::complete`] as false; it never discards work already done.
+    ///
+    /// The probes still in flight are **cancelled**, because dropping the
+    /// `buffer_unordered` stream drops the futures inside it. That is the
+    /// reason this lives here rather than in a caller: a
+    /// `tokio::time::timeout` wrapped around `scan_hosts` would return nothing
+    /// at all while fifty sockets stayed open behind it, and a caller that
+    /// wrapped the whole call would report *fewer* devices than answered with
+    /// no way to tell that it had.
+    async fn scan_hosts(&self, targets: Vec<String>, within: Option<Duration>) -> ScanOutcome {
+        let deadline = within.map(|within| tokio::time::Instant::now() + within);
+        let probes = stream::iter(targets)
             .map(|ip| async move { self.probe_info(&ip).await })
-            .buffer_unordered(SCAN_CONCURRENCY)
-            .filter_map(|device| async move { device })
-            .collect::<Vec<_>>()
-            .await;
+            .buffer_unordered(SCAN_CONCURRENCY);
+        futures_util::pin_mut!(probes);
+
+        let mut discovered = Vec::new();
+        let mut complete = true;
+        loop {
+            let next = probes.next();
+            let answered = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, next).await {
+                    Ok(answered) => answered,
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                },
+                None => next.await,
+            };
+            match answered {
+                Some(Some(device)) => discovered.push(device),
+                // A host that did not answer. Still a completed probe.
+                Some(None) => {}
+                None => break,
+            }
+        }
 
         // Skip ourselves and de-duplicate by fingerprint (a peer may answer on more than
         // one address). Fingerprint is a peer's identity; a device without one is ignored.
@@ -117,7 +183,10 @@ impl HttpDiscovery {
                 result.push(device);
             }
         }
-        result
+        ScanOutcome {
+            devices: result,
+            complete,
+        }
     }
 
     /// Probe a single host's `/info` endpoint. Tries the configured protocol first and,
@@ -417,7 +486,10 @@ mod tests {
         // discovery must still retry the same port over HTTP.
         let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Https)
             .expect("build discovery");
-        let found = discovery.scan_hosts(vec!["127.0.0.1".to_string()]).await;
+        let found = discovery
+            .scan_hosts(vec!["127.0.0.1".to_string()], None)
+            .await
+            .devices;
 
         let target = found
             .iter()
@@ -513,6 +585,44 @@ mod tests {
                 .iter()
                 .any(|peer| peer.ip.as_deref() == Some(target.as_str())),
             "the explicit LocalSend target must answer /info"
+        );
+    }
+
+    /// **A deadline keeps what answered and says it was cut short.**
+    ///
+    /// TEST-NET-1 is reserved for documentation and routed nowhere, so all 253
+    /// hosts hang until `CONNECT_TIMEOUT` — one full second, and fifty at a
+    /// time, which is roughly five seconds of wall clock. The row asserts the
+    /// call comes back in well under that and reports `complete: false`.
+    ///
+    /// It is also the row that fails if somebody "simplifies" this into a
+    /// `tokio::time::timeout` around the whole sweep: that version returns an
+    /// error rather than an outcome, and the devices found before the deadline
+    /// are lost.
+    #[tokio::test]
+    async fn a_deadline_abandons_the_sweep_and_says_so() {
+        let discovery = HttpDiscovery::new(
+            "a test device".to_string(),
+            53317,
+            crate::protocol::Protocol::Http,
+        )
+        .expect("a discovery client");
+
+        let started = std::time::Instant::now();
+        let outcome = discovery
+            .scan_subnet_within("192.0.2.10", std::time::Duration::from_millis(300))
+            .await
+            .expect("a scan of a reserved range still runs");
+
+        assert!(
+            !outcome.complete,
+            "253 unroutable hosts cannot all have been probed in 300ms"
+        );
+        assert!(outcome.devices.is_empty(), "nothing answers on TEST-NET-1");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the deadline must abandon the sweep, not wait for its last probe: {:?}",
+            started.elapsed()
         );
     }
 }
