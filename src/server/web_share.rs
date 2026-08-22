@@ -17,7 +17,71 @@ use std::task::{Context, Poll};
 use tokio::sync::RwLock;
 use tokio_util::io::ReaderStream;
 
-use super::state::ServerState;
+/// Everything the Web Share half of the protocol needs, and nothing else.
+///
+/// # Why this is its own state rather than a field of `ServerState`
+///
+/// The five handlers below read exactly four things: the device this daemon
+/// announces, the event channel, the accept timeout, and the share itself. They
+/// touch none of the receive half — no session store, no save directory, no
+/// upload gate. Holding them in `ServerState` therefore made Web Share
+/// unmountable by anything that does not use this crate's own router, which is
+/// the position `xross-adapter-localsend` is in: it serves the upload half from
+/// its own axum router, over its own admission policy, and had no way to serve
+/// the download half at all.
+///
+/// So the state is split and the routes are exported ([`web_share_router`]).
+/// `ServerState` holds one of these behind its own lock, and this crate's router
+/// mounts the same function every other consumer does — which is what keeps the
+/// two from drifting.
+///
+/// `device` is a copy of `ServerState::device` and that duplication is
+/// deliberate rather than overlooked: the only use of it here is building the
+/// `prepare-download` response, where `download` is forced true regardless. A
+/// consumer that changes its announced alias mid-share would show the old one on
+/// that one response; a shared lock across both halves would cost every upload a
+/// contended acquire for a field that is written approximately never.
+pub struct WebShareHost {
+    pub device: DeviceInfo,
+    pub events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
+    pub accept_timeout: std::time::Duration,
+    pub share: Option<WebShareState>,
+}
+
+impl WebShareHost {
+    pub fn new(
+        device: DeviceInfo,
+        events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
+        accept_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            device,
+            events_tx,
+            accept_timeout,
+            share: None,
+        }
+    }
+}
+
+/// The Web Share routes, over a state a consumer owns.
+///
+/// Mounted by this crate's own router and by any other. `GET /` is the browser
+/// page; the two API routes are the reverse-mode half of the protocol. All five
+/// answer 403 while no share is running, which is what stops the page existing
+/// on a device that never offered one.
+pub fn web_share_router(host: Arc<RwLock<WebShareHost>>) -> axum::Router {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route(
+            "/api/localsend/v2/prepare-download",
+            post(handle_prepare_download),
+        )
+        .route("/api/localsend/v2/download", get(handle_download))
+        .route("/", get(handle_web_index))
+        .route("/main.js", get(handle_web_js))
+        .route("/i18n.json", get(handle_web_i18n))
+        .with_state(host)
+}
 
 #[derive(Clone, Debug)]
 pub enum WebShareSource {
@@ -73,7 +137,9 @@ impl WebShareFile {
 }
 
 #[derive(Debug)]
-pub(crate) struct WebShareSession {
+/// One browser talking to a running share. `pub` for the same reason
+/// [`WebShareState`] is.
+pub struct WebShareSession {
     pub ip: IpAddr,
     pub approved: bool,
     pub response_tx: Option<tokio::sync::oneshot::Sender<bool>>,
@@ -81,7 +147,12 @@ pub(crate) struct WebShareSession {
 }
 
 #[derive(Debug)]
-pub(crate) struct WebShareState {
+/// One running Web Share.
+///
+/// `pub` rather than `pub(crate)` since 2026-08-22, because [`WebShareHost`] is
+/// public and a private field type inside a public struct is a wall a consumer
+/// hits with no way through.
+pub struct WebShareState {
     pub files: HashMap<FileId, WebShareFile>,
     pub sessions: HashMap<SessionId, WebShareSession>,
     pub auto_accept: bool,
@@ -117,15 +188,15 @@ struct PrepareDownloadResponse {
     files: HashMap<FileId, FileMetadata>,
 }
 
-pub(crate) async fn handle_prepare_download(
-    State(state_ref): State<Arc<RwLock<ServerState>>>,
+async fn handle_prepare_download(
+    State(state_ref): State<Arc<RwLock<WebShareHost>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(query): Query<PrepareDownloadQuery>,
 ) -> Response {
     let mut state = state_ref.write().await;
     let device = state.device.clone();
     let events_tx = state.events_tx.clone();
-    let Some(web) = state.web_share.as_mut() else {
+    let Some(web) = state.share.as_mut() else {
         return (StatusCode::FORBIDDEN, "Web share not initialized").into_response();
     };
 
@@ -181,7 +252,7 @@ pub(crate) async fn handle_prepare_download(
     );
     let mut state = state_ref.write().await;
     let device = state.device.clone();
-    let Some(web) = state.web_share.as_mut() else {
+    let Some(web) = state.share.as_mut() else {
         return StatusCode::FORBIDDEN.into_response();
     };
     if !accepted {
@@ -221,14 +292,14 @@ pub(crate) struct DownloadQuery {
     file_id: FileId,
 }
 
-pub(crate) async fn handle_download(
-    State(state_ref): State<Arc<RwLock<ServerState>>>,
+async fn handle_download(
+    State(state_ref): State<Arc<RwLock<WebShareHost>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
     let (file, events_tx) = {
         let state = state_ref.read().await;
-        let Some(web) = state.web_share.as_ref() else {
+        let Some(web) = state.share.as_ref() else {
             return StatusCode::FORBIDDEN.into_response();
         };
         if !web
@@ -296,7 +367,7 @@ pub(crate) async fn handle_download(
 
 struct WebShareProgressStream {
     inner: Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
-    state: Arc<RwLock<ServerState>>,
+    state: Arc<RwLock<WebShareHost>>,
     events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
     session_id: SessionId,
     file_id: FileId,
@@ -347,7 +418,7 @@ impl WebShareProgressStream {
         tokio::spawn(async move {
             let session_done = {
                 let mut state = state.write().await;
-                let Some(web) = state.web_share.as_mut() else {
+                let Some(web) = state.share.as_mut() else {
                     return;
                 };
                 let file_count = web.files.len();
@@ -366,10 +437,10 @@ impl WebShareProgressStream {
     }
 }
 
-pub(crate) async fn handle_web_index(
-    State(state_ref): State<Arc<RwLock<ServerState>>>,
+async fn handle_web_index(
+    State(state_ref): State<Arc<RwLock<WebShareHost>>>,
 ) -> Response {
-    if state_ref.read().await.web_share.is_none() {
+    if state_ref.read().await.share.is_none() {
         return (
             StatusCode::FORBIDDEN,
             include_str!("../../assets/web/error-403.html"),
@@ -379,8 +450,8 @@ pub(crate) async fn handle_web_index(
     axum::response::Html(include_str!("../../assets/web/index.html")).into_response()
 }
 
-pub(crate) async fn handle_web_js(State(state_ref): State<Arc<RwLock<ServerState>>>) -> Response {
-    if state_ref.read().await.web_share.is_none() {
+async fn handle_web_js(State(state_ref): State<Arc<RwLock<WebShareHost>>>) -> Response {
+    if state_ref.read().await.share.is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
     (
@@ -390,8 +461,8 @@ pub(crate) async fn handle_web_js(State(state_ref): State<Arc<RwLock<ServerState
         .into_response()
 }
 
-pub(crate) async fn handle_web_i18n(State(state_ref): State<Arc<RwLock<ServerState>>>) -> Response {
-    if state_ref.read().await.web_share.is_none() {
+async fn handle_web_i18n(State(state_ref): State<Arc<RwLock<WebShareHost>>>) -> Response {
+    if state_ref.read().await.share.is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
     Json(serde_json::json!({

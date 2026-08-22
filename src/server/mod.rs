@@ -18,4 +18,6 @@ pub use crosscopy_authorized::{
 };
 pub use events::{PendingRequest, PendingWebShareRequest, ServerEvent, TransferDecision};
 pub use server::{LocalSendServer, LocalSendServerBuilder};
-pub use web_share::{WebShareFile, WebShareSource};
+pub use web_share::{
+    WebShareFile, WebShareHost, WebShareSource, WebShareState, web_share_router,
+};

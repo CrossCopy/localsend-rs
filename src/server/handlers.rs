@@ -979,19 +979,26 @@ mod tests {
         let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
         let session = crate::core::Session::new("sender".to_string(), HashMap::new());
         let session_id = session.id.clone();
+        let device = DeviceInfo::new("receiver".to_string(), 53317, Protocol::Http);
         let state = Arc::new(RwLock::new(ServerState {
-            device: DeviceInfo::new("receiver".to_string(), 53317, Protocol::Http),
+            device: device.clone(),
             current_session: Some(session),
             current_session_from: Some("10.0.0.5".parse().unwrap()),
             awaiting_consent: None,
             save_dir: std::path::PathBuf::from("."),
-            events_tx,
+            events_tx: events_tx.clone(),
             auto_accept: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             accept_timeout: std::time::Duration::from_secs(60),
             session_timeout: std::time::Duration::from_secs(300),
             receive_rate_limit_bytes_per_second: None,
             pin_gate: crate::server::pin::PinGate::new(None),
-            web_share: None,
+            web: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::server::web_share::WebShareHost::new(
+                    device,
+                    events_tx,
+                    std::time::Duration::from_secs(30),
+                ),
+            )),
             sink: Arc::new(crate::core::AtomicFileSink),
             crosscopy_authorized_upload_gate: None,
             crosscopy_authorized_session: None,

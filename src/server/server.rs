@@ -123,6 +123,11 @@ impl LocalSendServer {
                 let bound_port = std_listener.local_addr()?.port();
                 self.device.port = bound_port;
 
+                let web = Arc::new(RwLock::new(super::web_share::WebShareHost::new(
+                    self.device.clone(),
+                    events_tx.clone(),
+                    self.accept_timeout,
+                )));
                 let state = Arc::new(RwLock::new(ServerState {
                     device: self.device.clone(),
                     current_session: None,
@@ -136,14 +141,14 @@ impl LocalSendServer {
                     session_timeout: self.session_timeout,
                     receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
                     pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
-                    web_share: None,
+                    web: Arc::clone(&web),
                     crosscopy_authorized_upload_gate: self.crosscopy_authorized_upload_gate.clone(),
                     crosscopy_authorized_session: None,
                     crosscopy_authorized_active_upload: None,
                     crosscopy_authorized_stopping: false,
                 }));
                 self.state = Some(state.clone());
-                let router = super::routes::create_router(state.clone());
+                let router = super::routes::create_router(state.clone(), Arc::clone(&web));
 
                 let server = axum_server::from_tcp_rustls(std_listener, tls_config)
                     .map_err(|e| {
@@ -187,6 +192,11 @@ impl LocalSendServer {
             self.device.port = bound_port;
             tracing::info!("Starting HTTP server on port {}", bound_port);
 
+            let web = Arc::new(RwLock::new(super::web_share::WebShareHost::new(
+                self.device.clone(),
+                events_tx.clone(),
+                self.accept_timeout,
+            )));
             let state = Arc::new(RwLock::new(ServerState {
                 device: self.device.clone(),
                 current_session: None,
@@ -200,14 +210,14 @@ impl LocalSendServer {
                 session_timeout: self.session_timeout,
                 receive_rate_limit_bytes_per_second: self.receive_rate_limit_bytes_per_second,
                 pin_gate: crate::server::pin::PinGate::new(self.pin.clone()),
-                web_share: None,
+                web: Arc::clone(&web),
                 crosscopy_authorized_upload_gate: self.crosscopy_authorized_upload_gate.clone(),
                 crosscopy_authorized_session: None,
                 crosscopy_authorized_active_upload: None,
                 crosscopy_authorized_stopping: false,
             }));
             self.state = Some(state.clone());
-            let router = super::routes::create_router(state.clone());
+            let router = super::routes::create_router(state.clone(), Arc::clone(&web));
 
             let handle = tokio::spawn(async move {
                 let server = axum::serve(
@@ -312,13 +322,13 @@ impl LocalSendServer {
             .state
             .as_ref()
             .ok_or_else(|| crate::error::LocalSendError::invalid_state("Server is not running"))?;
-        let mut state = state.write().await;
-        state.web_share = Some(super::web_share::WebShareState::new(
+        let web = Arc::clone(&state.read().await.web);
+        web.write().await.share = Some(super::web_share::WebShareState::new(
             files,
             pin,
             auto_accept,
         ));
-        state.device.download = true;
+        state.write().await.device.download = true;
         self.device.download = true;
         Ok(())
     }
@@ -328,9 +338,9 @@ impl LocalSendServer {
             .state
             .as_ref()
             .ok_or_else(|| crate::error::LocalSendError::invalid_state("Server is not running"))?;
-        let mut state = state.write().await;
-        state.web_share = None;
-        state.device.download = false;
+        let web = Arc::clone(&state.read().await.web);
+        web.write().await.share = None;
+        state.write().await.device.download = false;
         self.device.download = false;
         Ok(())
     }
@@ -344,9 +354,10 @@ impl LocalSendServer {
             .state
             .as_ref()
             .ok_or_else(|| crate::error::LocalSendError::invalid_state("Server is not running"))?;
-        let mut state = state.write().await;
+        let web = Arc::clone(&state.read().await.web);
+        let mut state = web.write().await;
         let sender = state
-            .web_share
+            .share
             .as_mut()
             .and_then(|web| web.sessions.get_mut(session_id))
             .and_then(|session| session.response_tx.take())

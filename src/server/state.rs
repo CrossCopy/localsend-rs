@@ -44,7 +44,13 @@ pub struct ServerState {
     pub session_timeout: std::time::Duration,
     pub receive_rate_limit_bytes_per_second: Option<u64>,
     pub pin_gate: crate::server::pin::PinGate,
-    pub web_share: Option<crate::server::web_share::WebShareState>,
+    /// The Web Share half, behind its own lock.
+    ///
+    /// Its own state rather than a field here because the five Web Share
+    /// handlers read four things and none of them belongs to the receive half —
+    /// so splitting them is what lets another crate's router mount the same
+    /// routes. See [`crate::server::web_share::WebShareHost`].
+    pub web: std::sync::Arc<tokio::sync::RwLock<crate::server::web_share::WebShareHost>>,
     /// Optional host-owned gate for File-v3 protected prepares.  `None` is the
     /// production-compatible default and makes the reserved header fail closed.
     pub crosscopy_authorized_upload_gate:
