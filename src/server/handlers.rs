@@ -209,7 +209,7 @@ async fn handle_standard_prepare_upload(
     {
         let mut state = state_ref.write().await;
         match state.pin_gate.check(params.pin.as_deref(), peer.ip()) {
-            crate::server::pin::PinVerdict::Ok => {}
+            crate::server::pin::PinVerdict::Ok { .. } => {}
             crate::server::pin::PinVerdict::Unauthorized => {
                 return StatusCode::UNAUTHORIZED.into_response();
             }

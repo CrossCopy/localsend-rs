@@ -210,7 +210,7 @@ async fn handle_prepare_download(
     }
 
     match web.pin_gate.check(query.pin.as_deref(), peer.ip()) {
-        PinVerdict::Ok => {}
+        PinVerdict::Ok { .. } => {}
         PinVerdict::Unauthorized => return StatusCode::UNAUTHORIZED.into_response(),
         PinVerdict::LockedOut => return StatusCode::TOO_MANY_REQUESTS.into_response(),
     }
