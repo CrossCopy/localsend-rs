@@ -25,6 +25,25 @@ pub const LOCKOUT: Duration = Duration::from_secs(5 * 60);
 /// device's receiver against everybody by filling the table.
 pub const MAX_TRACKED_PEERS: usize = 1024;
 
+/// How many wrong PIN *values* this gate tolerates, across every address, before
+/// [`PinGate::under_guessing_pressure`] starts saying so.
+///
+/// **Deliberately not a refusal.** The per-address lockout is what refuses; this
+/// counter exists so a consumer can decline to treat a cleared PIN as *standing*
+/// evidence — falling back to asking a person — while somebody is working
+/// through values. Making it refuse would hand anyone who can reach the port a
+/// way to lock the receiver against everybody, which is strictly worse than the
+/// guessing it would prevent.
+///
+/// It is global because the per-address counter cannot see the shape of the
+/// attack: three tries per address is a budget set by how many addresses the
+/// sender has, and one machine on the segment holds an IPv6 `/64`.
+///
+/// **No window and no timer.** It clears on the next correct PIN, which is the
+/// owner's own device sending a file, and until then the consumer asks — the
+/// safe direction, and one that needs no clock.
+pub const GUESS_PRESSURE: u32 = 10;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PinVerdict {
     /// The request may proceed.
@@ -51,6 +70,9 @@ pub enum PinVerdict {
 pub struct PinGate {
     pin: Option<String>,
     failures: HashMap<IpAddr, (u32, Instant)>, // (count, last_failure)
+    /// Wrong PIN values seen since the last correct one, across every address.
+    /// See [`GUESS_PRESSURE`].
+    wrong_values: u32,
 }
 
 impl PinGate {
@@ -58,6 +80,7 @@ impl PinGate {
         Self {
             pin,
             failures: HashMap::new(),
+            wrong_values: 0,
         }
     }
 
@@ -72,6 +95,22 @@ impl PinGate {
     pub fn set(&mut self, pin: Option<String>) {
         self.pin = pin;
         self.failures.clear();
+        // Same argument as the table: guesses at a retired secret say nothing
+        // about the new one, and leaving the count behind would keep a consumer
+        // asking about every offer for a reason nobody could see.
+        self.wrong_values = 0;
+    }
+
+    /// Whether wrong PIN values have been arriving faster than ordinary use
+    /// explains. See [`GUESS_PRESSURE`] for what this is and is not for.
+    pub fn under_guessing_pressure(&self) -> bool {
+        self.wrong_values >= GUESS_PRESSURE
+    }
+
+    /// How many wrong values have arrived since the last correct one. Exposed
+    /// for a receiver that wants to report it; it decides nothing on its own.
+    pub fn wrong_values(&self) -> u32 {
+        self.wrong_values
     }
 
     /// Whether a sender has to present a PIN at all.
@@ -123,8 +162,10 @@ impl PinGate {
 
         if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
             self.failures.remove(&peer);
+            self.wrong_values = 0;
             PinVerdict::Ok { cleared: true }
         } else {
+            self.wrong_values = self.wrong_values.saturating_add(1);
             // Only for an address not already tracked: a peer working through
             // its three guesses must not be able to evict anybody, or the bound
             // becomes the attack instead of the defence.
@@ -232,6 +273,57 @@ mod tests {
         g.check(Some("bad"), PEER);
         g.check(Some("bad"), PEER);
         assert_eq!(g.check(Some("123456"), PEER), PinVerdict::Ok { cleared: true });
+    }
+
+    #[test]
+    fn wrong_values_across_addresses_add_up_to_pressure() {
+        let mut g = PinGate::new(Some("123456".to_string()));
+        // Each from its own address, so the per-address lockout never fires and
+        // nothing here would be visible to it. That is the point: three tries
+        // per address is a budget the sender sets, not this device.
+        for n in 0..super::GUESS_PRESSURE {
+            assert!(!g.under_guessing_pressure(), "pressure at {n} guesses");
+            let peer = IpAddr::V4(Ipv4Addr::from((n + 1).to_be_bytes()));
+            assert_eq!(g.check(Some("000000"), peer), PinVerdict::Unauthorized);
+        }
+        assert!(g.under_guessing_pressure());
+        assert_eq!(g.wrong_values(), super::GUESS_PRESSURE);
+
+        // **The correct PIN clears it**, which is the owner's own device sending
+        // a file and is why this needs no timer.
+        assert_eq!(
+            g.check(Some("123456"), PEER),
+            PinVerdict::Ok { cleared: true }
+        );
+        assert!(!g.under_guessing_pressure());
+    }
+
+    #[test]
+    fn a_sender_that_offered_no_pin_does_not_raise_the_pressure_either() {
+        // The same argument as the lockout budget: presenting nothing is not a
+        // guess, and a client with no PIN field must not be able to make this
+        // device ask about every offer.
+        let mut g = PinGate::new(Some("123456".to_string()));
+        for _ in 0..(super::GUESS_PRESSURE * 3) {
+            assert_eq!(g.check(None, PEER), PinVerdict::Unauthorized);
+        }
+        assert!(!g.under_guessing_pressure());
+        assert_eq!(g.wrong_values(), 0);
+    }
+
+    #[test]
+    fn changing_the_pin_clears_the_pressure_with_the_table() {
+        let mut g = PinGate::new(Some("123456".to_string()));
+        for n in 0..super::GUESS_PRESSURE {
+            let peer = IpAddr::V4(Ipv4Addr::from((n + 1).to_be_bytes()));
+            g.check(Some("000000"), peer);
+        }
+        assert!(g.under_guessing_pressure());
+        g.set(Some("654321".to_string()));
+        assert!(
+            !g.under_guessing_pressure(),
+            "guesses at a retired secret still counted against the new one"
+        );
     }
 
     /// One address per wrong guess is a table an unauthenticated stranger
