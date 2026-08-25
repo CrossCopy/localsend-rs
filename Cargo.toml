@@ -55,7 +55,7 @@ axum = { version = "0.8", features = ["macros"] }
 # that a reqwest `Client` built BEFORE the provider is installed panics, so
 # every constructor in this crate calls `ensure_crypto_provider()` first.
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider", "charset", "http2", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls-vendored", "charset", "http2", "system-proxy"] }
 tower = "0.5"
 rustls = { version = "0.23.36", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
@@ -100,11 +100,8 @@ parking_lot = "0.12"
 [dev-dependencies]
 prost = "0.14"
 tempfile = "3"
-# Dev-only, and deliberately still on the provider-bundled `rustls` feature.
-# Dev-dependencies are never built when a consumer (the CrossCopy superproject)
-# compiles this crate, so this does NOT put aws-lc back into the shipped binary.
-# Keeping it here lets the ~20 bare `reqwest::Client::new()` calls in tests/
-# work without each one first installing a crypto provider.
-reqwest = { version = "0.13", features = ["json", "rustls"] }
+# Keep test clients on the same native TLS backend as production so the lockfile
+# does not retain the Rustls root-certificate path through dev targets.
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls-vendored"] }
 serde_json = "1.0"
 tokio = { version = "1.49", features = ["full", "test-util"] }
