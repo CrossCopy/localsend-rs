@@ -237,7 +237,10 @@ mod tests {
         let mut g = PinGate::new(Some("123456".to_string()));
         assert_eq!(g.check(None, PEER), PinVerdict::Unauthorized);
         assert_eq!(g.check(Some("000000"), PEER), PinVerdict::Unauthorized);
-        assert_eq!(g.check(Some("123456"), PEER), PinVerdict::Ok { cleared: true });
+        assert_eq!(
+            g.check(Some("123456"), PEER),
+            PinVerdict::Ok { cleared: true }
+        );
     }
 
     #[test]
@@ -248,7 +251,10 @@ mod tests {
         }
         // Ten refusals later the peer is still allowed to present the real one.
         // A client with no PIN field cannot lock its user out of a receiver.
-        assert_eq!(g.check(Some("123456"), PEER), PinVerdict::Ok { cleared: true });
+        assert_eq!(
+            g.check(Some("123456"), PEER),
+            PinVerdict::Ok { cleared: true }
+        );
     }
 
     #[test]
@@ -260,7 +266,10 @@ mod tests {
         // 4th attempt: locked, even with the right PIN
         assert_eq!(g.check(Some("123456"), PEER), PinVerdict::LockedOut);
         // a different peer is unaffected
-        assert_eq!(g.check(Some("123456"), OTHER), PinVerdict::Ok { cleared: true });
+        assert_eq!(
+            g.check(Some("123456"), OTHER),
+            PinVerdict::Ok { cleared: true }
+        );
     }
 
     #[test]
@@ -268,11 +277,17 @@ mod tests {
         let mut g = PinGate::new(Some("123456".to_string()));
         g.check(Some("bad"), PEER);
         g.check(Some("bad"), PEER);
-        assert_eq!(g.check(Some("123456"), PEER), PinVerdict::Ok { cleared: true });
+        assert_eq!(
+            g.check(Some("123456"), PEER),
+            PinVerdict::Ok { cleared: true }
+        );
         // counter reset: two more failures don't lock
         g.check(Some("bad"), PEER);
         g.check(Some("bad"), PEER);
-        assert_eq!(g.check(Some("123456"), PEER), PinVerdict::Ok { cleared: true });
+        assert_eq!(
+            g.check(Some("123456"), PEER),
+            PinVerdict::Ok { cleared: true }
+        );
     }
 
     #[test]
