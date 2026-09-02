@@ -1037,10 +1037,9 @@ mod tests {
 
     /// **A deadline keeps what answered and says it was cut short.**
     ///
-    /// TEST-NET-1 is reserved for documentation and routed nowhere, so all 253
-    /// hosts hang until `CONNECT_TIMEOUT` — one full second, and fifty at a
-    /// time, which is roughly five seconds of wall clock. The row asserts the
-    /// call comes back in well under that and reports `complete: false`.
+    /// A local listener that never sends an HTTP response makes the probe wait
+    /// without relying on routing, firewall, or instrumentation behaviour. The
+    /// row asserts the call returns promptly and reports `complete: false`.
     ///
     /// It is also the row that fails if somebody "simplifies" this into a
     /// `tokio::time::timeout` around the whole sweep: that version returns an
@@ -1048,24 +1047,36 @@ mod tests {
     /// are lost.
     #[tokio::test]
     async fn a_deadline_abandons_the_sweep_and_says_so() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stalled test listener");
+        let port = listener.local_addr().expect("listener address").port();
         let discovery = HttpDiscovery::new(
             "a test device".to_string(),
-            53317,
+            port,
             crate::protocol::Protocol::Http,
         )
         .expect("a discovery client");
 
         let started = std::time::Instant::now();
         let outcome = discovery
-            .scan_subnet_within("192.0.2.10", std::time::Duration::from_millis(300))
-            .await
-            .expect("a scan of a reserved range still runs");
+            .scan_hosts(
+                vec!["127.0.0.1".to_string()],
+                Some(std::time::Duration::from_millis(300)),
+                false,
+            )
+            .await;
 
         assert!(
             !outcome.complete,
-            "253 unroutable hosts cannot all have been probed in 300ms"
+            "the stalled probe must not complete before the deadline"
         );
-        assert!(outcome.devices.is_empty(), "nothing answers on TEST-NET-1");
+        assert!(
+            outcome.devices.is_empty(),
+            "the stalled listener found no device"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
             "the deadline must abandon the sweep, not wait for its last probe: {:?}",
