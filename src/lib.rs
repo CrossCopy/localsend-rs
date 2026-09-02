@@ -15,7 +15,11 @@ pub use core::{
     generate_file_id, get_device_model, get_device_type, get_local_ip, get_mime_type,
 };
 #[cfg(feature = "https")]
-pub use crypto::{TlsCertificate, generate_tls_certificate};
+pub use crypto::{
+    TlsCertificate, default_tls_identity_dir, generate_tls_certificate,
+    load_or_generate_default_tls_certificate, load_or_generate_tls_certificate,
+    tls_certificate_from_pem,
+};
 pub use crypto::{generate_fingerprint, sha256_from_bytes, sha256_from_file};
 pub use discovery::{
     Discovery, HttpDiscovery, MulticastConfig, MulticastDiscovery, ScanOutcome,

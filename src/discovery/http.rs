@@ -61,12 +61,33 @@ impl HttpDiscovery {
             ip: None,
         };
 
-        Ok(Self {
-            local_device: device,
-            client: build_discovery_client()?,
-            running: Arc::new(AtomicBool::new(false)),
-            tx: None,
-        })
+        Self::with_client_identity(device, None)
+    }
+
+    /// Builds a discovery client that presents the same identity as the local
+    /// LocalSend receiver. Some iOS builds require a client certificate during
+    /// the TLS handshake, including for discovery requests.
+    #[cfg(feature = "https")]
+    pub fn new_with_client_certificate(
+        alias: String,
+        port: u16,
+        protocol: Protocol,
+        certificate: &crate::crypto::TlsCertificate,
+    ) -> Result<Self> {
+        let device = DeviceInfo {
+            alias,
+            version: PROTOCOL_VERSION.to_string(),
+            device_model: Some(get_device_model()),
+            device_type: Some(get_device_type()),
+            fingerprint: certificate.fingerprint.clone(),
+            port,
+            protocol,
+            download: false,
+            ip: None,
+        };
+        let pem = format!("{}\n{}", certificate.cert_pem, certificate.key_pem);
+        let identity = reqwest::Identity::from_pem(pem.as_bytes()).map_err(LocalSendError::from)?;
+        Self::with_client_identity(device, Some(identity))
     }
 
     /// The same, for a consumer that already **is** a LocalSend device.
@@ -78,9 +99,16 @@ impl HttpDiscovery {
     /// announces — so the caller's own machine comes back as a peer, gets a row
     /// in its own device list, and can be "sent to".
     pub fn for_device(device: DeviceInfo) -> Result<Self> {
+        Self::with_client_identity(device, None)
+    }
+
+    fn with_client_identity(
+        device: DeviceInfo,
+        client_identity: Option<reqwest::Identity>,
+    ) -> Result<Self> {
         Ok(Self {
             local_device: device,
-            client: build_discovery_client()?,
+            client: build_discovery_client(client_identity)?,
             running: Arc::new(AtomicBool::new(false)),
             tx: None,
         })
@@ -92,12 +120,22 @@ impl HttpDiscovery {
     /// (spec §2.2): it finds any device whose HTTP server is reachable, even one that is
     /// missing multicast (lossy Wi-Fi, or a mobile app suspended in the background).
     ///
-    /// Probes run concurrently ([`SCAN_CONCURRENCY`] at a time). LocalSend devices use
+    /// Probes run concurrently ([`SCAN_CONCURRENCY`] at a time) on the protocol's
+    /// well-known [`crate::protocol::constants::DEFAULT_HTTP_PORT`]. LocalSend devices use
     /// self-signed certificates, so the client accepts them — the peer's real fingerprint
     /// is read from the response, so nothing is trusted blindly. Mirrors localsend-ts
     /// `HttpDiscovery` and the official `HttpScanDiscoveryService`.
+    /// A blind subnet scan never POSTs local device metadata to arbitrary hosts.
     pub async fn scan_subnet(&self, base_ip: &str) -> Result<Vec<DeviceInfo>> {
-        Ok(self.scan_hosts(subnet_hosts(base_ip)?, None).await.devices)
+        Ok(self
+            .scan_hosts(
+                subnet_hosts(base_ip)?,
+                crate::protocol::constants::DEFAULT_HTTP_PORT,
+                None,
+                false,
+            )
+            .await
+            .devices)
     }
 
     /// [`Self::scan_subnet`], abandoned after `within`.
@@ -106,7 +144,14 @@ impl HttpDiscovery {
     /// [`Self::scan_hosts`] for what "abandoned" does to the probes still in
     /// flight.
     pub async fn scan_subnet_within(&self, base_ip: &str, within: Duration) -> Result<ScanOutcome> {
-        Ok(self.scan_hosts(subnet_hosts(base_ip)?, Some(within)).await)
+        Ok(self
+            .scan_hosts(
+                subnet_hosts(base_ip)?,
+                crate::protocol::constants::DEFAULT_HTTP_PORT,
+                Some(within),
+                false,
+            )
+            .await)
     }
 
     /// Probe a caller-supplied set of hosts over the normal LocalSend `/info`
@@ -114,13 +159,32 @@ impl HttpDiscovery {
     /// reachable address but cannot enumerate it through multicast; it still
     /// performs the same TLS/HTTP negotiation, response decoding and
     /// fingerprint-based de-duplication as a subnet scan.
+    ///
+    /// Because these targets were named by the caller rather than swept for,
+    /// a host that reports no `/info` route falls back to `/register`, which
+    /// discloses this device to it. A blind [`Self::scan_subnet`] never does.
     pub async fn scan_ips(&self, ips: Vec<String>) -> Result<Vec<DeviceInfo>> {
-        Ok(self.scan_hosts(ips, None).await.devices)
+        Ok(self
+            .scan_hosts(
+                ips,
+                crate::protocol::constants::DEFAULT_HTTP_PORT,
+                None,
+                true,
+            )
+            .await
+            .devices)
     }
 
     /// [`Self::scan_ips`], abandoned after `within`.
     pub async fn scan_ips_within(&self, ips: Vec<String>, within: Duration) -> Result<ScanOutcome> {
-        Ok(self.scan_hosts(ips, Some(within)).await)
+        Ok(self
+            .scan_hosts(
+                ips,
+                crate::protocol::constants::DEFAULT_HTTP_PORT,
+                Some(within),
+                true,
+            )
+            .await)
     }
 
     /// Probe an explicit list of hosts concurrently and return the de-duplicated set of
@@ -141,10 +205,19 @@ impl HttpDiscovery {
     /// at all while fifty sockets stayed open behind it, and a caller that
     /// wrapped the whole call would report *fewer* devices than answered with
     /// no way to tell that it had.
-    async fn scan_hosts(&self, targets: Vec<String>, within: Option<Duration>) -> ScanOutcome {
+    async fn scan_hosts(
+        &self,
+        targets: Vec<String>,
+        target_port: u16,
+        within: Option<Duration>,
+        allow_register_fallback: bool,
+    ) -> ScanOutcome {
         let deadline = within.map(|within| tokio::time::Instant::now() + within);
         let probes = stream::iter(targets)
-            .map(|ip| async move { self.probe_info(&ip).await })
+            .map(|ip| async move {
+                self.probe_info(&ip, target_port, allow_register_fallback)
+                    .await
+            })
             .buffer_unordered(SCAN_CONCURRENCY);
         futures_util::pin_mut!(probes);
 
@@ -194,8 +267,27 @@ impl HttpDiscovery {
     /// HTTP-only peer (and vice-versa). A host that is unreachable at the TCP level is not
     /// retried on the other scheme — it would fail there too — which keeps the scan fast
     /// over a subnet that is mostly empty.
-    async fn probe_info(&self, ip: &str) -> Option<DeviceInfo> {
-        self.probe_peer(ip, self.local_device.port).await
+    async fn probe_info(
+        &self,
+        ip: &str,
+        port: u16,
+        allow_register_fallback: bool,
+    ) -> Option<DeviceInfo> {
+        for protocol in self.protocol_candidates() {
+            match self.probe_info_with(ip, port, protocol).await {
+                ProbeOutcome::Found(device) => return Some(device),
+                ProbeOutcome::Unreachable => return None,
+                ProbeOutcome::RegisterFallback if allow_register_fallback => {
+                    match self.probe_register_with(ip, port, protocol).await {
+                        ProbeOutcome::Found(device) => return Some(device),
+                        ProbeOutcome::Unreachable => return None,
+                        ProbeOutcome::Miss | ProbeOutcome::RegisterFallback => continue,
+                    }
+                }
+                ProbeOutcome::RegisterFallback | ProbeOutcome::Miss => continue,
+            }
+        }
+        None
     }
 
     /// Ask ONE known peer, at ITS port, whether it is still there.
@@ -214,6 +306,15 @@ impl HttpDiscovery {
             match self.probe_info_with(ip, port, protocol).await {
                 ProbeOutcome::Found(device) => return Some(device),
                 ProbeOutcome::Unreachable => return None,
+                // `/info` is the normal probe. An explicit peer can fall back
+                // to `/register` when the endpoint reports that it is absent.
+                ProbeOutcome::RegisterFallback => {
+                    match self.probe_register_with(ip, port, protocol).await {
+                        ProbeOutcome::Found(device) => return Some(device),
+                        ProbeOutcome::Unreachable => return None,
+                        ProbeOutcome::Miss | ProbeOutcome::RegisterFallback => continue,
+                    }
+                }
                 ProbeOutcome::Miss => continue,
             }
         }
@@ -242,7 +343,11 @@ impl HttpDiscovery {
             Err(_) => return ProbeOutcome::Miss,
         };
         if !response.status().is_success() {
-            return ProbeOutcome::Miss;
+            return if register_fallback_status(response.status()) {
+                ProbeOutcome::RegisterFallback
+            } else {
+                ProbeOutcome::Miss
+            };
         }
         let mut device: DeviceInfo = match response.json().await {
             Ok(device) => device,
@@ -264,6 +369,36 @@ impl HttpDiscovery {
         );
         ProbeOutcome::Found(device)
     }
+
+    /// Register with a peer when its `/info` endpoint is unavailable. This is
+    /// the official LocalSend discovery fallback and is especially important
+    /// for mobile receivers that only expose their authenticated registration
+    /// route while foregrounded.
+    async fn probe_register_with(&self, ip: &str, port: u16, protocol: Protocol) -> ProbeOutcome {
+        let url = format!("{}://{}:{}/api/localsend/v2/register", protocol, ip, port);
+        let response = match self.client.post(&url).json(&self.local_device).send().await {
+            Ok(response) => response,
+            Err(e) if e.is_timeout() => return ProbeOutcome::Unreachable,
+            Err(_) => return ProbeOutcome::Miss,
+        };
+        if !response.status().is_success() {
+            return ProbeOutcome::Miss;
+        }
+        let mut device: DeviceInfo = match response.json().await {
+            Ok(device) => device,
+            Err(_) => return ProbeOutcome::Miss,
+        };
+        device.ip = Some(ip.to_string());
+        device.port = port;
+        device.protocol = protocol;
+        tracing::info!(
+            "[DISCOVER/REGISTER] {} ({}, model: {:?})",
+            device.alias,
+            ip,
+            device.device_model
+        );
+        ProbeOutcome::Found(device)
+    }
 }
 
 /// Result of probing one host on one scheme.
@@ -274,16 +409,33 @@ enum ProbeOutcome {
     Unreachable,
     /// The host answered but not as a LocalSend peer on this scheme — try the next one.
     Miss,
+    /// `/info` reported that an explicit peer should be queried through
+    /// `/register` instead.
+    RegisterFallback,
+}
+
+/// Whether an `/info` response means "this peer does not serve `/info`", as
+/// opposed to "this peer served `/info` and said no".
+///
+/// Only the two answers that describe a missing route qualify. `401`/`403` are
+/// deliberately excluded: they mean the route exists and refused us, and an
+/// unauthenticated `/register` to the same peer would be refused for the same
+/// reason — so the retry cannot succeed, and its only effect would be to post
+/// this device's alias, model and fingerprint to a host that just declined to
+/// talk to us.
+fn register_fallback_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+    )
 }
 
 /// Host addresses `x.y.z.1..=254` in the `/24` of `base_ip`, excluding `base_ip` itself.
 fn subnet_hosts(base_ip: &str) -> Result<Vec<String>> {
-    let octets: Vec<&str> = base_ip.split('.').collect();
-    if octets.len() != 4 {
-        return Err(LocalSendError::network(format!(
-            "Invalid base IP for subnet scan: {base_ip}"
-        )));
-    }
+    let address = base_ip.parse::<std::net::Ipv4Addr>().map_err(|_| {
+        LocalSendError::network(format!("Invalid base IP for subnet scan: {base_ip}"))
+    })?;
+    let octets = address.octets();
     let prefix = format!("{}.{}.{}", octets[0], octets[1], octets[2]);
     Ok((1u8..=254)
         .map(|host| format!("{prefix}.{host}"))
@@ -334,20 +486,23 @@ pub fn local_ipv4_interfaces() -> Result<Vec<(String, std::net::Ipv4Addr)>> {
 
 /// A reqwest client tuned for LAN discovery: accepts the self-signed certificates that
 /// every LocalSend device presents, and bounds each probe so the scan finishes promptly.
-fn build_discovery_client() -> Result<Client> {
+fn build_discovery_client(client_identity: Option<reqwest::Identity>) -> Result<Client> {
     crate::crypto::ensure_crypto_provider();
-    Client::builder()
+    let mut builder = Client::builder()
         // **No proxy**, for the reason `LocalSendClient::new` says: the hosts
         // being probed are on this segment and a proxy is not on the way to
         // them — and asking the platform for its proxy configuration measured
         // 20.4 s on macOS on 2026-08-22, which a scan of 254 hosts pays before
         // the first probe leaves.
         .no_proxy()
+        .tls_backend_rustls()
         .danger_accept_invalid_certs(true)
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(LocalSendError::from)
+        .timeout(REQUEST_TIMEOUT);
+    if let Some(identity) = client_identity {
+        builder = builder.identity(identity);
+    }
+    builder.build().map_err(LocalSendError::from)
 }
 
 #[async_trait::async_trait]
@@ -426,6 +581,229 @@ mod tests {
     fn subnet_hosts_rejects_a_malformed_base_ip() {
         assert!(subnet_hosts("not.an.ip").is_err());
         assert!(subnet_hosts("192.0.2").is_err());
+        assert!(subnet_hosts("192.0.999.10").is_err());
+    }
+
+    #[test]
+    fn register_fallback_is_limited_to_missing_info_routes() {
+        assert!(super::register_fallback_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        assert!(super::register_fallback_status(
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ));
+        // A peer that answered and refused us is not a peer that is missing
+        // `/info`; retrying against `/register` only discloses who we are.
+        assert!(!super::register_fallback_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!super::register_fallback_status(
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(!super::register_fallback_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    /// A PIN-protected peer answers `/info` with 401. The scan must treat that
+    /// as "not for us" and move on, rather than posting this device's identity
+    /// to it.
+    #[tokio::test]
+    async fn a_pin_protected_peer_is_not_sent_our_identity() {
+        use crate::Protocol;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let port = listener.local_addr().expect("server address").port();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept /info");
+            let mut request = [0u8; 1024];
+            let length = stream.read(&mut request).await.expect("read /info");
+            assert!(
+                String::from_utf8_lossy(&request[..length])
+                    .starts_with("GET /api/localsend/v2/info")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write unauthorized response");
+
+            // Anything that arrives next is the alternate-scheme probe, never a
+            // registration carrying our alias and fingerprint.
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept()).await
+            {
+                let length = stream.read(&mut request).await.unwrap_or(0);
+                assert!(!String::from_utf8_lossy(&request[..length]).starts_with("POST "));
+            }
+        });
+
+        let discovery =
+            HttpDiscovery::new("scanner".into(), port, Protocol::Http).expect("build discovery");
+        assert!(discovery.probe_peer("127.0.0.1", port).await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server task did not finish")
+            .expect("server task failed");
+    }
+
+    /// The positive half of the fallback: a peer that genuinely has no `/info`
+    /// route is still found through `/register`.
+    #[tokio::test]
+    async fn a_peer_without_an_info_route_is_found_through_register() {
+        use crate::{DeviceInfo, Protocol};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let port = listener.local_addr().expect("server address").port();
+        let mut peer = DeviceInfo::new("register-only peer".into(), port, Protocol::Http);
+        peer.fingerprint = "register-only-fingerprint".into();
+        let served = peer.clone();
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept probe");
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).await.expect("read request");
+                let request = String::from_utf8_lossy(&request[..length]).into_owned();
+                let (status, body) = if request.starts_with("POST /api/localsend/v2/register") {
+                    ("200 OK", serde_json::to_vec(&served).expect("encode peer"))
+                } else {
+                    ("404 Not Found", Vec::new())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+                stream.write_all(&body).await.expect("write body");
+                if status == "200 OK" {
+                    break;
+                }
+            }
+        });
+
+        let discovery =
+            HttpDiscovery::new("scanner".into(), port, Protocol::Http).expect("build discovery");
+        let found = discovery
+            .probe_peer("127.0.0.1", port)
+            .await
+            .expect("a peer without /info must still be found through /register");
+
+        assert_eq!(found.alias, "register-only peer");
+        assert_eq!(found.ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(found.port, port);
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server task did not finish")
+            .expect("server task failed");
+    }
+
+    #[tokio::test]
+    async fn server_errors_do_not_send_local_device_metadata_to_register() {
+        use crate::Protocol;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let port = listener.local_addr().expect("server address").port();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept /info");
+            let mut request = [0u8; 1024];
+            let length = stream.read(&mut request).await.expect("read /info");
+            assert!(
+                String::from_utf8_lossy(&request[..length])
+                    .starts_with("GET /api/localsend/v2/info")
+            );
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write error response");
+
+            // The second connection is the HTTPS fallback attempt. If every
+            // non-2xx response triggered `/register`, these bytes would start
+            // with an HTTP POST instead of a TLS ClientHello.
+            let (mut stream, _) = listener.accept().await.expect("accept HTTPS fallback");
+            let length = stream
+                .read(&mut request)
+                .await
+                .expect("read HTTPS fallback");
+            assert!(!String::from_utf8_lossy(&request[..length]).starts_with("POST "));
+        });
+
+        let discovery =
+            HttpDiscovery::new("scanner".into(), port, Protocol::Http).expect("build discovery");
+        assert!(discovery.probe_peer("127.0.0.1", port).await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server task did not finish")
+            .expect("server task failed");
+    }
+
+    #[tokio::test]
+    async fn subnet_scans_do_not_register_with_a_generic_not_found_server() {
+        use crate::Protocol;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let port = listener.local_addr().expect("server address").port();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept /info");
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).await.expect("read /info");
+            assert!(
+                String::from_utf8_lossy(&request[..length])
+                    .starts_with("GET /api/localsend/v2/info")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write not-found response");
+
+            let (mut stream, _) =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .expect("subnet scan may try the alternate scheme")
+                    .expect("accept alternate scheme probe");
+            let length = stream
+                .read(&mut request)
+                .await
+                .expect("read alternate probe");
+            assert!(!String::from_utf8_lossy(&request[..length]).starts_with("POST "));
+        });
+
+        let discovery =
+            HttpDiscovery::new("scanner".into(), port, Protocol::Http).expect("build discovery");
+        let outcome = discovery
+            .scan_hosts(vec!["127.0.0.1".into()], port, None, false)
+            .await;
+        assert!(outcome.devices.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server task did not finish")
+            .expect("server task failed");
     }
 
     #[cfg(feature = "https")]
@@ -450,9 +828,9 @@ mod tests {
         let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Https)
             .expect("build discovery");
         let found = discovery
-            .scan_ips(vec!["127.0.0.1".to_string()])
+            .scan_hosts(vec!["127.0.0.1".to_string()], server.port(), None, true)
             .await
-            .expect("scan explicit loopback target");
+            .devices;
 
         let target = found
             .iter()
@@ -487,7 +865,7 @@ mod tests {
         let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Https)
             .expect("build discovery");
         let found = discovery
-            .scan_hosts(vec!["127.0.0.1".to_string()], None)
+            .scan_hosts(vec!["127.0.0.1".to_string()], server.port(), None, false)
             .await
             .devices;
 
@@ -501,14 +879,103 @@ mod tests {
         server.stop().await;
     }
 
+    /// A mobile peer may reject an unauthenticated `/info` request during the
+    /// TLS handshake but accept the protocol's authenticated `/register`
+    /// fallback. This test requires both pieces: the test server requires a
+    /// client certificate, and it only returns a device from `/register`.
+    #[cfg(feature = "https")]
+    #[tokio::test]
+    async fn https_scan_presents_client_certificate_and_falls_back_to_register() {
+        use crate::{DeviceInfo, Protocol, TlsCertificate, generate_tls_certificate};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+        use rustls::server::WebPkiClientVerifier;
+        use rustls::{RootCertStore, ServerConfig};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        fn private_key(certificate: &TlsCertificate) -> PrivateKeyDer<'static> {
+            PrivateKeyDer::from_pem_slice(certificate.key_pem.as_bytes()).expect("read private key")
+        }
+
+        let server_certificate = generate_tls_certificate().expect("generate server certificate");
+        let client_certificate = generate_tls_certificate().expect("generate client certificate");
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(client_certificate.cert_der.clone()))
+            .expect("trust the test client certificate");
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("build client certificate verifier");
+        let server_config = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![CertificateDer::from(server_certificate.cert_der.clone())],
+                private_key(&server_certificate),
+            )
+            .expect("build mutual TLS server");
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let port = listener.local_addr().expect("server address").port();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let mut peer = DeviceInfo::new("mTLS register peer".into(), port, Protocol::Https);
+        peer.fingerprint = server_certificate.fingerprint.clone();
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept probe");
+                let mut stream = acceptor.accept(stream).await.expect("client certificate");
+                let mut request = [0u8; 8192];
+                let length = stream.read(&mut request).await.expect("read request");
+                let request = String::from_utf8_lossy(&request[..length]);
+                let (status, body) = if request.starts_with("POST /api/localsend/v2/register") {
+                    ("200 OK", serde_json::to_vec(&peer).expect("encode peer"))
+                } else {
+                    ("404 Not Found", Vec::new())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response headers");
+                stream.write_all(&body).await.expect("write response body");
+            }
+        });
+
+        let discovery = HttpDiscovery::new_with_client_certificate(
+            "scanner".into(),
+            port,
+            Protocol::Https,
+            &client_certificate,
+        )
+        .expect("build mTLS discovery client");
+        let found = discovery
+            .scan_hosts(vec!["127.0.0.1".into()], port, None, true)
+            .await
+            .devices;
+
+        let found_peer = found
+            .iter()
+            .find(|device| device.fingerprint == server_certificate.fingerprint)
+            .expect("the peer must be found through /register");
+        assert_eq!(found_peer.alias, "mTLS register peer");
+        assert_eq!(found_peer.protocol, Protocol::Https);
+        server_task.await.expect("test server completed");
+    }
+
     /// A liveness check asks ONE known peer, at ITS port.
     ///
-    /// The scan path takes the port from the scanner's own device because it is
-    /// sweeping a subnet of strangers, all of which are assumed to be on the
-    /// well-known port. A peer we have already met is different: we know where
-    /// it answered, and that is not necessarily where we listen. The scanner
-    /// here is deliberately configured with the wrong port, so a probe that
-    /// used its own would find nothing.
+    /// A subnet scan uses the protocol's well-known port because it is sweeping
+    /// strangers. A peer we have already met is different: we know where it
+    /// answered, and that is not necessarily where we listen. The scanner here
+    /// is deliberately configured with the wrong port, so a probe that used its
+    /// own would find nothing.
     #[tokio::test]
     async fn probe_peer_asks_at_the_peers_own_port() {
         use crate::{LocalSendServer, Protocol};
@@ -566,34 +1033,40 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "https")]
     #[tokio::test]
     #[ignore = "requires CROSSCOPY_E2E_LOCALSEND_TARGET to name a reachable LocalSend peer"]
-    async fn scan_ips_finds_an_explicit_e2e_peer() {
-        use crate::Protocol;
+    async fn scan_ips_finds_an_explicit_e2e_peer_with_client_certificate() {
+        use crate::{Protocol, generate_tls_certificate};
 
         let target = std::env::var("CROSSCOPY_E2E_LOCALSEND_TARGET")
             .expect("set CROSSCOPY_E2E_LOCALSEND_TARGET to a LocalSend peer IP");
-        let discovery = HttpDiscovery::new("e2e-scanner".into(), 53317, Protocol::Https)
-            .expect("build discovery client");
+        let certificate = generate_tls_certificate().expect("generate client certificate");
+        let discovery = HttpDiscovery::new_with_client_certificate(
+            "e2e-scanner".into(),
+            53317,
+            Protocol::Https,
+            &certificate,
+        )
+        .expect("build mTLS discovery client");
 
         let found = discovery
             .scan_ips(vec![target.clone()])
             .await
-            .expect("probe explicit E2E target");
+            .expect("probe explicit E2E target with client certificate");
         assert!(
             found
                 .iter()
                 .any(|peer| peer.ip.as_deref() == Some(target.as_str())),
-            "the explicit LocalSend target must answer /info"
+            "the explicit LocalSend target must answer with client-certificate support"
         );
     }
 
     /// **A deadline keeps what answered and says it was cut short.**
     ///
-    /// TEST-NET-1 is reserved for documentation and routed nowhere, so all 253
-    /// hosts hang until `CONNECT_TIMEOUT` — one full second, and fifty at a
-    /// time, which is roughly five seconds of wall clock. The row asserts the
-    /// call comes back in well under that and reports `complete: false`.
+    /// A local listener that never sends an HTTP response makes the probe wait
+    /// without relying on routing, firewall, or instrumentation behaviour. The
+    /// row asserts the call returns promptly and reports `complete: false`.
     ///
     /// It is also the row that fails if somebody "simplifies" this into a
     /// `tokio::time::timeout` around the whole sweep: that version returns an
@@ -601,24 +1074,37 @@ mod tests {
     /// are lost.
     #[tokio::test]
     async fn a_deadline_abandons_the_sweep_and_says_so() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stalled test listener");
+        let port = listener.local_addr().expect("listener address").port();
         let discovery = HttpDiscovery::new(
             "a test device".to_string(),
-            53317,
+            port,
             crate::protocol::Protocol::Http,
         )
         .expect("a discovery client");
 
         let started = std::time::Instant::now();
         let outcome = discovery
-            .scan_subnet_within("192.0.2.10", std::time::Duration::from_millis(300))
-            .await
-            .expect("a scan of a reserved range still runs");
+            .scan_hosts(
+                vec!["127.0.0.1".to_string()],
+                port,
+                Some(std::time::Duration::from_millis(300)),
+                false,
+            )
+            .await;
 
         assert!(
             !outcome.complete,
-            "253 unroutable hosts cannot all have been probed in 300ms"
+            "the stalled probe must not complete before the deadline"
         );
-        assert!(outcome.devices.is_empty(), "nothing answers on TEST-NET-1");
+        assert!(
+            outcome.devices.is_empty(),
+            "the stalled listener found no device"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
             "the deadline must abandon the sweep, not wait for its last probe: {:?}",

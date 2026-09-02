@@ -2,11 +2,10 @@ use crate::DeviceInfo;
 use crate::client::{LocalSendClient, TlsTrustPolicy};
 use crate::core::file::build_file_metadata;
 use crate::crypto::generate_fingerprint;
-use crate::discovery::{Discovery, MulticastDiscovery};
+use crate::discovery::{Discovery, HttpDiscovery, MulticastDiscovery};
 use crate::protocol::types::FileMetadataDetails;
 use crate::protocol::{DeviceType, FileMetadata, Protocol};
 use clap::Parser;
-use reqwest::Client;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -30,8 +29,29 @@ pub struct SendCommand {
     send_rate_limit_kib: Option<u64>,
 }
 
+/// The TLS identity this send presents to peers. Empty without the `https`
+/// feature, where there is no certificate to present and nothing to carry.
+#[derive(Clone, Default)]
+struct ClientIdentity {
+    #[cfg(feature = "https")]
+    certificate: Option<crate::crypto::TlsCertificate>,
+}
+
+/// This machine's persistent LocalSend identity.
+///
+/// It is loaded once per run and used for both halves of a send — finding the
+/// peer and talking to it — because a peer that requires a client certificate
+/// requires it on every connection, including the discovery probe.
+fn client_identity() -> anyhow::Result<ClientIdentity> {
+    Ok(ClientIdentity {
+        #[cfg(feature = "https")]
+        certificate: Some(crate::crypto::load_or_generate_default_tls_certificate()?),
+    })
+}
+
 pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
-    let target = resolve_target(&command.target).await?;
+    let client_identity = client_identity()?;
+    let target = resolve_target(&command.target, &client_identity).await?;
     println!("Sending to: {} ({:?})", target.alias, target.ip);
 
     let sender = DeviceInfo {
@@ -45,7 +65,7 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
         download: false,
         ip: None,
     };
-    let client = build_client_for_target(sender, &target)?;
+    let client = build_client_for_target(sender, &target, &client_identity)?;
     let send_rate_limit = command
         .send_rate_limit_kib
         .map(|kib_per_second| kib_per_second.saturating_mul(1_024));
@@ -156,12 +176,24 @@ pub async fn execute(command: SendCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(feature = "https"), allow(unused_variables))]
 fn build_client_for_target(
     sender: DeviceInfo,
     target: &DeviceInfo,
+    identity: &ClientIdentity,
 ) -> anyhow::Result<LocalSendClient> {
     match target_trust_policy(target) {
-        Some(policy) => Ok(LocalSendClient::with_trust_policy(sender, policy)?),
+        Some(policy) => {
+            #[cfg(feature = "https")]
+            if let Some(certificate) = identity.certificate.as_ref() {
+                return Ok(LocalSendClient::with_trust_policy_and_client_certificate(
+                    sender,
+                    policy,
+                    certificate,
+                )?);
+            }
+            Ok(LocalSendClient::with_trust_policy(sender, policy)?)
+        }
         None => Ok(LocalSendClient::new(sender)),
     }
 }
@@ -205,7 +237,7 @@ fn split_host_port(target: &str) -> (String, Option<u16>) {
     }
 }
 
-async fn resolve_target(target: &str) -> anyhow::Result<DeviceInfo> {
+async fn resolve_target(target: &str, identity: &ClientIdentity) -> anyhow::Result<DeviceInfo> {
     let (host, explicit_port) = split_host_port(target);
     let port = explicit_port.unwrap_or(crate::protocol::constants::DEFAULT_HTTP_PORT);
 
@@ -215,7 +247,7 @@ async fn resolve_target(target: &str) -> anyhow::Result<DeviceInfo> {
             "Target is an IP address, probing {}:{} directly...",
             ip, port
         );
-        if let Ok(device) = probe_device(ip.to_string(), port).await {
+        if let Ok(device) = probe_device(ip.to_string(), port, identity).await {
             return Ok(device);
         }
         println!("Direct probe failed, falling back to discovery...");
@@ -227,6 +259,10 @@ async fn resolve_target(target: &str) -> anyhow::Result<DeviceInfo> {
         53317,
         crate::protocol::Protocol::Https,
     )?;
+    #[cfg(feature = "https")]
+    if let Some(certificate) = identity.certificate.as_ref() {
+        discovery.set_client_certificate(certificate.clone());
+    }
 
     let found_device = std::sync::Arc::new(std::sync::Mutex::new(None as Option<DeviceInfo>));
     let found_device_clone = found_device.clone();
@@ -269,43 +305,54 @@ async fn resolve_target(target: &str) -> anyhow::Result<DeviceInfo> {
     }
 }
 
-async fn probe_device(ip: String, port: u16) -> anyhow::Result<DeviceInfo> {
-    crate::crypto::ensure_crypto_provider();
-    let client = Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(2))
-        .build()?;
+#[cfg_attr(not(feature = "https"), allow(unused_variables))]
+async fn probe_device(
+    ip: String,
+    port: u16,
+    identity: &ClientIdentity,
+) -> anyhow::Result<DeviceInfo> {
+    // The probe reaches the peer at ITS port, passed to `probe_peer` below.
+    // The port carried here is the one we describe OURSELVES by if the peer
+    // only answers the `/register` fallback — it has to be the port a peer
+    // would call us back on, not the port we are calling.
+    let own_port = crate::protocol::constants::DEFAULT_HTTP_PORT;
+    let discovery = {
+        #[cfg(feature = "https")]
+        if let Some(certificate) = identity.certificate.as_ref() {
+            HttpDiscovery::new_with_client_certificate(
+                "LocalSend-Rust-Finder".to_string(),
+                own_port,
+                Protocol::Https,
+                certificate,
+            )?
+        } else {
+            HttpDiscovery::new(
+                "LocalSend-Rust-Finder".to_string(),
+                own_port,
+                Protocol::Https,
+            )?
+        }
+        #[cfg(not(feature = "https"))]
+        {
+            HttpDiscovery::new(
+                "LocalSend-Rust-Finder".to_string(),
+                own_port,
+                Protocol::Http,
+            )?
+        }
+    };
 
-    // Try HTTPS first
-    let url = format!("https://{}:{}/api/localsend/v2/info", ip, port);
-    if let Ok(resp) = client.get(&url).send().await
-        && resp.status().is_success()
-    {
-        let mut device: DeviceInfo = resp.json().await?;
-        device.ip = Some(ip.clone());
-        device.port = port;
-        device.protocol = crate::protocol::Protocol::Https; // Ensure protocol is set matches what we used
-        return Ok(device);
-    }
-
-    // Try HTTP
-    let url = format!("http://{}:{}/api/localsend/v2/info", ip, port);
-    if let Ok(resp) = client.get(&url).send().await
-        && resp.status().is_success()
-    {
-        let mut device: DeviceInfo = resp.json().await?;
-        device.ip = Some(ip.clone());
-        device.port = port;
-        device.protocol = crate::protocol::Protocol::Http;
-        return Ok(device);
-    }
-
-    anyhow::bail!("Failed to probe device at {}:{}", ip, port)
+    discovery
+        .probe_peer(&ip, port)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Failed to probe device at {}:{}", ip, port))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SendCommand, build_client_for_target, split_host_port, target_trust_policy};
+    use super::{
+        ClientIdentity, SendCommand, build_client_for_target, split_host_port, target_trust_policy,
+    };
     use crate::protocol::{DeviceInfo, Protocol};
     use clap::Parser;
 
@@ -387,7 +434,7 @@ mod tests {
         let mut target = DeviceInfo::new("receiver".to_string(), 53317, Protocol::Https);
         target.fingerprint = "not-a-certificate-fingerprint".to_string();
 
-        let error = build_client_for_target(sender, &target)
+        let error = build_client_for_target(sender, &target, &ClientIdentity::default())
             .err()
             .expect("HTTPS client must reject an invalid peer fingerprint");
 
