@@ -18,6 +18,7 @@ pub struct LocalSendClient {
     device: DeviceInfo,
     pinned_fingerprint: Option<String>,
     pinned_client: Arc<tokio::sync::Mutex<Option<HttpClient>>>,
+    client_identity: Option<reqwest::Identity>,
 }
 
 impl LocalSendClient {
@@ -36,6 +37,7 @@ impl LocalSendClient {
         crate::crypto::ensure_crypto_provider();
         let client = HttpClient::builder()
             .no_proxy()
+            .tls_backend_rustls()
             .build()
             .expect("a reqwest client with no proxy and no TLS override cannot fail to build");
         Self {
@@ -43,10 +45,54 @@ impl LocalSendClient {
             device,
             pinned_fingerprint: None,
             pinned_client: Arc::new(tokio::sync::Mutex::new(None)),
+            client_identity: None,
         }
     }
 
     pub fn with_trust_policy(device: DeviceInfo, policy: TlsTrustPolicy) -> Result<Self> {
+        Self::with_trust_policy_and_identity(device, policy, None)
+    }
+
+    /// A client that presents `certificate` to the peer during the TLS
+    /// handshake, for peers that require one.
+    ///
+    /// # Why this is not optional for some peers
+    ///
+    /// LocalSend's transport is mutually authenticated in practice even though
+    /// the spec describes only the server side: current iOS builds request a
+    /// client certificate and **abort the handshake** when none is offered, so
+    /// a client without one cannot reach any endpoint on those peers — not even
+    /// `/info`. Android builds accept a client certificate and do not require
+    /// it, so presenting one is the behaviour that works everywhere.
+    ///
+    /// # This overrides `device.fingerprint`
+    ///
+    /// The returned client announces `certificate`'s fingerprint, replacing
+    /// whatever `device` carried. In LocalSend a device *is* its certificate
+    /// fingerprint: it is what a peer stores from `/register`, what it
+    /// de-duplicates its device list on, and what it pins us to on later
+    /// connections. Announcing a fingerprint we will never present would make
+    /// this device unrecognisable the next time it connects — a new entry in
+    /// the peer's list on every run, and a pin that can never match. Passing
+    /// the two separately is exactly how they come to disagree, so they are
+    /// taken from one place.
+    #[cfg(feature = "https")]
+    pub fn with_trust_policy_and_client_certificate(
+        mut device: DeviceInfo,
+        policy: TlsTrustPolicy,
+        certificate: &crate::crypto::TlsCertificate,
+    ) -> Result<Self> {
+        device.fingerprint = certificate.fingerprint.clone();
+        let pem = format!("{}\n{}", certificate.cert_pem, certificate.key_pem);
+        let identity = reqwest::Identity::from_pem(pem.as_bytes()).map_err(LocalSendError::from)?;
+        Self::with_trust_policy_and_identity(device, policy, Some(identity))
+    }
+
+    fn with_trust_policy_and_identity(
+        device: DeviceInfo,
+        policy: TlsTrustPolicy,
+        client_identity: Option<reqwest::Identity>,
+    ) -> Result<Self> {
         crate::crypto::ensure_crypto_provider();
         let pinned_fingerprint = match &policy {
             TlsTrustPolicy::PinnedFingerprint(fingerprint) => Some(
@@ -56,23 +102,31 @@ impl LocalSendClient {
             TlsTrustPolicy::InsecureForTests => None,
         };
         let client = match policy {
-            TlsTrustPolicy::InsecureForTests => HttpClient::builder()
-                .no_proxy()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .map_err(LocalSendError::from)?,
+            TlsTrustPolicy::InsecureForTests => {
+                let mut builder = HttpClient::builder()
+                    .no_proxy()
+                    .tls_backend_rustls()
+                    .danger_accept_invalid_certs(true);
+                if let Some(identity) = client_identity.clone() {
+                    builder = builder.identity(identity);
+                }
+                builder.build().map_err(LocalSendError::from)?
+            }
             TlsTrustPolicy::PinnedFingerprint(_fingerprint) => {
                 #[cfg(feature = "https")]
                 {
-                    HttpClient::builder()
+                    let mut builder = HttpClient::builder()
                         .no_proxy()
+                        .tls_backend_rustls()
                         // This client is used only for the certificate bootstrap
                         // in `client_for_target`; all payload requests use a
                         // client pinned to the exact leaf certificate.
                         .danger_accept_invalid_certs(true)
-                        .tls_info(true)
-                        .build()
-                        .map_err(LocalSendError::from)?
+                        .tls_info(true);
+                    if let Some(identity) = client_identity.clone() {
+                        builder = builder.identity(identity);
+                    }
+                    builder.build().map_err(LocalSendError::from)?
                 }
 
                 #[cfg(not(feature = "https"))]
@@ -90,6 +144,7 @@ impl LocalSendClient {
             device,
             pinned_fingerprint,
             pinned_client: Arc::new(tokio::sync::Mutex::new(None)),
+            client_identity,
         })
     }
 
@@ -131,14 +186,17 @@ impl LocalSendClient {
         let certificate = reqwest::Certificate::from_der(certificate).map_err(|error| {
             LocalSendError::network(format!("Invalid LocalSend TLS certificate: {error}"))
         })?;
-        let client = HttpClient::builder()
+        let mut builder = HttpClient::builder()
             .no_proxy()
+            .tls_backend_rustls()
             .tls_certs_only([certificate])
             // LocalSend certificates are self-signed for the peer, not for
             // the numeric IP address used by the discovery announcement.
-            .danger_accept_invalid_hostnames(true)
-            .build()
-            .map_err(LocalSendError::from)?;
+            .danger_accept_invalid_hostnames(true);
+        if let Some(identity) = self.client_identity.clone() {
+            builder = builder.identity(identity);
+        }
+        let client = builder.build().map_err(LocalSendError::from)?;
         *pinned_client = Some(client.clone());
         Ok(client)
     }

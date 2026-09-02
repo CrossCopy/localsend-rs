@@ -9,6 +9,11 @@ documentation = "https://github.com/CrossCopy/localsend-rs#readme"
 homepage = "https://crosscopy.io"
 exclude = [".github/"]
 
+[[bin]]
+name = "localsend-rs"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [features]
 default = ["cli", "https"]
 cli = [
@@ -21,7 +26,6 @@ cli = [
 https = [
     "dep:axum-server",
     "dep:tokio-rustls",
-    "dep:rustls-pemfile",
     "dep:rcgen",
 ]
 tui = [
@@ -55,11 +59,10 @@ axum = { version = "0.8", features = ["macros"] }
 # that a reqwest `Client` built BEFORE the provider is installed panics, so
 # every constructor in this crate calls `ensure_crypto_provider()` first.
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls-vendored", "charset", "http2", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider", "charset", "http2", "system-proxy"] }
 tower = "0.5"
 rustls = { version = "0.23.36", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
-rustls-pemfile = { version = "2.2", optional = true }
 rcgen = { version = "0.14", optional = true }
 
 # Networking
@@ -100,8 +103,8 @@ parking_lot = "0.12"
 [dev-dependencies]
 prost = "0.14"
 tempfile = "3"
-# Keep test clients on the same native TLS backend as production so the lockfile
-# does not retain the Rustls root-certificate path through dev targets.
-reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls-vendored"] }
+# Keep test clients on the same rustls backend as production; the explicit
+# provider feature is required because the crate intentionally uses no-provider.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 serde_json = "1.0"
 tokio = { version = "1.49", features = ["full", "test-util"] }

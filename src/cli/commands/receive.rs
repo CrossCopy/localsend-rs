@@ -76,6 +76,13 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
         crate::protocol::Protocol::Http
     };
 
+    #[cfg(feature = "https")]
+    let tls_certificate = if https_enabled {
+        Some(crate::crypto::load_or_generate_default_tls_certificate()?)
+    } else {
+        None
+    };
+
     let mut builder = crate::server::LocalSendServer::builder()
         .alias("LocalSend-Rust".to_string())
         .port(command.port)
@@ -95,11 +102,19 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
     if let Some(ref pin) = command.pin {
         builder = builder.pin(pin.clone());
     }
+    #[cfg(feature = "https")]
+    if let Some(certificate) = tls_certificate.as_ref() {
+        builder = builder.tls_certificate(certificate.clone());
+    }
     let (mut server, mut events) = builder.build().await?;
 
     // Discovery must announce the SAME device identity the server uses.
     let mut discovery =
         crate::discovery::MulticastDiscovery::new_with_device(server.device().clone());
+    #[cfg(feature = "https")]
+    if let Some(certificate) = tls_certificate {
+        discovery.set_client_certificate(certificate);
+    }
     println!("Starting multicast discovery...");
     discovery.start().await?;
     println!("Announcing presence to network...");

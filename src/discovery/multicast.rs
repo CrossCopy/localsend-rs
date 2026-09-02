@@ -71,6 +71,8 @@ pub struct MulticastDiscovery {
     sockets: Vec<Arc<UdpSocket>>,
     running: Arc<AtomicBool>,
     tx: Option<broadcast::Sender<DeviceInfo>>,
+    #[cfg(feature = "https")]
+    client_certificate: Option<crate::crypto::TlsCertificate>,
 }
 
 impl MulticastDiscovery {
@@ -104,6 +106,8 @@ impl MulticastDiscovery {
             sockets: Vec::new(),
             running: Arc::new(AtomicBool::new(false)),
             tx: Some(tx),
+            #[cfg(feature = "https")]
+            client_certificate: None,
         })
     }
 
@@ -111,6 +115,20 @@ impl MulticastDiscovery {
     /// sockets or losing the current discovery cache.
     pub fn set_local_device(&mut self, device: DeviceInfo) {
         self.local_device = device;
+    }
+
+    /// Uses the receiver's TLS identity when answering HTTPS announcements.
+    /// The same certificate is used by the HTTP fallback and file sender, so
+    /// mobile peers requiring mutual TLS see one stable LocalSend identity.
+    #[cfg(feature = "https")]
+    pub fn set_client_certificate(&mut self, certificate: crate::crypto::TlsCertificate) {
+        // HTTPS LocalSend peers identify the sender by the presented client
+        // certificate. Keep the JSON identity and TLS identity inseparable so
+        // current iOS peers do not discard `/register` as inconsistent.
+        if self.local_device.protocol == Protocol::Https {
+            self.local_device.fingerprint = certificate.fingerprint.clone();
+        }
+        self.client_certificate = Some(certificate);
     }
 }
 
@@ -139,6 +157,8 @@ impl Discovery for MulticastDiscovery {
             let running = self.running.clone();
             let local_device = self.local_device.clone();
             let multicast_addr = SocketAddr::from((self.config.address, self.config.port));
+            #[cfg(feature = "https")]
+            let client_certificate = self.client_certificate.clone();
 
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
@@ -180,6 +200,8 @@ impl Discovery for MulticastDiscovery {
                                     if is_announcement {
                                         let local_device = local_device.clone();
                                         let socket = socket.clone();
+                                        #[cfg(feature = "https")]
+                                        let client_certificate = client_certificate.clone();
 
                                         tokio::spawn(async move {
                                             Self::respond_to_announcement(
@@ -187,6 +209,8 @@ impl Discovery for MulticastDiscovery {
                                                 &local_device,
                                                 &socket,
                                                 multicast_addr,
+                                                #[cfg(feature = "https")]
+                                                client_certificate,
                                             )
                                             .await;
                                         });
@@ -322,6 +346,29 @@ impl MulticastDiscovery {
         }
     }
 
+    #[cfg(feature = "https")]
+    fn client_for_announcement(
+        local_device: DeviceInfo,
+        target_device: &DeviceInfo,
+        client_certificate: Option<&crate::crypto::TlsCertificate>,
+    ) -> Result<LocalSendClient> {
+        match target_device.protocol {
+            Protocol::Http => Ok(LocalSendClient::new(local_device)),
+            Protocol::Https => {
+                let policy = TlsTrustPolicy::PinnedFingerprint(target_device.fingerprint.clone());
+                match client_certificate {
+                    Some(certificate) => LocalSendClient::with_trust_policy_and_client_certificate(
+                        local_device,
+                        policy,
+                        certificate,
+                    ),
+                    None => LocalSendClient::with_trust_policy(local_device, policy),
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "https"))]
     fn client_for_announcement(
         local_device: DeviceInfo,
         target_device: &DeviceInfo,
@@ -370,6 +417,7 @@ impl MulticastDiscovery {
         local_device: &DeviceInfo,
         socket: &UdpSocket,
         multicast_addr: SocketAddr,
+        #[cfg(feature = "https")] client_certificate: Option<crate::crypto::TlsCertificate>,
     ) {
         tracing::debug!(
             "Responding to announcement from {} ({:?})",
@@ -379,7 +427,16 @@ impl MulticastDiscovery {
 
         // The discovery announcement contains the peer's certificate fingerprint.
         // Use it for HTTPS registration instead of system CA verification.
-        match Self::client_for_announcement(local_device.clone(), target_device) {
+        #[cfg(feature = "https")]
+        let client_result = Self::client_for_announcement(
+            local_device.clone(),
+            target_device,
+            client_certificate.as_ref(),
+        );
+        #[cfg(not(feature = "https"))]
+        let client_result = Self::client_for_announcement(local_device.clone(), target_device);
+
+        match client_result {
             Ok(client) => match client.register(target_device).await {
                 Ok(_) => {
                     tracing::debug!(
