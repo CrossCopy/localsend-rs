@@ -120,14 +120,20 @@ impl HttpDiscovery {
     /// (spec §2.2): it finds any device whose HTTP server is reachable, even one that is
     /// missing multicast (lossy Wi-Fi, or a mobile app suspended in the background).
     ///
-    /// Probes run concurrently ([`SCAN_CONCURRENCY`] at a time). LocalSend devices use
+    /// Probes run concurrently ([`SCAN_CONCURRENCY`] at a time) on the protocol's
+    /// well-known [`crate::protocol::constants::DEFAULT_HTTP_PORT`]. LocalSend devices use
     /// self-signed certificates, so the client accepts them — the peer's real fingerprint
     /// is read from the response, so nothing is trusted blindly. Mirrors localsend-ts
     /// `HttpDiscovery` and the official `HttpScanDiscoveryService`.
     /// A blind subnet scan never POSTs local device metadata to arbitrary hosts.
     pub async fn scan_subnet(&self, base_ip: &str) -> Result<Vec<DeviceInfo>> {
         Ok(self
-            .scan_hosts(subnet_hosts(base_ip)?, None, false)
+            .scan_hosts(
+                subnet_hosts(base_ip)?,
+                crate::protocol::constants::DEFAULT_HTTP_PORT,
+                None,
+                false,
+            )
             .await
             .devices)
     }
@@ -139,7 +145,12 @@ impl HttpDiscovery {
     /// flight.
     pub async fn scan_subnet_within(&self, base_ip: &str, within: Duration) -> Result<ScanOutcome> {
         Ok(self
-            .scan_hosts(subnet_hosts(base_ip)?, Some(within), false)
+            .scan_hosts(
+                subnet_hosts(base_ip)?,
+                crate::protocol::constants::DEFAULT_HTTP_PORT,
+                Some(within),
+                false,
+            )
             .await)
     }
 
@@ -153,12 +164,27 @@ impl HttpDiscovery {
     /// a host that reports no `/info` route falls back to `/register`, which
     /// discloses this device to it. A blind [`Self::scan_subnet`] never does.
     pub async fn scan_ips(&self, ips: Vec<String>) -> Result<Vec<DeviceInfo>> {
-        Ok(self.scan_hosts(ips, None, true).await.devices)
+        Ok(self
+            .scan_hosts(
+                ips,
+                crate::protocol::constants::DEFAULT_HTTP_PORT,
+                None,
+                true,
+            )
+            .await
+            .devices)
     }
 
     /// [`Self::scan_ips`], abandoned after `within`.
     pub async fn scan_ips_within(&self, ips: Vec<String>, within: Duration) -> Result<ScanOutcome> {
-        Ok(self.scan_hosts(ips, Some(within), true).await)
+        Ok(self
+            .scan_hosts(
+                ips,
+                crate::protocol::constants::DEFAULT_HTTP_PORT,
+                Some(within),
+                true,
+            )
+            .await)
     }
 
     /// Probe an explicit list of hosts concurrently and return the de-duplicated set of
@@ -182,12 +208,16 @@ impl HttpDiscovery {
     async fn scan_hosts(
         &self,
         targets: Vec<String>,
+        target_port: u16,
         within: Option<Duration>,
         allow_register_fallback: bool,
     ) -> ScanOutcome {
         let deadline = within.map(|within| tokio::time::Instant::now() + within);
         let probes = stream::iter(targets)
-            .map(|ip| async move { self.probe_info(&ip, allow_register_fallback).await })
+            .map(|ip| async move {
+                self.probe_info(&ip, target_port, allow_register_fallback)
+                    .await
+            })
             .buffer_unordered(SCAN_CONCURRENCY);
         futures_util::pin_mut!(probes);
 
@@ -237,19 +267,18 @@ impl HttpDiscovery {
     /// HTTP-only peer (and vice-versa). A host that is unreachable at the TCP level is not
     /// retried on the other scheme — it would fail there too — which keeps the scan fast
     /// over a subnet that is mostly empty.
-    async fn probe_info(&self, ip: &str, allow_register_fallback: bool) -> Option<DeviceInfo> {
+    async fn probe_info(
+        &self,
+        ip: &str,
+        port: u16,
+        allow_register_fallback: bool,
+    ) -> Option<DeviceInfo> {
         for protocol in self.protocol_candidates() {
-            match self
-                .probe_info_with(ip, self.local_device.port, protocol)
-                .await
-            {
+            match self.probe_info_with(ip, port, protocol).await {
                 ProbeOutcome::Found(device) => return Some(device),
                 ProbeOutcome::Unreachable => return None,
                 ProbeOutcome::RegisterFallback if allow_register_fallback => {
-                    match self
-                        .probe_register_with(ip, self.local_device.port, protocol)
-                        .await
-                    {
+                    match self.probe_register_with(ip, port, protocol).await {
                         ProbeOutcome::Found(device) => return Some(device),
                         ProbeOutcome::Unreachable => return None,
                         ProbeOutcome::Miss | ProbeOutcome::RegisterFallback => continue,
@@ -403,12 +432,10 @@ fn register_fallback_status(status: reqwest::StatusCode) -> bool {
 
 /// Host addresses `x.y.z.1..=254` in the `/24` of `base_ip`, excluding `base_ip` itself.
 fn subnet_hosts(base_ip: &str) -> Result<Vec<String>> {
-    let octets: Vec<&str> = base_ip.split('.').collect();
-    if octets.len() != 4 {
-        return Err(LocalSendError::network(format!(
-            "Invalid base IP for subnet scan: {base_ip}"
-        )));
-    }
+    let address = base_ip.parse::<std::net::Ipv4Addr>().map_err(|_| {
+        LocalSendError::network(format!("Invalid base IP for subnet scan: {base_ip}"))
+    })?;
+    let octets = address.octets();
     let prefix = format!("{}.{}.{}", octets[0], octets[1], octets[2]);
     Ok((1u8..=254)
         .map(|host| format!("{prefix}.{host}"))
@@ -554,6 +581,7 @@ mod tests {
     fn subnet_hosts_rejects_a_malformed_base_ip() {
         assert!(subnet_hosts("not.an.ip").is_err());
         assert!(subnet_hosts("192.0.2").is_err());
+        assert!(subnet_hosts("192.0.999.10").is_err());
     }
 
     #[test]
@@ -769,7 +797,7 @@ mod tests {
         let discovery =
             HttpDiscovery::new("scanner".into(), port, Protocol::Http).expect("build discovery");
         let outcome = discovery
-            .scan_hosts(vec!["127.0.0.1".into()], None, false)
+            .scan_hosts(vec!["127.0.0.1".into()], port, None, false)
             .await;
         assert!(outcome.devices.is_empty());
         tokio::time::timeout(Duration::from_secs(1), server_task)
@@ -800,9 +828,9 @@ mod tests {
         let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Https)
             .expect("build discovery");
         let found = discovery
-            .scan_ips(vec!["127.0.0.1".to_string()])
+            .scan_hosts(vec!["127.0.0.1".to_string()], server.port(), None, true)
             .await
-            .expect("scan explicit loopback target");
+            .devices;
 
         let target = found
             .iter()
@@ -837,7 +865,7 @@ mod tests {
         let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Https)
             .expect("build discovery");
         let found = discovery
-            .scan_hosts(vec!["127.0.0.1".to_string()], None, false)
+            .scan_hosts(vec!["127.0.0.1".to_string()], server.port(), None, false)
             .await
             .devices;
 
@@ -928,9 +956,9 @@ mod tests {
         )
         .expect("build mTLS discovery client");
         let found = discovery
-            .scan_ips(vec!["127.0.0.1".into()])
+            .scan_hosts(vec!["127.0.0.1".into()], port, None, true)
             .await
-            .expect("scan mTLS target");
+            .devices;
 
         let found_peer = found
             .iter()
@@ -943,12 +971,11 @@ mod tests {
 
     /// A liveness check asks ONE known peer, at ITS port.
     ///
-    /// The scan path takes the port from the scanner's own device because it is
-    /// sweeping a subnet of strangers, all of which are assumed to be on the
-    /// well-known port. A peer we have already met is different: we know where
-    /// it answered, and that is not necessarily where we listen. The scanner
-    /// here is deliberately configured with the wrong port, so a probe that
-    /// used its own would find nothing.
+    /// A subnet scan uses the protocol's well-known port because it is sweeping
+    /// strangers. A peer we have already met is different: we know where it
+    /// answered, and that is not necessarily where we listen. The scanner here
+    /// is deliberately configured with the wrong port, so a probe that used its
+    /// own would find nothing.
     #[tokio::test]
     async fn probe_peer_asks_at_the_peers_own_port() {
         use crate::{LocalSendServer, Protocol};
@@ -1064,6 +1091,7 @@ mod tests {
         let outcome = discovery
             .scan_hosts(
                 vec!["127.0.0.1".to_string()],
+                port,
                 Some(std::time::Duration::from_millis(300)),
                 false,
             )
