@@ -1,6 +1,6 @@
 //! Main TUI application with async event loop.
 
-use crate::client::LocalSendClient;
+use crate::client::{LocalSendClient, TlsTrustPolicy};
 use crate::crypto::generate_fingerprint;
 use crate::discovery::{Discovery, MulticastDiscovery};
 use crate::protocol::{DeviceInfo, DeviceType, PROTOCOL_VERSION, Protocol, ReceivedFile};
@@ -37,6 +37,12 @@ enum SendKind {
     Text,
 }
 
+#[derive(Clone)]
+struct ClientIdentity {
+    #[cfg(feature = "https")]
+    certificate: Option<crate::crypto::TlsCertificate>,
+}
+
 /// Progress and completion reported by a spawned send task back to the UI loop.
 /// Send tasks run detached; without this channel a failure was silently swallowed
 /// (`let _ = send_file(...).await`) and the progress gauge never moved.
@@ -68,6 +74,7 @@ pub struct App {
 
     // Device info
     device_info: DeviceInfo,
+    client_identity: ClientIdentity,
     port: u16,
     https: bool,
     save_dir: PathBuf,
@@ -124,7 +131,8 @@ pub struct App {
 }
 
 impl App {
-    /// Create a new App instance.
+    /// Create a new App instance, using this machine's persistent LocalSend
+    /// identity when running over HTTPS.
     pub fn new(
         port: u16,
         alias: Option<String>,
@@ -132,6 +140,54 @@ impl App {
         pin: Option<String>,
         auto_accept: bool,
     ) -> Result<Self> {
+        Self::with_identity(
+            port,
+            alias,
+            https,
+            pin,
+            auto_accept,
+            Self::default_identity(https)?,
+        )
+    }
+
+    /// The identity [`App::new`] runs with: the persistent certificate this
+    /// machine announces to its peers.
+    #[cfg(feature = "https")]
+    fn default_identity(https: bool) -> Result<ClientIdentity> {
+        Ok(ClientIdentity {
+            certificate: if https {
+                Some(crate::crypto::load_or_generate_default_tls_certificate()?)
+            } else {
+                None
+            },
+        })
+    }
+
+    #[cfg(not(feature = "https"))]
+    fn default_identity(_https: bool) -> Result<ClientIdentity> {
+        Ok(ClientIdentity {})
+    }
+
+    /// [`App::new`] with the TLS identity supplied rather than read from the
+    /// user's config directory, so a test can build an app without creating —
+    /// or, worse, silently adopting — the identity of the machine it runs on.
+    fn with_identity(
+        port: u16,
+        alias: Option<String>,
+        https: bool,
+        pin: Option<String>,
+        auto_accept: bool,
+        client_identity: ClientIdentity,
+    ) -> Result<Self> {
+        #[cfg(feature = "https")]
+        let fingerprint = client_identity
+            .certificate
+            .as_ref()
+            .map(|certificate| certificate.fingerprint.clone())
+            .unwrap_or_else(generate_fingerprint);
+        #[cfg(not(feature = "https"))]
+        let fingerprint = generate_fingerprint();
+
         let device_name = alias.unwrap_or_else(|| {
             format!("LocalSend-Rust-{}", &uuid::Uuid::new_v4().to_string()[..4])
         });
@@ -141,7 +197,7 @@ impl App {
             version: PROTOCOL_VERSION.to_string(),
             device_model: Some(crate::core::device::get_device_model()),
             device_type: Some(DeviceType::Desktop),
-            fingerprint: generate_fingerprint(),
+            fingerprint,
             port,
             protocol: if https {
                 Protocol::Https
@@ -165,6 +221,7 @@ impl App {
             should_quit: false,
             screen: Screen::SendText,
             device_info: device_info.clone(),
+            client_identity,
             port,
             https,
             save_dir: save_dir.clone(),
@@ -257,6 +314,10 @@ impl App {
         let device_info = self.device_info.clone();
 
         let mut discovery = MulticastDiscovery::new_with_device(device_info.clone());
+        #[cfg(feature = "https")]
+        if let Some(certificate) = self.client_identity.certificate.as_ref() {
+            discovery.set_client_certificate(certificate.clone());
+        }
 
         discovery.on_discovered(move |device: DeviceInfo| {
             // Discovery callback runs off the UI thread; if the reader holds
@@ -297,6 +358,12 @@ impl App {
             .auto_accept(self.initial_auto_accept);
         if let Some(ref pin) = self.pin {
             builder = builder.pin(pin.clone());
+        }
+        #[cfg(feature = "https")]
+        if let Some(certificate) = self.client_identity.certificate.as_ref()
+            && self.https
+        {
+            builder = builder.tls_certificate(certificate.clone());
         }
         let (server, events) = builder.build().await?;
 
@@ -765,6 +832,7 @@ impl App {
         }
         let message = self.send_text.message().to_string();
         let device_info = self.device_info.clone();
+        let client_identity = self.client_identity.clone();
         let tx = self.send_tx.clone();
         self.send_generation = self.send_generation.wrapping_add(1);
         let generation = self.send_generation;
@@ -773,8 +841,10 @@ impl App {
         self.status_message = Some(("Sending message...".into(), MessageLevel::Info));
 
         tokio::spawn(async move {
-            let client = LocalSendClient::new(device_info);
-            let result = send_text_message(&client, &target, &message, pin.as_deref()).await;
+            let result = match build_send_client(device_info, &target, &client_identity) {
+                Ok(client) => send_text_message(&client, &target, &message, pin.as_deref()).await,
+                Err(error) => Err(error),
+            };
             let _ = tx.send(send_update_from_result(
                 generation,
                 SendKind::Text,
@@ -799,6 +869,7 @@ impl App {
             return;
         }
         let device_info = self.device_info.clone();
+        let client_identity = self.client_identity.clone();
         let tx = self.send_tx.clone();
         self.send_generation = self.send_generation.wrapping_add(1);
         let generation = self.send_generation;
@@ -815,17 +886,21 @@ impl App {
         self.status_message = Some((format!("Sending {label}..."), MessageLevel::Info));
 
         tokio::spawn(async move {
-            let client = LocalSendClient::new(device_info);
-            let tx_prog = tx.clone();
-            let cb: crate::client::client::ProgressCallback =
-                Box::new(move |sent, total, _elapsed| {
-                    let _ = tx_prog.send(SendUpdate::Progress {
-                        generation,
-                        sent,
-                        total,
-                    });
-                });
-            let result = send_file(&client, &target, &file_path, Some(cb), pin).await;
+            let result = match build_send_client(device_info, &target, &client_identity) {
+                Ok(client) => {
+                    let tx_prog = tx.clone();
+                    let cb: crate::client::client::ProgressCallback =
+                        Box::new(move |sent, total, _elapsed| {
+                            let _ = tx_prog.send(SendUpdate::Progress {
+                                generation,
+                                sent,
+                                total,
+                            });
+                        });
+                    send_file(&client, &target, &file_path, Some(cb), pin).await
+                }
+                Err(error) => Err(error),
+            };
             let _ = tx.send(send_update_from_result(
                 generation,
                 SendKind::File,
@@ -1024,6 +1099,31 @@ fn send_update_from_result(
     }
 }
 
+#[cfg_attr(not(feature = "https"), allow(unused_variables))]
+fn build_send_client(
+    sender: DeviceInfo,
+    target: &DeviceInfo,
+    identity: &ClientIdentity,
+) -> anyhow::Result<LocalSendClient> {
+    if target.protocol == Protocol::Http {
+        return Ok(LocalSendClient::new(sender));
+    }
+
+    #[cfg(feature = "https")]
+    if let Some(certificate) = identity.certificate.as_ref() {
+        return Ok(LocalSendClient::with_trust_policy_and_client_certificate(
+            sender,
+            TlsTrustPolicy::new([target.fingerprint.clone()]),
+            certificate,
+        )?);
+    }
+
+    Ok(LocalSendClient::with_trust_policy(
+        sender,
+        TlsTrustPolicy::new([target.fingerprint.clone()]),
+    )?)
+}
+
 async fn send_text_message(
     client: &LocalSendClient,
     target: &DeviceInfo,
@@ -1182,7 +1282,9 @@ fn remember_device(
 
 #[cfg(test)]
 mod tests {
-    use super::{App, SendKind, SendUpdate, remember_device, send_update_from_result};
+    use super::{
+        App, ClientIdentity, SendKind, SendUpdate, remember_device, send_update_from_result,
+    };
     use crate::protocol::{DeviceInfo, Protocol};
     use crate::tui::popup::{MessageLevel, Popup};
 
@@ -1229,6 +1331,56 @@ mod tests {
             device("self-fp", "192.168.6.250", 53317)
         ));
         assert!(devices.is_empty());
+    }
+
+    /// The fingerprint the TUI announces has to be the one a peer will see on
+    /// the certificate it presents, or a peer that pins us stops trusting us.
+    ///
+    /// The certificate is injected: reading the real one would make this pass
+    /// by adopting whatever identity the machine already has, and would create
+    /// a long-lived private key under the developer's config directory as a
+    /// side effect of `cargo test`.
+    #[cfg(feature = "https")]
+    #[test]
+    fn https_tui_advertises_the_certificate_used_by_its_server() {
+        let certificate = crate::crypto::generate_tls_certificate().expect("a test certificate");
+        let app = App::with_identity(
+            53317,
+            Some("test".into()),
+            true,
+            None,
+            false,
+            ClientIdentity {
+                certificate: Some(certificate.clone()),
+            },
+        )
+        .expect("build app");
+
+        assert_eq!(app.device_info.fingerprint, certificate.fingerprint);
+        assert_eq!(app.device_info.protocol, Protocol::Https);
+    }
+
+    /// Without HTTPS there is no certificate to be consistent with, and the
+    /// device still needs a fingerprint to identify itself by.
+    #[test]
+    fn a_plain_http_tui_still_has_a_fingerprint_and_no_certificate() {
+        let app = App::with_identity(
+            0,
+            Some("test".into()),
+            false,
+            None,
+            false,
+            ClientIdentity {
+                #[cfg(feature = "https")]
+                certificate: None,
+            },
+        )
+        .expect("build app");
+
+        assert!(!app.device_info.fingerprint.is_empty());
+        assert_eq!(app.device_info.protocol, Protocol::Http);
+        #[cfg(feature = "https")]
+        assert!(app.client_identity.certificate.is_none());
     }
 
     // App::new does no I/O (it binds nothing until run()), so it's safe to build

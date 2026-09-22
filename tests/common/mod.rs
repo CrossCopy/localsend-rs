@@ -31,6 +31,10 @@ pub fn make_random_file(dir: &Path, name: &str, size: usize) -> (PathBuf, String
 
 /// Poll GET /info until the server answers (or panic after ~5 s).
 pub async fn wait_for_http_info(port: u16) {
+    // The crate intentionally uses rustls' `-no-provider` features in
+    // production, so integration tests that construct their own reqwest
+    // clients must install the shared provider before doing so.
+    localsend_rs::crypto::ensure_crypto_provider();
     let url = format!("http://127.0.0.1:{port}/api/localsend/v2/info");
     for _ in 0..50 {
         if reqwest::get(&url).await.is_ok() {

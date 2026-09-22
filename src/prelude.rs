@@ -20,7 +20,11 @@ pub use crate::protocol::{
 pub use crate::crypto::{generate_fingerprint, sha256_from_bytes, sha256_from_file};
 
 #[cfg(feature = "https")]
-pub use crate::crypto::{TlsCertificate, generate_tls_certificate};
+pub use crate::crypto::{
+    TlsCertificate, default_tls_identity_dir, generate_tls_certificate,
+    load_or_generate_default_tls_certificate, load_or_generate_tls_certificate,
+    tls_certificate_from_pem,
+};
 
 // Client & Server
 pub use crate::client::LocalSendClient;
