@@ -214,7 +214,7 @@ fn mask24() -> Ipv4Addr {
 }
 
 #[cfg(feature = "https")]
-use crate::{DeviceInfo, LocalSendServer, Protocol};
+use crate::{DeviceInfo, LocalSendServer, Protocol, generate_tls_certificate};
 
 #[cfg(feature = "https")]
 #[tokio::test]
@@ -232,8 +232,10 @@ async fn announcement_client_pins_the_discovered_https_certificate() {
     let mut peer = server.device().clone();
     peer.ip = Some("127.0.0.1".into());
     let local = DeviceInfo::new("discovery client".into(), 0, Protocol::Https);
-    let client = MulticastDiscovery::client_for_announcement(local, &peer)
-        .expect("build a client for the announced peer");
+    let client_certificate = generate_tls_certificate().expect("generate client certificate");
+    let client =
+        MulticastDiscovery::client_for_announcement(local, &peer, Some(&client_certificate))
+            .expect("build a client for the announced peer");
 
     client
         .register(&peer)
@@ -241,6 +243,28 @@ async fn announcement_client_pins_the_discovered_https_certificate() {
         .expect("the announced certificate fingerprint should be pinned");
 
     server.stop().await;
+}
+
+#[cfg(feature = "https")]
+#[test]
+fn multicast_discovery_retains_the_configured_client_certificate() {
+    let mut discovery = MulticastDiscovery::new_with_device(DeviceInfo::new(
+        "discovery client".into(),
+        0,
+        Protocol::Https,
+    ));
+    let certificate = generate_tls_certificate().expect("generate client certificate");
+    let fingerprint = certificate.fingerprint.clone();
+    discovery.set_client_certificate(certificate);
+
+    assert_eq!(discovery.local_device.fingerprint, fingerprint);
+    assert_eq!(
+        discovery
+            .client_certificate
+            .as_ref()
+            .map(|certificate| certificate.fingerprint.as_str()),
+        Some(fingerprint.as_str())
+    );
 }
 
 #[test]

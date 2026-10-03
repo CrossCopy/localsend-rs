@@ -119,21 +119,30 @@ pub enum TransferDecision {
 pub struct PendingRequest {
     sender: DeviceInfo,
     files: HashMap<FileId, FileMetadata>,
+    authenticated_fingerprint: Option<String>,
     responder: oneshot::Sender<TransferDecision>,
 }
 
 impl PendingRequest {
-    // Not yet called outside tests: handler wiring lands in Task 2.2.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new(
         sender: DeviceInfo,
         files: HashMap<FileId, FileMetadata>,
+    ) -> (Self, oneshot::Receiver<TransferDecision>) {
+        Self::new_with_authenticated_fingerprint(sender, files, None)
+    }
+
+    pub(crate) fn new_with_authenticated_fingerprint(
+        sender: DeviceInfo,
+        files: HashMap<FileId, FileMetadata>,
+        authenticated_fingerprint: Option<String>,
     ) -> (Self, oneshot::Receiver<TransferDecision>) {
         let (tx, rx) = oneshot::channel();
         (
             Self {
                 sender,
                 files,
+                authenticated_fingerprint,
                 responder: tx,
             },
             rx,
@@ -146,6 +155,14 @@ impl PendingRequest {
 
     pub fn files(&self) -> &HashMap<FileId, FileMetadata> {
         &self.files
+    }
+
+    /// SHA-256 fingerprint of the client certificate verified by this HTTPS
+    /// connection. `None` means the peer did not present a certificate or the
+    /// server is running over plain HTTP; callers must not substitute the
+    /// fingerprint claimed in [`Self::sender`] for security decisions.
+    pub fn authenticated_fingerprint(&self) -> Option<&str> {
+        self.authenticated_fingerprint.as_deref()
     }
 
     /// Accept every offered file. No-op if the sender already timed out.
