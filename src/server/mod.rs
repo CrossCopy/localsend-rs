@@ -6,6 +6,7 @@ pub mod server;
 pub mod web_share;
 
 pub(crate) mod handlers;
+pub(crate) mod identity;
 /// Receiver-side PIN enforcement.
 ///
 /// **Public because a consumer that serves the v2 routes from its own router
