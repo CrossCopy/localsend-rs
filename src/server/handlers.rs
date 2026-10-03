@@ -6,7 +6,7 @@ use super::events::ServerEvent;
 use super::state::{CrossCopyAuthorizedSession, ServerState, write_body_to_file_with_progress};
 use crate::protocol::{DeviceInfo, FileId, PrepareUploadRequest, PrepareUploadResponse, SessionId};
 use axum::{
-    Json,
+    Extension, Json,
     body::Body,
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
@@ -19,6 +19,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
+fn same_fingerprint(left: &str, right: &str) -> bool {
+    let left = left.chars().filter(|character| *character != ':');
+    let right = right.chars().filter(|character| *character != ':');
+    left.clone().next().is_some()
+        && left
+            .map(|character| character.to_ascii_lowercase())
+            .eq(right.map(|character| character.to_ascii_lowercase()))
+}
+
 pub(crate) async fn handle_info(State(state): State<Arc<RwLock<ServerState>>>) -> Response {
     let state = state.read().await;
     Json(state.device.clone()).into_response()
@@ -27,9 +36,15 @@ pub(crate) async fn handle_info(State(state): State<Arc<RwLock<ServerState>>>) -
 pub(crate) async fn handle_register(
     State(state): State<Arc<RwLock<ServerState>>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    identity: Option<Extension<super::identity::AuthenticatedPeer>>,
     Json(mut remote_device): Json<DeviceInfo>,
 ) -> Response {
     tracing::debug!("Register request from {:?}", remote_device.alias);
+    if identity.as_ref().is_some_and(|identity| {
+        !same_fingerprint(identity.fingerprint(), &remote_device.fingerprint)
+    }) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let state = state.read().await;
     // Prefer the address we actually received the request from over the one the
     // body claims. The socket cannot be wished into being wrong, and the
@@ -91,6 +106,7 @@ impl Drop for ReservationGuard {
 pub(crate) async fn handle_prepare_upload(
     State(state_ref): State<Arc<RwLock<ServerState>>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    identity: Option<Extension<super::identity::AuthenticatedPeer>>,
     Query(params): Query<PrepareUploadParams>,
     headers: HeaderMap,
     Json(request): Json<PrepareUploadRequest>,
@@ -98,7 +114,14 @@ pub(crate) async fn handle_prepare_upload(
     if headers.contains_key(CROSSCOPY_FILE_V3_HANDOFF_HEADER) {
         return handle_crosscopy_authorized_prepare(state_ref, headers, request).await;
     }
-    handle_standard_prepare_upload(state_ref, peer, params, request).await
+    handle_standard_prepare_upload(
+        state_ref,
+        peer,
+        identity.map(|Extension(identity)| identity),
+        params,
+        request,
+    )
+    .await
 }
 
 async fn handle_crosscopy_authorized_prepare(
@@ -200,9 +223,19 @@ async fn handle_crosscopy_authorized_prepare(
 async fn handle_standard_prepare_upload(
     state_ref: Arc<RwLock<ServerState>>,
     peer: std::net::SocketAddr,
+    identity: Option<super::identity::AuthenticatedPeer>,
     params: PrepareUploadParams,
     request: PrepareUploadRequest,
 ) -> Response {
+    if identity.as_ref().is_some_and(|identity| {
+        !same_fingerprint(identity.fingerprint(), &request.info.fingerprint)
+    }) {
+        tracing::warn!(
+            peer = %peer,
+            "Rejected a prepare-upload whose claimed fingerprint did not match its client certificate"
+        );
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     // PIN gate runs first, before any session/event work -- a locked-out or
     // unauthenticated peer must never reach the accept flow (which would
     // otherwise answer with 403/409 instead of the correct 401/429).
@@ -309,7 +342,11 @@ async fn handle_standard_prepare_upload(
         crate::server::events::TransferDecision::Accept
     } else {
         let (pending_request, decision_rx) =
-            crate::server::events::PendingRequest::new(request.info.clone(), request.files.clone());
+            crate::server::events::PendingRequest::new_with_authenticated_fingerprint(
+                request.info.clone(),
+                request.files.clone(),
+                identity.map(|identity| identity.fingerprint().to_owned()),
+            );
         if events_tx
             .send(crate::server::events::ServerEvent::TransferRequest(
                 pending_request,
@@ -455,6 +492,8 @@ struct ReceiveProgressContext {
 }
 
 impl ReceiveProgressContext {
+    // Keep compatibility with Rust versions before AtomicU64::try_update.
+    #[allow(deprecated)]
     fn add(&self, amount: u64) {
         let previous = self
             .received_bytes
@@ -465,6 +504,7 @@ impl ReceiveProgressContext {
         self.emit(previous.saturating_add(amount).min(self.total_bytes));
     }
 
+    #[allow(deprecated)]
     fn rollback(&self, amount: u64) {
         let previous = self
             .received_bytes

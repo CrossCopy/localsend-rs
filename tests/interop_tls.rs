@@ -1,11 +1,54 @@
 #![cfg(feature = "https")]
 
 use localsend_rs::{
-    DeviceInfo, FileId, FileMetadata, LocalSendClient, LocalSendServer, Protocol, SessionId,
-    TlsTrustPolicy, Token, generate_tls_certificate,
+    DeviceInfo, FileId, FileMetadata, LocalSendClient, LocalSendServer, PrepareUploadRequest,
+    Protocol, SessionId, TlsCertificate, TlsTrustPolicy, Token, generate_tls_certificate,
+    server::ServerEvent, tls_certificate_from_pem,
 };
 use std::collections::HashMap;
 use std::time::Duration;
+
+fn expired_client_certificate() -> localsend_rs::TlsCertificate {
+    let key = rcgen::KeyPair::generate().expect("expired certificate key");
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".into()])
+        .expect("expired certificate parameters");
+    params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+    let certificate = params
+        .self_signed(&key)
+        .expect("expired self-signed certificate");
+    tls_certificate_from_pem(certificate.pem(), key.serialize_pem())
+        .expect("expired LocalSend certificate")
+}
+
+fn offered_files(name: &str) -> HashMap<FileId, FileMetadata> {
+    let id = FileId::new();
+    HashMap::from([(
+        id.clone(),
+        FileMetadata {
+            id,
+            file_name: name.into(),
+            size: 1,
+            file_type: "text/plain".into(),
+            sha256: None,
+            preview: None,
+            metadata: None,
+        },
+    )])
+}
+
+fn raw_https_client(certificate: Option<&TlsCertificate>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true);
+    if let Some(certificate) = certificate {
+        let pem = format!("{}\n{}", certificate.cert_pem, certificate.key_pem);
+        builder = builder.identity(
+            reqwest::Identity::from_pem(pem.as_bytes()).expect("raw test client identity"),
+        );
+    }
+    builder.build().expect("raw HTTPS test client")
+}
 
 #[tokio::test]
 async fn builder_uses_the_supplied_certificate_fingerprint_for_https() {
@@ -132,6 +175,273 @@ async fn pinned_client_rejects_a_non_matching_self_signed_leaf() {
         .expect("pinned client");
 
     assert!(client.register(&target).await.is_err());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn receiver_exposes_the_authenticated_client_certificate_fingerprint() {
+    let output = tempfile::tempdir().expect("output directory");
+    let client_certificate = generate_tls_certificate().expect("client certificate");
+    let expected_fingerprint = client_certificate.fingerprint.clone();
+    let (mut server, mut events) = LocalSendServer::builder()
+        .alias("Authenticated receiver")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Https)
+        .build()
+        .await
+        .expect("start HTTPS receiver");
+
+    let mut target = server.device().clone();
+    target.ip = Some("127.0.0.1".into());
+    let sender = DeviceInfo::new("Authenticated sender".into(), 0, Protocol::Https);
+    let client = LocalSendClient::with_trust_policy_and_client_certificate(
+        sender,
+        TlsTrustPolicy::new([target.fingerprint.clone()]),
+        &client_certificate,
+    )
+    .expect("mTLS client");
+    let file_id = FileId::new();
+    let files = HashMap::from([(
+        file_id.clone(),
+        FileMetadata {
+            id: file_id,
+            file_name: "identity.txt".into(),
+            size: 1,
+            file_type: "text/plain".into(),
+            sha256: None,
+            preview: None,
+            metadata: None,
+        },
+    )]);
+
+    let request = tokio::spawn(async move { client.prepare_upload(&target, files, None).await });
+    let received_fingerprint = match tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("receive event before timeout")
+        .expect("server event stream")
+    {
+        ServerEvent::TransferRequest(request) => {
+            let fingerprint = request.authenticated_fingerprint().map(str::to_owned);
+            request.decline();
+            fingerprint
+        }
+        event => panic!("expected transfer request, got {event:?}"),
+    };
+    assert_eq!(
+        received_fingerprint.as_deref(),
+        Some(expected_fingerprint.as_str())
+    );
+    assert!(request.await.expect("request task").is_err());
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn receiver_rejects_an_expired_client_certificate_during_the_tls_handshake() {
+    assert_receiver_rejects_certificate(expired_client_certificate()).await;
+}
+
+#[tokio::test]
+async fn receiver_rejects_a_client_certificate_with_an_invalid_self_signature() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let mut certificate = generate_tls_certificate().expect("client certificate");
+    *certificate
+        .cert_der
+        .last_mut()
+        .expect("certificate signature") ^= 1;
+    certificate.cert_pem = format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        STANDARD.encode(&certificate.cert_der)
+    );
+    // Keep the claim consistent with the tampered leaf: only the certificate
+    // validation, not a later metadata mismatch, should reject this client.
+    certificate.fingerprint = localsend_rs::sha256_from_bytes(&certificate.cert_der);
+    assert_receiver_rejects_certificate(certificate).await;
+}
+
+async fn assert_receiver_rejects_certificate(client_certificate: TlsCertificate) {
+    let output = tempfile::tempdir().expect("output directory");
+    let (mut server, _events) = LocalSendServer::builder()
+        .alias("Certificate-validating receiver")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Https)
+        .build()
+        .await
+        .expect("start HTTPS receiver");
+
+    let mut target = server.device().clone();
+    target.ip = Some("127.0.0.1".into());
+    let sender = DeviceInfo::new("Invalid certificate sender".into(), 0, Protocol::Https);
+    let client = LocalSendClient::with_trust_policy_and_client_certificate(
+        sender,
+        TlsTrustPolicy::new([target.fingerprint.clone()]),
+        &client_certificate,
+    )
+    .expect("mTLS client with invalid certificate");
+
+    assert!(
+        client.register(&target).await.is_err(),
+        "an invalid peer certificate must fail before any HTTP request is served"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn receiver_rejects_claimed_fingerprints_that_do_not_match_the_client_certificate() {
+    let output = tempfile::tempdir().expect("output directory");
+    let client_certificate = generate_tls_certificate().expect("client certificate");
+    let (mut server, mut events) = LocalSendServer::builder()
+        .alias("Fingerprint-checking receiver")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Https)
+        .build()
+        .await
+        .expect("start HTTPS receiver");
+    let base = format!("https://127.0.0.1:{}/api/localsend/v2", server.port());
+    let client = raw_https_client(Some(&client_certificate));
+    let mut impostor = DeviceInfo::new("Impostor".into(), 0, Protocol::Https);
+    impostor.fingerprint = "f".repeat(64);
+
+    let register = client
+        .post(format!("{base}/register"))
+        .json(&impostor)
+        .send()
+        .await
+        .expect("register response");
+    assert_eq!(register.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), events.recv())
+            .await
+            .is_err(),
+        "a mismatched registration must not emit PeerRegistered"
+    );
+
+    let prepare = client
+        .post(format!("{base}/prepare-upload"))
+        .json(&PrepareUploadRequest {
+            info: impostor,
+            files: offered_files("mismatch.txt"),
+        })
+        .send()
+        .await
+        .expect("prepare-upload response");
+    assert_eq!(prepare.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), events.recv())
+            .await
+            .is_err(),
+        "a mismatched upload offer must not reach the consent event stream"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn https_without_a_client_certificate_stays_compatible_but_is_not_authenticated() {
+    let output = tempfile::tempdir().expect("output directory");
+    let (mut server, mut events) = LocalSendServer::builder()
+        .alias("Browser-compatible receiver")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Https)
+        .build()
+        .await
+        .expect("start HTTPS receiver");
+    let url = format!(
+        "https://127.0.0.1:{}/api/localsend/v2/prepare-upload",
+        server.port()
+    );
+    let client = raw_https_client(None);
+    let sender = DeviceInfo::new("Certificate-less sender".into(), 0, Protocol::Https);
+    let request = tokio::spawn(async move {
+        client
+            .post(url)
+            .json(&PrepareUploadRequest {
+                info: sender,
+                files: offered_files("no-certificate.txt"),
+            })
+            .send()
+            .await
+    });
+
+    match tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("receive event before timeout")
+        .expect("server event stream")
+    {
+        ServerEvent::TransferRequest(request) => {
+            assert_eq!(request.authenticated_fingerprint(), None);
+            request.decline();
+        }
+        event => panic!("expected transfer request, got {event:?}"),
+    }
+    assert_eq!(
+        request
+            .await
+            .expect("request task")
+            .expect("prepare-upload response")
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn plain_http_requests_never_gain_an_authenticated_certificate_identity() {
+    let output = tempfile::tempdir().expect("output directory");
+    let (mut server, mut events) = LocalSendServer::builder()
+        .alias("Plain HTTP receiver")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Http)
+        .build()
+        .await
+        .expect("start HTTP receiver");
+    let url = format!(
+        "http://127.0.0.1:{}/api/localsend/v2/prepare-upload",
+        server.port()
+    );
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP test client");
+    let sender = DeviceInfo::new("HTTP sender".into(), 0, Protocol::Http);
+    let request = tokio::spawn(async move {
+        client
+            .post(url)
+            .json(&PrepareUploadRequest {
+                info: sender,
+                files: offered_files("plain-http.txt"),
+            })
+            .send()
+            .await
+    });
+
+    match tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("receive event before timeout")
+        .expect("server event stream")
+    {
+        ServerEvent::TransferRequest(request) => {
+            assert_eq!(request.authenticated_fingerprint(), None);
+            request.decline();
+        }
+        event => panic!("expected transfer request, got {event:?}"),
+    }
+    assert_eq!(
+        request
+            .await
+            .expect("request task")
+            .expect("prepare-upload response")
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
     server.stop().await;
 }
 
