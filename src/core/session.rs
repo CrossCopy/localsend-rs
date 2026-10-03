@@ -19,6 +19,7 @@ enum ReceivePhase {
 struct ReceiveSlot {
     phase: ReceivePhase,
     cancellation: CancellationToken,
+    active: bool,
 }
 
 #[derive(Debug)]
@@ -47,7 +48,9 @@ impl StandardReceiveLease {
     /// Atomically chooses publication over cancellation. Once this succeeds,
     /// session cancellation must wait for the handler to publish and record
     /// the file rather than clearing its owning session underneath it.
-    pub(crate) fn begin_publication(mut self) -> Option<StandardPublicationPermit> {
+    // Keep ownership on failure: the handler must still abort its pending sink
+    // before cancellation can consider this receive settled.
+    pub(crate) fn begin_publication(&mut self) -> Option<StandardPublicationPermit> {
         let transitioned = {
             let mut lifecycle = self.lifecycle.lock();
             let slot = lifecycle.slots.get_mut(&self.file_id)?;
@@ -78,10 +81,11 @@ impl Drop for StandardReceiveLease {
             return;
         }
         let mut lifecycle = self.lifecycle.lock();
-        if let Some(slot) = lifecycle.slots.get_mut(&self.file_id)
-            && slot.phase == ReceivePhase::Receiving
-        {
-            slot.phase = ReceivePhase::Ready;
+        if let Some(slot) = lifecycle.slots.get_mut(&self.file_id) {
+            slot.active = false;
+            if slot.phase == ReceivePhase::Receiving {
+                slot.phase = ReceivePhase::Ready;
+            }
         }
     }
 }
@@ -104,6 +108,7 @@ impl StandardPublicationPermit {
             .expect("publication file remains in its session lifecycle");
         debug_assert_eq!(slot.phase, ReceivePhase::Publishing);
         slot.phase = ReceivePhase::Published;
+        slot.active = false;
         self.armed = false;
     }
 }
@@ -114,10 +119,11 @@ impl Drop for StandardPublicationPermit {
             return;
         }
         let mut lifecycle = self.lifecycle.lock();
-        if let Some(slot) = lifecycle.slots.get_mut(&self.file_id)
-            && slot.phase == ReceivePhase::Publishing
-        {
-            slot.phase = ReceivePhase::Ready;
+        if let Some(slot) = lifecycle.slots.get_mut(&self.file_id) {
+            slot.active = false;
+            if slot.phase == ReceivePhase::Publishing {
+                slot.phase = ReceivePhase::Ready;
+            }
         }
     }
 }
@@ -157,6 +163,7 @@ impl Session {
                         ReceiveSlot {
                             phase: ReceivePhase::Ready,
                             cancellation: CancellationToken::new(),
+                            active: false,
                         },
                     )
                 })
@@ -209,6 +216,7 @@ impl Session {
                 return None;
             }
             slot.phase = ReceivePhase::Receiving;
+            slot.active = true;
             slot.cancellation.clone()
         };
         Some(StandardReceiveLease {
@@ -240,6 +248,16 @@ impl Session {
             }
         }
         true
+    }
+
+    /// Includes a handler that has acquired its lease but has not entered the
+    /// receive sink yet. Waiting only for open filesystem writers misses it.
+    pub(crate) fn receives_settled(&self) -> bool {
+        self.receive_lifecycle
+            .lock()
+            .slots
+            .values()
+            .all(|slot| !slot.active)
     }
 
     /// Record a completed file. Returns true when every file has arrived.
@@ -292,6 +310,22 @@ mod tests {
         assert_eq!(session.files.len(), 1);
         assert_eq!(session.tokens.len(), 1);
         assert!(!session.is_timed_out(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn failed_publication_keeps_the_receive_active_until_cleanup_finishes() {
+        let files = create_test_files();
+        let id = files.keys().next().unwrap().clone();
+        let session = Session::new("sender".into(), files);
+        let mut lease = session.begin_receive(&id).unwrap();
+        assert!(session.try_cancel_receives());
+        assert!(lease.begin_publication().is_none());
+        assert!(
+            !session.receives_settled(),
+            "the handler still owns pending sink cleanup"
+        );
+        drop(lease);
+        assert!(session.receives_settled());
     }
 
     #[test]
