@@ -355,6 +355,13 @@ async fn handle_standard_prepare_upload(
     // answer the sender differently and only one of them is worth retrying.
     if let crate::server::events::TransferDecision::Refuse { reason } = &decision {
         let mut state = state_ref.write().await;
+        if state
+            .current_session
+            .as_ref()
+            .is_none_or(|session| session.id != reserved)
+        {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         if let Some(session) = &state.current_session {
             let _ = session.try_cancel_receives();
         }
@@ -375,6 +382,13 @@ async fn handle_standard_prepare_upload(
 
     if accepted_ids.is_empty() {
         let mut state = state_ref.write().await;
+        if state
+            .current_session
+            .as_ref()
+            .is_none_or(|session| session.id != reserved)
+        {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         if let Some(session) = &state.current_session {
             let _ = session.try_cancel_receives();
         }
@@ -398,6 +412,15 @@ async fn handle_standard_prepare_upload(
 
     {
         let mut state = state_ref.write().await;
+        // A receiver-side cancellation can arrive after the decision was read.
+        // Never revive that cancelled offer or replace a newer reservation.
+        if state
+            .current_session
+            .as_ref()
+            .is_none_or(|placeholder| placeholder.id != reserved)
+        {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         if let Some(placeholder) = &state.current_session {
             let _ = placeholder.try_cancel_receives();
         }
@@ -455,6 +478,8 @@ struct ReceiveProgressContext {
 }
 
 impl ReceiveProgressContext {
+    // Keep compatibility with Rust versions before AtomicU64::try_update.
+    #[allow(deprecated)]
     fn add(&self, amount: u64) {
         let previous = self
             .received_bytes
@@ -465,6 +490,7 @@ impl ReceiveProgressContext {
         self.emit(previous.saturating_add(amount).min(self.total_bytes));
     }
 
+    #[allow(deprecated)]
     fn rollback(&self, amount: u64) {
         let previous = self
             .received_bytes
@@ -594,7 +620,7 @@ pub(crate) async fn handle_upload(
         receive_rate_limit_bytes_per_second,
         save_dir,
         sink,
-        receive_lease,
+        mut receive_lease,
     ) = if let Some(session) = &state.current_session {
         if session.id != params.session_id {
             tracing::warn!(
