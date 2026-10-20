@@ -1,3 +1,9 @@
+// Xross change (2026-10-20, D-20261020-K): `upload_reader` uploads from a
+// reader the caller already opened, with the size the caller already measured
+// from it, and `upload_file_with_rate_limit` now goes through the same body
+// (`upload_stream`). Added for xross-dev's LocalSend sender, which must send
+// the descriptor it verified against the file a person chose rather than
+// whatever the path names once the receiver answers `prepare-upload`.
 use crate::client::trust_policy::TlsTrustPolicy;
 use crate::error::{LocalSendError, Result};
 use crate::protocol::{
@@ -9,6 +15,7 @@ use std::collections::HashMap;
 #[cfg(feature = "https")]
 use std::sync::Arc;
 use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio_util::io::ReaderStream;
 
 pub type ProgressCallback = Box<dyn Fn(u64, u64, f64) + Send + Sync>;
@@ -198,6 +205,75 @@ impl LocalSendClient {
         progress: Option<ProgressCallback>,
         rate_limit_bytes_per_second: Option<u64>,
     ) -> Result<()> {
+        // Stream the file instead of loading it all into memory
+        let file = File::open(file_path).await?;
+        let total_bytes = file.metadata().await?.len();
+        self.upload_stream(
+            target,
+            session_id,
+            file_id,
+            token,
+            file,
+            total_bytes,
+            progress,
+            rate_limit_bytes_per_second,
+        )
+        .await
+    }
+
+    /// Uploads from a reader the caller already holds, declaring `total_bytes`.
+    ///
+    /// **For a sender that must not reopen by path.** `upload_file` opens the
+    /// path when the upload starts, which is after the receiver answered
+    /// `prepare-upload` — a window in which the name can be pointed at another
+    /// file. A caller that opened and checked the file earlier passes that
+    /// descriptor here, with the size it measured from the same descriptor.
+    ///
+    /// At most `total_bytes` are read, so the body never exceeds what the offer
+    /// and `Content-Length` declared; a reader that ends early fails the upload
+    /// rather than sending a short file as complete.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_reader<R>(
+        &self,
+        target: &DeviceInfo,
+        session_id: &SessionId,
+        file_id: &FileId,
+        token: &Token,
+        reader: R,
+        total_bytes: u64,
+        progress: Option<ProgressCallback>,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Send + Sync + 'static,
+    {
+        self.upload_stream(
+            target,
+            session_id,
+            file_id,
+            token,
+            reader.take(total_bytes),
+            total_bytes,
+            progress,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_stream<R>(
+        &self,
+        target: &DeviceInfo,
+        session_id: &SessionId,
+        file_id: &FileId,
+        token: &Token,
+        file: R,
+        total_bytes: u64,
+        progress: Option<ProgressCallback>,
+        rate_limit_bytes_per_second: Option<u64>,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Send + Sync + 'static,
+    {
         let ip = target
             .ip
             .as_ref()
@@ -206,10 +282,6 @@ impl LocalSendClient {
             "{}://{}:{}/api/localsend/v2/upload?sessionId={}&fileId={}&token={}",
             target.protocol, ip, target.port, session_id, file_id, token
         );
-
-        // Stream the file instead of loading it all into memory
-        let file = File::open(file_path).await?;
-        let total_bytes = file.metadata().await?.len();
         let started = std::time::Instant::now();
         let progress = progress.map(std::sync::Arc::new);
 
