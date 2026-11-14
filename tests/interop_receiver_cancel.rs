@@ -11,6 +11,8 @@ use std::{
 use tokio::sync::{Notify, mpsc};
 
 fn client() -> reqwest::Client {
+    // Test clients use rustls without a bundled provider since #4.
+    localsend_rs::crypto::ensure_crypto_provider();
     reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
