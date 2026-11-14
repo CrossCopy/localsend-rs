@@ -9,9 +9,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-#[cfg(feature = "https")]
-use axum_server::tls_rustls::RustlsConfig;
-
 pub struct LocalSendServer {
     device: DeviceInfo,
     save_dir: PathBuf,
@@ -99,22 +96,12 @@ impl LocalSendServer {
             #[cfg(feature = "https")]
             {
                 crate::crypto::ensure_crypto_provider();
-                let (cert_pem, key_pem) = if let Some(ref cert) = self.tls_cert {
-                    (cert.cert_pem.clone(), cert.key_pem.clone())
+                let certificate = if let Some(ref certificate) = self.tls_cert {
+                    certificate.clone()
                 } else {
-                    let cert = crate::crypto::generate_tls_certificate()?;
-                    (cert.cert_pem, cert.key_pem)
+                    crate::crypto::generate_tls_certificate()?
                 };
-
-                let tls_config =
-                    RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes())
-                        .await
-                        .map_err(|e| {
-                            crate::error::LocalSendError::network(format!(
-                                "TLS config error: {}",
-                                e
-                            ))
-                        })?;
+                let tls_acceptor = super::identity::IdentityAcceptor::new(&certificate)?;
 
                 // Bind before spawn so the real (possibly OS-assigned) port is
                 // known before the ServerState/router are built.
@@ -150,13 +137,14 @@ impl LocalSendServer {
                 self.state = Some(state.clone());
                 let router = super::routes::create_router(state.clone(), Arc::clone(&web));
 
-                let server = axum_server::from_tcp_rustls(std_listener, tls_config)
+                let server = axum_server::from_tcp(std_listener)
                     .map_err(|e| {
                         crate::error::LocalSendError::network(format!(
                             "Failed to serve HTTPS listener: {}",
                             e
                         ))
                     })?
+                    .acceptor(tls_acceptor)
                     .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>());
 
                 let handle = tokio::spawn(async move {

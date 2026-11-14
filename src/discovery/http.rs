@@ -122,9 +122,10 @@ impl HttpDiscovery {
     ///
     /// Probes run concurrently ([`SCAN_CONCURRENCY`] at a time) on the port configured
     /// for this discovery instance. LocalSend devices use self-signed certificates, so
-    /// the client accepts them — the peer's real fingerprint is read from the response,
-    /// so nothing is trusted blindly. Mirrors localsend-ts `HttpDiscovery` and the
-    /// official `HttpScanDiscoveryService`.
+    /// the client accepts them; over HTTPS the peer's identity is derived from the leaf
+    /// certificate in the TLS handshake rather than the fingerprint claimed by the JSON
+    /// response. Mirrors localsend-ts `HttpDiscovery` and the official
+    /// `HttpScanDiscoveryService`.
     /// A blind subnet scan never POSTs local device metadata to arbitrary hosts.
     pub async fn scan_subnet(&self, base_ip: &str) -> Result<Vec<DeviceInfo>> {
         Ok(self
@@ -334,10 +335,20 @@ impl HttpDiscovery {
                 ProbeOutcome::Miss
             };
         }
+        let certificate_fingerprint = match response_certificate_fingerprint(&response, protocol) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                tracing::debug!("[DISCOVER/TCP] Ignoring {ip}:{port}: {error}");
+                return ProbeOutcome::Miss;
+            }
+        };
         let mut device: DeviceInfo = match response.json().await {
             Ok(device) => device,
             Err(_) => return ProbeOutcome::Miss,
         };
+        if let Some(fingerprint) = certificate_fingerprint {
+            device.fingerprint = fingerprint;
+        }
         device.ip = Some(ip.to_string());
         // The port we actually reached it on, not ours. The official app omits
         // `port` from `/info`, so the connection is the only evidence of where
@@ -369,10 +380,20 @@ impl HttpDiscovery {
         if !response.status().is_success() {
             return ProbeOutcome::Miss;
         }
+        let certificate_fingerprint = match response_certificate_fingerprint(&response, protocol) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                tracing::debug!("[DISCOVER/REGISTER] Ignoring {ip}:{port}: {error}");
+                return ProbeOutcome::Miss;
+            }
+        };
         let mut device: DeviceInfo = match response.json().await {
             Ok(device) => device,
             Err(_) => return ProbeOutcome::Miss,
         };
+        if let Some(fingerprint) = certificate_fingerprint {
+            device.fingerprint = fingerprint;
+        }
         device.ip = Some(ip.to_string());
         device.port = port;
         device.protocol = protocol;
@@ -413,6 +434,33 @@ fn register_fallback_status(status: reqwest::StatusCode) -> bool {
         status,
         reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
     )
+}
+
+/// Returns the identity authenticated by the transport.
+///
+/// Plain HTTP has no transport identity, so its JSON fingerprint remains the
+/// only available value. HTTPS discovery deliberately accepts self-signed
+/// certificates because the peer is not known yet; after that handshake, the
+/// leaf certificate is the peer's identity and overrides any JSON claim.
+/// Missing TLS metadata on an HTTPS response is therefore a failed probe, not
+/// permission to fall back to unauthenticated metadata.
+fn response_certificate_fingerprint(
+    response: &reqwest::Response,
+    protocol: Protocol,
+) -> Result<Option<String>> {
+    if protocol == Protocol::Http {
+        return Ok(None);
+    }
+
+    response
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(reqwest::tls::TlsInfo::peer_certificate)
+        .map(crate::crypto::sha256_from_bytes)
+        .map(Some)
+        .ok_or_else(|| {
+            LocalSendError::network("HTTPS discovery response carried no peer certificate")
+        })
 }
 
 /// Host addresses `x.y.z.1..=254` in the `/24` of `base_ip`, excluding `base_ip` itself.
@@ -482,6 +530,9 @@ fn build_discovery_client(client_identity: Option<reqwest::Identity>) -> Result<
         .no_proxy()
         .tls_backend_rustls()
         .danger_accept_invalid_certs(true)
+        // Preserve the leaf DER on every response so HTTPS discovery can bind
+        // the returned metadata to the identity that completed the handshake.
+        .tls_info(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT);
     if let Some(identity) = client_identity {
@@ -829,6 +880,82 @@ mod tests {
         server.stop().await;
     }
 
+    /// Before a fingerprint is known, discovery has to accept a peer's
+    /// self-signed certificate. That makes the certificate presented by the
+    /// TLS connection the only authenticated identity: the JSON body is still
+    /// useful metadata, but its `fingerprint` field is only a claim.
+    #[cfg(feature = "https")]
+    #[tokio::test]
+    async fn https_info_uses_the_certificate_fingerprint_instead_of_the_body_claim() {
+        use crate::{DeviceInfo, Protocol, TlsCertificate, generate_tls_certificate};
+        use rustls::ServerConfig;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        fn private_key(certificate: &TlsCertificate) -> PrivateKeyDer<'static> {
+            PrivateKeyDer::from_pem_slice(certificate.key_pem.as_bytes()).expect("read private key")
+        }
+
+        let certificate = generate_tls_certificate().expect("generate server certificate");
+        let expected_fingerprint = certificate.fingerprint.clone();
+        let mut claimed_peer =
+            DeviceInfo::new("untrusted body fingerprint".into(), 0, Protocol::Https);
+        claimed_peer.fingerprint = "body-claims-a-different-device".into();
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(certificate.cert_der.clone())],
+                private_key(&certificate),
+            )
+            .expect("build TLS server");
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let port = listener.local_addr().expect("server address").port();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept probe");
+            let mut stream = acceptor
+                .accept(stream)
+                .await
+                .expect("complete TLS handshake");
+            let mut request = [0u8; 4096];
+            let length = stream.read(&mut request).await.expect("read /info");
+            assert!(
+                String::from_utf8_lossy(&request[..length])
+                    .starts_with("GET /api/localsend/v2/info")
+            );
+
+            let body = serde_json::to_vec(&claimed_peer).expect("encode peer");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            stream.write_all(&body).await.expect("write response body");
+        });
+
+        let discovery =
+            HttpDiscovery::new("scanner".into(), port, Protocol::Https).expect("build discovery");
+        let found = discovery
+            .scan_hosts(vec!["127.0.0.1".into()], port, None, false)
+            .await
+            .devices;
+
+        let peer = found.first().expect("discover TLS peer");
+        assert_eq!(peer.fingerprint, expected_fingerprint);
+        assert_ne!(peer.fingerprint, "body-claims-a-different-device");
+        server_task.await.expect("test server completed");
+    }
+
     #[tokio::test]
     async fn scan_subnet_honors_the_configured_port() {
         use crate::{LocalSendServer, Protocol};
@@ -939,7 +1066,7 @@ mod tests {
         let port = listener.local_addr().expect("server address").port();
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
         let mut peer = DeviceInfo::new("mTLS register peer".into(), port, Protocol::Https);
-        peer.fingerprint = server_certificate.fingerprint.clone();
+        peer.fingerprint = "untrusted-register-body-fingerprint".into();
 
         let server_task = tokio::spawn(async move {
             for _ in 0..2 {
@@ -983,6 +1110,10 @@ mod tests {
             .expect("the peer must be found through /register");
         assert_eq!(found_peer.alias, "mTLS register peer");
         assert_eq!(found_peer.protocol, Protocol::Https);
+        assert_ne!(
+            found_peer.fingerprint,
+            "untrusted-register-body-fingerprint"
+        );
         server_task.await.expect("test server completed");
     }
 
