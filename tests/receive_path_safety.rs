@@ -48,6 +48,7 @@ async fn upload_one(save_dir: &Path, file_name: &str) -> UploadResult {
             }
         }
     });
+    localsend_rs::crypto::ensure_crypto_provider();
     let prepared: serde_json::Value = reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{port}/api/localsend/v2/prepare-upload"
@@ -68,6 +69,7 @@ async fn upload_one(save_dir: &Path, file_name: &str) -> UploadResult {
         .as_str()
         .expect("upload token in response");
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let response = reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{port}/api/localsend/v2/upload?sessionId={session_id}&fileId=f1&token={token}"
@@ -128,6 +130,7 @@ async fn prepare_one(port: u16, file_name: &str, size: usize) -> (String, String
             }
         }
     });
+    localsend_rs::crypto::ensure_crypto_provider();
     let prepared: serde_json::Value = reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{port}/api/localsend/v2/prepare-upload"
@@ -222,6 +225,7 @@ async fn cancel_during_a_paused_upload_aborts_before_publication() {
     let (body, release) = paused_body(FIRST, REST);
     let upload_session_id = session_id.clone();
     let upload = tokio::spawn(async move {
+        localsend_rs::crypto::ensure_crypto_provider();
         reqwest::Client::new()
             .post(format!(
                 "http://127.0.0.1:{port}/api/localsend/v2/upload?sessionId={upload_session_id}&fileId=f1&token={token}"
@@ -234,6 +238,7 @@ async fn cancel_during_a_paused_upload_aborts_before_publication() {
 
     let mut observed = ObservedEvents::default();
     wait_for_positive_progress(&mut events, &mut observed).await;
+    localsend_rs::crypto::ensure_crypto_provider();
     let cancel = reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{port}/api/localsend/v2/cancel?sessionId={session_id}"
@@ -281,6 +286,7 @@ async fn timeout_replacement_during_a_paused_upload_aborts_before_publication() 
     let (session_id, token) = prepare_one(port, "timed-out.bin", FIRST.len() + REST.len()).await;
     let (body, release) = paused_body(FIRST, REST);
     let upload = tokio::spawn(async move {
+        localsend_rs::crypto::ensure_crypto_provider();
         reqwest::Client::new()
             .post(format!(
                 "http://127.0.0.1:{port}/api/localsend/v2/upload?sessionId={session_id}&fileId=f1&token={token}"

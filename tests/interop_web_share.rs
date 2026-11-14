@@ -26,6 +26,7 @@ async fn approved_browser_session_downloads_exact_bytes() {
         .expect("web share starts");
     assert!(server.device().download);
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{}", server.port());
     let response = client
@@ -118,6 +119,7 @@ async fn browser_prepare_waits_for_explicit_approval() {
         "http://127.0.0.1:{}/api/localsend/v2/prepare-download",
         server.port()
     );
+    localsend_rs::crypto::ensure_crypto_provider();
     let request = tokio::spawn(async move { reqwest::Client::new().post(url).send().await });
     let pending = match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
         .await
@@ -152,6 +154,7 @@ async fn browser_share_pin_uses_receiver_rate_limit() {
         )
         .await
         .expect("web share starts");
+    localsend_rs::crypto::ensure_crypto_provider();
     let client = reqwest::Client::new();
     let base = format!(
         "http://127.0.0.1:{}/api/localsend/v2/prepare-download",
@@ -205,6 +208,7 @@ async fn browser_share_streams_disk_files_and_rejects_unknown_file_ids() {
         .await
         .expect("web share starts");
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{}", server.port());
     let body: serde_json::Value = client

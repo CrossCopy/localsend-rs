@@ -24,6 +24,7 @@ async fn empty_files_map_returns_204() {
                   "fingerprint": "fp", "port": 53317, "protocol": "http", "download": false },
         "files": {}
     });
+    localsend_rs::crypto::ensure_crypto_provider();
     let r = reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{port}/api/localsend/v2/prepare-upload"

@@ -35,6 +35,7 @@ async fn failed_upload_resets_file_progress_and_can_be_retried() {
         ("fileId", id.as_str()),
         ("token", prep.files[&id].as_str()),
     ]);
+    localsend_rs::crypto::ensure_crypto_provider();
     let response = reqwest::Client::builder()
         .no_proxy()
         .build()

@@ -34,6 +34,7 @@ async fn pin_gate_returns_401_then_429_then_accepts_correct_pin() {
     let port = server.port();
     common::wait_for_http_info(port).await;
     let base = format!("http://127.0.0.1:{port}/api/localsend/v2/prepare-upload");
+    localsend_rs::crypto::ensure_crypto_provider();
     let http = reqwest::Client::new();
 
     // wrong pin -> 401, three times
@@ -73,6 +74,7 @@ async fn correct_pin_passes() {
     common::wait_for_http_info(port).await;
     let base = format!("http://127.0.0.1:{port}/api/localsend/v2/prepare-upload");
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let r = reqwest::Client::new()
         .post(format!("{base}?pin=123456"))
         .json(&minimal_prepare_body())

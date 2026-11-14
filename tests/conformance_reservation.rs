@@ -57,6 +57,7 @@ async fn silent_receiver() -> (LocalSendServer, u16, tempfile::TempDir) {
 }
 
 async fn prepare(port: u16, name: &str) -> reqwest::Response {
+    localsend_rs::crypto::ensure_crypto_provider();
     reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{port}/api/localsend/v2/prepare-upload"
@@ -76,6 +77,7 @@ async fn a_sender_that_disconnects_while_waiting_does_not_hold_the_slot() {
 
     // A one-second client timeout is the disconnect: the request is dropped
     // client-side while the receiver is still parked on the decision.
+    localsend_rs::crypto::ensure_crypto_provider();
     let abandoned = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
@@ -115,6 +117,7 @@ async fn a_sender_can_cancel_before_it_has_a_session_id() {
     let pending = tokio::spawn(prepare(port, "changed-my-mind.bin"));
     tokio::time::sleep(Duration::from_millis(150)).await;
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let cancelled = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/api/localsend/v2/cancel"))
         .send()
@@ -154,6 +157,7 @@ async fn a_cancel_with_nothing_to_cancel_is_refused() {
     let port = server.port();
     common::wait_for_http_info(port).await;
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let answer = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/api/localsend/v2/cancel"))
         .send()

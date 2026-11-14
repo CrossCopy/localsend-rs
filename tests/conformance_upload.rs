@@ -42,6 +42,7 @@ async fn prepare_single(port: u16, size: u64, sha256: Option<String>) -> (String
                   "fingerprint": "fp", "port": 53317, "protocol": "http", "download": false },
         "files": { "f1": file }
     });
+    localsend_rs::crypto::ensure_crypto_provider();
     let resp: serde_json::Value = reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{port}/api/localsend/v2/prepare-upload"
@@ -79,6 +80,7 @@ async fn short_body_is_rejected_and_partial_discarded() {
     // Declare 200 bytes but send only 10.
     let (session_id, token) = prepare_single(port, 200, None).await;
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let r = reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{port}/api/localsend/v2/upload?sessionId={session_id}&fileId=f1&token={token}"
@@ -122,6 +124,7 @@ async fn sha256_mismatch_is_rejected_and_partial_discarded() {
     let declared = sha256_from_bytes(&[0u8; 64]);
     let (session_id, token) = prepare_single(port, 64, Some(declared)).await;
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let r = reqwest::Client::new()
         .post(format!(
             "http://127.0.0.1:{port}/api/localsend/v2/upload?sessionId={session_id}&fileId=f1&token={token}"

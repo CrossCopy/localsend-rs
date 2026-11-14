@@ -22,6 +22,7 @@ async fn builder_uses_the_supplied_certificate_fingerprint_for_https() {
         .await
         .expect("start HTTPS receiver");
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -59,6 +60,7 @@ async fn builder_generates_a_nonempty_https_fingerprint_when_none_is_supplied() 
         .await
         .expect("start HTTPS receiver");
 
+    localsend_rs::crypto::ensure_crypto_provider();
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
