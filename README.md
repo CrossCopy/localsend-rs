@@ -286,7 +286,7 @@ cargo fmt --check
 
 ## About
 
-This is a [CrossCopy](https://crosscopy.io) project - a high-performance Rust implementation of the LocalSend protocol for fast, secure local network file transfers.
+This is a [Xross](https://xross.one) project - a high-performance Rust implementation of the LocalSend protocol for fast, secure local network file transfers.
 
 ## License
 

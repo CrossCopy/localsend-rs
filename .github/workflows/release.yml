@@ -1,0 +1,102 @@
+# Builds the `localsend-rs` binary on `v<version>` tags and attaches prebuilt
+# archives to the GitHub release. Archive names and layout follow what
+# [package.metadata.binstall] in Cargo.toml describes, so
+# `cargo binstall localsend-rs` can download them instead of compiling.
+#
+#   localsend-rs-<target>-v<version>.tar.gz   (zip on Windows)
+#     └── localsend-rs-<target>-v<version>/localsend-rs
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --bin localsend-rs --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="localsend-rs-${{ matrix.target }}-v${VERSION}"
+          mkdir -p "${NAME}"
+          install -m 755 "target/${{ matrix.target }}/release/localsend-rs" "${NAME}/localsend-rs"
+          tar czf "${NAME}.tar.gz" "${NAME}"
+          rm -rf "${NAME}"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $name = "localsend-rs-${{ matrix.target }}-v$version"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/localsend-rs.exe" "$name/localsend-rs.exe"
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          Remove-Item -Recurse -Force $name
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            localsend-rs-*.tar.gz
+            localsend-rs-*.zip
+
+  release:
+    name: Attach archives to the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release and attach archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "localsend-rs ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            dist/* \
+          || gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber

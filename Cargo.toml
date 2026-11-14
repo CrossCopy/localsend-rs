@@ -1,18 +1,28 @@
 [package]
 name = "localsend-rs"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Rust library for the LocalSend v2.1 protocol: discovery, HTTPS with certificate pinning, and file transfer. Includes a CLI and TUI."
 license = "MIT"
 repository = "https://github.com/CrossCopy/localsend-rs"
 documentation = "https://github.com/CrossCopy/localsend-rs#readme"
-homepage = "https://crosscopy.io"
+homepage = "https://xross.one"
 exclude = [".github/"]
 
 [[bin]]
 name = "localsend-rs"
 path = "src/main.rs"
 required-features = ["cli"]
+
+# cargo-binstall: prebuilt archives from the `v<version>` GitHub release,
+# produced by .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "{ name }-{ target }-v{ version }/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [features]
 default = ["cli", "https"]
