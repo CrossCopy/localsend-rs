@@ -21,6 +21,8 @@ pub async fn execute(command: DiscoverCommand) -> anyhow::Result<()> {
         53317,
         crate::protocol::Protocol::Https,
     )?;
+    #[cfg(feature = "https")]
+    discovery.set_client_certificate(crate::crypto::load_or_generate_default_tls_certificate()?);
 
     let devices = Arc::new(Mutex::new(Vec::<DeviceInfo>::new()));
     let devices_clone = devices.clone();

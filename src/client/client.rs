@@ -19,6 +19,15 @@ pub struct LocalSendClient {
     device: DeviceInfo,
 }
 
+#[derive(Clone)]
+struct ClientAuth {
+    identity: reqwest::Identity,
+    #[cfg(feature = "https")]
+    cert_der: Vec<u8>,
+    #[cfg(feature = "https")]
+    key_pem: String,
+}
+
 impl LocalSendClient {
     /// **No proxy, and it is not only about speed.** A LocalSend peer is a
     /// device on this network segment, addressed by the IP its own announcement
@@ -35,30 +44,106 @@ impl LocalSendClient {
         crate::crypto::ensure_crypto_provider();
         let client = HttpClient::builder()
             .no_proxy()
+            .tls_backend_rustls()
             .build()
             .expect("a reqwest client with no proxy and no TLS override cannot fail to build");
         Self { client, device }
     }
 
     pub fn with_trust_policy(device: DeviceInfo, policy: TlsTrustPolicy) -> Result<Self> {
+        Self::with_trust_policy_and_identity(device, policy, None)
+    }
+
+    /// A client that presents `certificate` to the peer during the TLS
+    /// handshake, for peers that require one.
+    ///
+    /// # Why this is not optional for some peers
+    ///
+    /// LocalSend's transport is mutually authenticated in practice even though
+    /// the spec describes only the server side: current iOS builds request a
+    /// client certificate and **abort the handshake** when none is offered, so
+    /// a client without one cannot reach any endpoint on those peers — not even
+    /// `/info`. Android builds accept a client certificate and do not require
+    /// it, so presenting one is the behaviour that works everywhere.
+    ///
+    /// # This overrides `device.fingerprint`
+    ///
+    /// The returned client announces `certificate`'s fingerprint, replacing
+    /// whatever `device` carried. In LocalSend a device *is* its certificate
+    /// fingerprint: it is what a peer stores from `/register`, what it
+    /// de-duplicates its device list on, and what it pins us to on later
+    /// connections. Announcing a fingerprint we will never present would make
+    /// this device unrecognisable the next time it connects — a new entry in
+    /// the peer's list on every run, and a pin that can never match. Passing
+    /// the two separately is exactly how they come to disagree, so they are
+    /// taken from one place.
+    #[cfg(feature = "https")]
+    pub fn with_trust_policy_and_client_certificate(
+        mut device: DeviceInfo,
+        policy: TlsTrustPolicy,
+        certificate: &crate::crypto::TlsCertificate,
+    ) -> Result<Self> {
+        device.fingerprint = certificate.fingerprint.clone();
+        let pem = format!("{}\n{}", certificate.cert_pem, certificate.key_pem);
+        let identity = reqwest::Identity::from_pem(pem.as_bytes()).map_err(LocalSendError::from)?;
+        Self::with_trust_policy_and_identity(
+            device,
+            policy,
+            Some(ClientAuth {
+                identity,
+                cert_der: certificate.cert_der.clone(),
+                key_pem: certificate.key_pem.clone(),
+            }),
+        )
+    }
+
+    fn with_trust_policy_and_identity(
+        device: DeviceInfo,
+        policy: TlsTrustPolicy,
+        client_auth: Option<ClientAuth>,
+    ) -> Result<Self> {
         crate::crypto::ensure_crypto_provider();
         let client = match policy {
-            TlsTrustPolicy::InsecureForTests => HttpClient::builder()
-                .no_proxy()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .map_err(LocalSendError::from)?,
+            TlsTrustPolicy::InsecureForTests => {
+                let mut builder = HttpClient::builder()
+                    .no_proxy()
+                    .tls_backend_rustls()
+                    .danger_accept_invalid_certs(true);
+                if let Some(auth) = client_auth {
+                    builder = builder.identity(auth.identity);
+                }
+                builder.build().map_err(LocalSendError::from)?
+            }
             TlsTrustPolicy::PinnedFingerprint(fingerprint) => {
                 #[cfg(feature = "https")]
                 {
+                    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
                     let verifier = FingerprintVerifier::new(fingerprint)?;
-                    let tls_config = rustls::ClientConfig::builder()
+                    let config = rustls::ClientConfig::builder()
                         .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(verifier))
-                        .with_no_client_auth();
+                        .with_custom_certificate_verifier(Arc::new(verifier));
+                    let config = if let Some(auth) = client_auth {
+                        let key = PrivateKeyDer::from_pem_slice(auth.key_pem.as_bytes()).map_err(
+                            |error| {
+                                LocalSendError::network(format!(
+                                    "Invalid LocalSend TLS client key: {error}"
+                                ))
+                            },
+                        )?;
+                        config
+                            .with_client_auth_cert(vec![CertificateDer::from(auth.cert_der)], key)
+                            .map_err(|error| {
+                                LocalSendError::network(format!(
+                                    "Invalid LocalSend TLS client identity: {error}"
+                                ))
+                            })?
+                    } else {
+                        config.with_no_client_auth()
+                    };
                     HttpClient::builder()
                         .no_proxy()
-                        .tls_backend_preconfigured(tls_config)
+                        .tls_backend_preconfigured(config)
                         .build()
                         .map_err(LocalSendError::from)?
                 }
@@ -66,6 +151,7 @@ impl LocalSendClient {
                 #[cfg(not(feature = "https"))]
                 {
                     let _ = fingerprint;
+                    let _ = client_auth;
                     return Err(LocalSendError::network(
                         "Pinned LocalSend TLS requires the https feature",
                     ));
