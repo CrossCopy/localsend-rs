@@ -48,8 +48,14 @@ pub enum ServerEvent {
         file_id: FileId,
         file_name: String,
         sender_alias: String,
+        /// Cumulative payload bytes written across the whole session.
         bytes_received: u64,
+        /// Total declared payload bytes across all accepted files.
         total_bytes: u64,
+        /// Payload bytes written for `file_id` during its current upload.
+        file_bytes_received: u64,
+        /// Declared payload bytes for `file_id`.
+        file_size: u64,
         file_count: usize,
     },
     /// One file finished writing to disk.

@@ -449,22 +449,29 @@ struct ReceiveProgressContext {
     file_name: String,
     sender_alias: String,
     total_bytes: u64,
+    file_size: u64,
     file_count: usize,
     events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
     received_bytes: Arc<AtomicU64>,
 }
 
 impl ReceiveProgressContext {
-    fn add(&self, amount: u64) {
+    // Keep compatibility with Rust versions before AtomicU64::try_update.
+    #[allow(deprecated)]
+    fn add(&self, amount: u64, file_bytes_received: u64) {
         let previous = self
             .received_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(amount).min(self.total_bytes))
             })
             .unwrap_or_else(|current| current);
-        self.emit(previous.saturating_add(amount).min(self.total_bytes));
+        self.emit(
+            previous.saturating_add(amount).min(self.total_bytes),
+            file_bytes_received.min(self.file_size),
+        );
     }
 
+    #[allow(deprecated)]
     fn rollback(&self, amount: u64) {
         let previous = self
             .received_bytes
@@ -472,10 +479,10 @@ impl ReceiveProgressContext {
                 Some(current.saturating_sub(amount))
             })
             .unwrap_or_else(|current| current);
-        self.emit(previous.saturating_sub(amount));
+        self.emit(previous.saturating_sub(amount), 0);
     }
 
-    fn emit(&self, bytes_received: u64) {
+    fn emit(&self, bytes_received: u64, file_bytes_received: u64) {
         let _ = self
             .events_tx
             .try_send(crate::server::events::ServerEvent::FileReceiveProgress {
@@ -485,6 +492,8 @@ impl ReceiveProgressContext {
                 sender_alias: self.sender_alias.clone(),
                 bytes_received,
                 total_bytes: self.total_bytes,
+                file_bytes_received,
+                file_size: self.file_size,
                 file_count: self.file_count,
             });
     }
@@ -681,6 +690,7 @@ pub(crate) async fn handle_upload(
         file_name: file_name.clone(),
         sender_alias: sender_alias.clone(),
         total_bytes,
+        file_size: declared_size,
         file_count,
         events_tx,
         received_bytes,
@@ -701,7 +711,7 @@ pub(crate) async fn handle_upload(
                 let delta = file_bytes.saturating_sub(previous_file_bytes);
                 previous_file_bytes = file_bytes;
                 callback_file_reported.store(file_bytes, Ordering::Relaxed);
-                callback_progress.add(delta);
+                callback_progress.add(delta, file_bytes);
             },
         ) => Some(result),
     };
