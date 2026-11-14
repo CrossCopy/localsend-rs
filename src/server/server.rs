@@ -239,6 +239,70 @@ impl LocalSendServer {
         }
     }
 
+    /// Cancel the ordinary LocalSend receive that is current when called.
+    ///
+    /// This is a local receiver action: it does not impersonate the remote sender
+    /// through `/cancel`, and it leaves the listener and pooled HTTP connections
+    /// running. Pending consent is withdrawn and remaining uploads are signalled.
+    /// An already-started atomic publication finishes first. The returned id is
+    /// still the original target if it finished while we waited; a later session
+    /// is never cancelled. Waits for admitted uploads to finish or abort their
+    /// sinks before returning. Protected CrossCopy sessions are unaffected.
+    pub async fn cancel_incoming(&self) -> crate::Result<Option<crate::protocol::SessionId>> {
+        let state_ref = self
+            .state
+            .as_ref()
+            .ok_or_else(|| crate::error::LocalSendError::invalid_state("Server is not running"))?;
+        let mut target = None;
+        let events = loop {
+            {
+                let mut state = state_ref.write().await;
+                if target.is_none() {
+                    target = state.current_session.clone();
+                }
+                let Some(target_session) = target.as_ref() else {
+                    return Ok(None);
+                };
+                let target_id = &target_session.id;
+                let Some(session) = state
+                    .current_session
+                    .as_ref()
+                    .filter(|s| &s.id == target_id)
+                else {
+                    // The handler or another cancellation already ended this
+                    // session and owns its terminal event.
+                    break None;
+                };
+                if session.try_cancel_receives() {
+                    state.current_session = None;
+                    state.current_session_from = None;
+                    if let Some(reservation) = state
+                        .awaiting_consent
+                        .take_if(|r| &r.session_id == target_id)
+                    {
+                        reservation.withdraw.cancel();
+                    }
+                    break Some(state.events_tx.clone());
+                }
+            }
+            // A publication permit is held only through commit and its event
+            // update. Do not hold the state lock while that handler completes.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let target = target.expect("the no-session case returned above");
+        // A lease can precede sink creation. Keep its lifecycle alive and wait
+        // until every admitted handler has aborted or finished publication.
+        while !target.receives_settled() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if let Some(events) = events {
+            let _ = events.try_send(ServerEvent::SessionDone {
+                session_id: target.id.clone(),
+            });
+        }
+        Ok(Some(target.id))
+    }
+
     /// Stop the listener after terminalizing any protected File-v3 upload that
     /// is still owned by this server.  A process crash remains recoverable by
     /// Task 2's durable reconciliation; this orderly shutdown must not leave a
