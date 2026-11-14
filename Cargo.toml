@@ -2,7 +2,7 @@
 name = "localsend-rs"
 version = "0.1.2"
 edition = "2024"
-description = "Rust implementation of LocalSend protocol - cross-platform file transfer tool"
+description = "Rust library for the LocalSend v2.1 protocol: discovery, HTTPS with certificate pinning, and file transfer. Includes a CLI and TUI."
 license = "MIT"
 repository = "https://github.com/CrossCopy/localsend-rs"
 documentation = "https://github.com/CrossCopy/localsend-rs#readme"
