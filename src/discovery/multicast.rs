@@ -522,11 +522,16 @@ impl Discovery for MulticastDiscovery {
         } else {
             return;
         };
-
         let mut rx = tx.subscribe();
         tokio::spawn(async move {
-            while let Ok(device) = rx.recv().await {
-                callback(device);
+            loop {
+                match rx.recv().await {
+                    Ok(device) => callback(device),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "discovery listener fell behind the event stream");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
         });
     }
@@ -537,6 +542,22 @@ impl Discovery for MulticastDiscovery {
 }
 
 impl MulticastDiscovery {
+    /// Adds a device learned outside this multicast listener to the live
+    /// discovery stream, for example from an HTTP `/register` event.
+    ///
+    /// Register the consumer with [`Discovery::on_discovered`] before calling
+    /// this method. Like multicast announcements, this is a live event and is
+    /// not retained for later subscribers. The event stream is bounded; if a
+    /// subscriber falls behind, skipped events are logged but are not replayed.
+    pub fn add_device(&self, device: DeviceInfo) {
+        if device.fingerprint.is_empty() || device.fingerprint == self.local_device.fingerprint {
+            return;
+        }
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.send(device);
+        }
+    }
+
     fn multicast_interfaces(interface_names: Option<&BTreeSet<String>>) -> Result<Vec<Ipv4Addr>> {
         let addresses = get_if_addrs()
             .map_err(|error| {

@@ -151,21 +151,27 @@ impl HttpDiscovery {
         })
     }
 
-    /// Sweeps every host `x.y.z.1..=254` in the `/24` subnet of `base_ip` (excluding
-    /// our own address), asking each one `GET /api/localsend/v2/info`, and returns the
-    /// LocalSend devices that answered. This is the protocol's "legacy" HTTP discovery
-    /// (spec §2.2): it finds any device whose HTTP server is reachable, even one that is
-    /// missing multicast (lossy Wi-Fi, or a mobile app suspended in the background).
+    /// Compatibility scan that sweeps every host `x.y.z.1..=254` in the `/24` subnet of
+    /// `base_ip` (excluding our own address), asking each one
+    /// `GET /api/localsend/v2/info`. This finds peers that expose the older `/info`
+    /// discovery endpoint, including devices that are not reachable over multicast.
     ///
     /// Probes run concurrently ([`SCAN_CONCURRENCY`] at a time) on the port configured
     /// for this discovery instance. LocalSend devices use self-signed certificates, so
-    /// the client accepts them — the peer's real fingerprint is read from the response,
-    /// so nothing is trusted blindly. Mirrors localsend-ts `HttpDiscovery` and the
-    /// official `HttpScanDiscoveryService`.
-    /// A blind subnet scan never POSTs local device metadata to arbitrary hosts.
+    /// the client accepts them — the peer's real fingerprint is read from the response.
+    /// This scan does not POST local device metadata to hosts on the subnet. For the
+    /// LocalSend v2.2 register-based fallback, see
+    /// [`Self::scan_subnet_register_within`].
     pub async fn scan_subnet(&self, base_ip: &str) -> Result<Vec<DeviceInfo>> {
         Ok(self
-            .scan_hosts(subnet_hosts(base_ip)?, self.local_device.port, None, false)
+            .scan_hosts(
+                subnet_hosts(base_ip)?,
+                self.local_device.port,
+                None,
+                ScanStrategy::Info {
+                    allow_register_fallback: false,
+                },
+            )
             .await
             .devices
             .into_iter()
@@ -184,7 +190,30 @@ impl HttpDiscovery {
                 subnet_hosts(base_ip)?,
                 self.local_device.port,
                 Some(within),
-                false,
+                ScanStrategy::Info {
+                    allow_register_fallback: false,
+                },
+            )
+            .await)
+    }
+
+    /// Scans a local `/24` using the LocalSend v2.2 HTTP fallback: send a
+    /// `POST /api/localsend/v2/register` to each host on the configured port.
+    /// Use this when multicast discovery did not find peers. It is separate from the
+    /// `/info` compatibility scan because every request announces this device's metadata
+    /// to the addressed host. Callers should only run it as an explicit discovery action.
+    /// This does not change the protocol version advertised by this discovery client.
+    pub async fn scan_subnet_register_within(
+        &self,
+        base_ip: &str,
+        within: Duration,
+    ) -> Result<ScanOutcome> {
+        Ok(self
+            .scan_hosts(
+                subnet_hosts(base_ip)?,
+                self.local_device.port,
+                Some(within),
+                ScanStrategy::Register,
             )
             .await)
     }
@@ -199,7 +228,14 @@ impl HttpDiscovery {
         within: Duration,
     ) -> Result<ScanOutcome> {
         Ok(self
-            .scan_hosts(subnet_hosts(base_ip)?, target_port, Some(within), false)
+            .scan_hosts(
+                subnet_hosts(base_ip)?,
+                target_port,
+                Some(within),
+                ScanStrategy::Info {
+                    allow_register_fallback: false,
+                },
+            )
             .await)
     }
 
@@ -214,7 +250,14 @@ impl HttpDiscovery {
     /// discloses this device to it. A blind [`Self::scan_subnet`] never does.
     pub async fn scan_ips(&self, ips: Vec<String>) -> Result<Vec<DeviceInfo>> {
         Ok(self
-            .scan_hosts(ips, self.local_device.port, None, true)
+            .scan_hosts(
+                ips,
+                self.local_device.port,
+                None,
+                ScanStrategy::Info {
+                    allow_register_fallback: true,
+                },
+            )
             .await
             .devices
             .into_iter()
@@ -225,12 +268,18 @@ impl HttpDiscovery {
     /// [`Self::scan_ips`], abandoned after `within`.
     pub async fn scan_ips_within(&self, ips: Vec<String>, within: Duration) -> Result<ScanOutcome> {
         Ok(self
-            .scan_hosts(ips, self.local_device.port, Some(within), true)
+            .scan_hosts(
+                ips,
+                self.local_device.port,
+                Some(within),
+                ScanStrategy::Info {
+                    allow_register_fallback: true,
+                },
+            )
             .await)
     }
 
-    /// Probe an explicit list of hosts concurrently and return the de-duplicated set of
-    /// LocalSend devices that answered (ourselves excluded). Shared core of `scan_subnet`.
+    /// Probe a list of hosts concurrently and return the de-duplicated devices that answered.
     ///
     /// # What a deadline does, and what it deliberately does not do
     ///
@@ -252,17 +301,24 @@ impl HttpDiscovery {
         targets: Vec<String>,
         target_port: u16,
         within: Option<Duration>,
-        allow_register_fallback: bool,
+        strategy: ScanStrategy,
     ) -> ScanOutcome {
         let deadline = within.map(|within| tokio::time::Instant::now() + within);
         let probes = stream::iter(targets)
             .map(|ip| async move {
-                self.probe_info(&ip, target_port, allow_register_fallback)
-                    .await
-                    .map(|device| ObservedDevice {
-                        device,
-                        observed_at: SystemTime::now(),
-                    })
+                let device = match strategy {
+                    ScanStrategy::Info {
+                        allow_register_fallback,
+                    } => {
+                        self.probe_info(&ip, target_port, allow_register_fallback)
+                            .await
+                    }
+                    ScanStrategy::Register => self.probe_register_peer(&ip, target_port).await,
+                };
+                device.map(|device| ObservedDevice {
+                    device,
+                    observed_at: SystemTime::now(),
+                })
             })
             .buffer_unordered(SCAN_CONCURRENCY);
         futures_util::pin_mut!(probes);
@@ -341,13 +397,24 @@ impl HttpDiscovery {
         None
     }
 
+    async fn probe_register_peer(&self, ip: &str, port: u16) -> Option<DeviceInfo> {
+        for protocol in self.protocol_candidates() {
+            match self.probe_register_with(ip, port, protocol).await {
+                ProbeOutcome::Found(device) => return Some(device),
+                ProbeOutcome::Unreachable => return None,
+                ProbeOutcome::Miss | ProbeOutcome::RegisterFallback => continue,
+            }
+        }
+        None
+    }
+
     /// Ask ONE known peer, at ITS port, whether it is still there.
     ///
-    /// The difference from a scan is which port is used. A sweep is looking for
-    /// strangers and can only assume the well-known port, so it probes with its
-    /// own. A peer we have already met answered somewhere specific, and that is
-    /// not necessarily where we listen — a caller checking whether a known peer
-    /// is still alive has to ask where the peer actually is.
+    /// The difference from a scan is which port is used. A sweep probes every
+    /// stranger on the discovery instance's configured port. A peer we have
+    /// already met answered somewhere specific, which may differ from that
+    /// configured scan port — a caller checking whether a known peer is still
+    /// alive has to ask where the peer actually is.
     ///
     /// This is what a daemon's liveness check runs on. It is unicast, and every
     /// LocalSend client is required to serve it, which makes it evidence about
@@ -463,6 +530,12 @@ enum ProbeOutcome {
     /// `/info` reported that an explicit peer should be queried through
     /// `/register` instead.
     RegisterFallback,
+}
+
+#[derive(Clone, Copy)]
+enum ScanStrategy {
+    Info { allow_register_fallback: bool },
+    Register,
 }
 
 /// Whether an `/info` response means "this peer does not serve `/info`", as
@@ -615,7 +688,7 @@ impl Discovery for HttpDiscovery {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpDiscovery, subnet_hosts};
+    use super::{HttpDiscovery, ScanStrategy, subnet_hosts};
 
     #[test]
     fn subnet_hosts_covers_1_to_254_excluding_self() {
@@ -854,9 +927,109 @@ mod tests {
         let discovery =
             HttpDiscovery::new("scanner".into(), port, Protocol::Http).expect("build discovery");
         let outcome = discovery
-            .scan_hosts(vec!["127.0.0.1".into()], port, None, false)
+            .scan_hosts(
+                vec!["127.0.0.1".into()],
+                port,
+                None,
+                ScanStrategy::Info {
+                    allow_register_fallback: false,
+                },
+            )
             .await;
         assert!(outcome.devices.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server task did not finish")
+            .expect("server task failed");
+    }
+
+    /// The official staged discovery path scans a subnet by sending the
+    /// protocol's `/register` request, not by depending on the legacy
+    /// `/info` endpoint. Keep this as a distinct API from the compatibility
+    /// `/info` scan so callers have to choose the protocol behavior explicitly.
+    #[tokio::test]
+    async fn register_scan_finds_a_register_only_peer() {
+        use crate::{DeviceInfo, Protocol};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind register-only peer");
+        let port = listener.local_addr().expect("peer address").port();
+        let mut peer = DeviceInfo::new("register-only subnet peer".into(), port, Protocol::Http);
+        peer.fingerprint = "register-only-subnet-fingerprint".into();
+        let served = peer.clone();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept register probe");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let header_end = loop {
+                let length = stream.read(&mut chunk).await.expect("read register probe");
+                if length == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..length]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(index + 4);
+                }
+            }
+            .expect("register request headers");
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(
+                headers.starts_with("POST /api/localsend/v2/register"),
+                "register-first scan must not depend on /info: {headers}"
+            );
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("valid content length"))
+                })
+                .expect("register request content length");
+            while request.len() < header_end + content_length {
+                let length = stream.read(&mut chunk).await.expect("read register body");
+                assert_ne!(length, 0, "register body ended early");
+                request.extend_from_slice(&chunk[..length]);
+            }
+            let posted: DeviceInfo =
+                serde_json::from_slice(&request[header_end..header_end + content_length])
+                    .expect("decode posted local device");
+            assert_eq!(posted.alias, "register-first scanner");
+            assert!(!posted.fingerprint.is_empty());
+
+            let body = serde_json::to_vec(&served).expect("encode peer");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response headers");
+            stream.write_all(&body).await.expect("write response body");
+        });
+
+        let discovery = HttpDiscovery::new("register-first scanner".into(), port, Protocol::Http)
+            .expect("build discovery");
+        let outcome = discovery
+            .scan_subnet_register_within("127.0.0.2", Duration::from_secs(10))
+            .await
+            .expect("register subnet scan");
+
+        let found = outcome
+            .devices
+            .iter()
+            .find(|observed| observed.device.fingerprint == "register-only-subnet-fingerprint")
+            .expect("register-only peer must be found by the staged fallback");
+        assert_eq!(found.device.alias, "register-only subnet peer");
+        assert_eq!(found.device.ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(found.device.port, port);
+        assert!(outcome.complete, "the small loopback scan should complete");
+
         tokio::time::timeout(Duration::from_secs(1), server_task)
             .await
             .expect("server task did not finish")
@@ -1054,7 +1227,14 @@ mod tests {
             HttpDiscovery::for_device_on_interface(local, source_address).expect("build scanner");
         let scan_started = SystemTime::now();
         let outcome = discovery
-            .scan_hosts(vec!["127.0.0.1".into()], target_port, None, false)
+            .scan_hosts(
+                vec!["127.0.0.1".into()],
+                target_port,
+                None,
+                ScanStrategy::Info {
+                    allow_register_fallback: false,
+                },
+            )
             .await;
         let scan_finished = SystemTime::now();
 
@@ -1102,7 +1282,14 @@ mod tests {
         let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Https)
             .expect("build discovery");
         let found = discovery
-            .scan_hosts(vec!["127.0.0.1".to_string()], server.port(), None, false)
+            .scan_hosts(
+                vec!["127.0.0.1".to_string()],
+                server.port(),
+                None,
+                ScanStrategy::Info {
+                    allow_register_fallback: false,
+                },
+            )
             .await
             .devices;
 
@@ -1194,7 +1381,14 @@ mod tests {
         )
         .expect("build interface-bound mTLS discovery client");
         let found = discovery
-            .scan_hosts(vec!["127.0.0.1".into()], port, None, true)
+            .scan_hosts(
+                vec!["127.0.0.1".into()],
+                port,
+                None,
+                ScanStrategy::Info {
+                    allow_register_fallback: true,
+                },
+            )
             .await
             .devices;
 
@@ -1209,11 +1403,10 @@ mod tests {
 
     /// A liveness check asks ONE known peer, at ITS port.
     ///
-    /// A subnet scan uses the protocol's well-known port because it is sweeping
-    /// strangers. A peer we have already met is different: we know where it
-    /// answered, and that is not necessarily where we listen. The scanner here
-    /// is deliberately configured with the wrong port, so a probe that used its
-    /// own would find nothing.
+    /// A subnet scan uses the discovery instance's configured port for every
+    /// stranger. A peer we have already met is different: we know where it
+    /// answered. The scanner here is deliberately configured with the wrong
+    /// scan port, so a probe that used that configured port would find nothing.
     #[tokio::test]
     async fn probe_peer_asks_at_the_peers_own_port() {
         use crate::{LocalSendServer, Protocol};
@@ -1331,7 +1524,9 @@ mod tests {
                 vec!["127.0.0.1".to_string()],
                 port,
                 Some(std::time::Duration::from_millis(300)),
-                false,
+                ScanStrategy::Info {
+                    allow_register_fallback: false,
+                },
             )
             .await;
 
