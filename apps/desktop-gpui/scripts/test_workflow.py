@@ -6,6 +6,21 @@ from pathlib import Path
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_signing_preflight_has_explicit_checkpoints_and_cannot_release(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        workflow = (repository / ".github/workflows/signing-preflight.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(workflow, r"(?m)^  workflow_dispatch:\s*$")
+        self.assertRegex(workflow, r"(?m)^  contents: read\s*$")
+        self.assertNotIn("gh release", workflow)
+        self.assertIn("macos-15", workflow)
+        self.assertIn("macos-15-intel", workflow)
+        self.assertIn("security find-identity -v -p codesigning", workflow)
+        self.assertIn("codesign --verify --strict", workflow)
+        self.assertIn("xcrun notarytool history", workflow)
+        self.assertIn("security delete-keychain", workflow)
+
     def test_manual_signing_check_cannot_publish_or_fall_back_to_unsigned(self) -> None:
         repository = Path(__file__).resolve().parents[3]
         workflow = (repository / ".github/workflows/release.yml").read_text(

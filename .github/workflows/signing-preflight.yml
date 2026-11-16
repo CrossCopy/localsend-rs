@@ -1,0 +1,72 @@
+name: macOS signing preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signing:
+    name: Signing preflight · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    steps:
+      - name: Check signing identity and notarization credentials
+        env:
+          APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID_SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_SIGNING_IDENTITY }}
+          APPLE_NOTARY_API_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for NAME in APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 \
+            APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD APPLE_DEVELOPER_ID_SIGNING_IDENTITY \
+            APPLE_NOTARY_API_KEY_P8_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
+            if [ -z "${!NAME:-}" ]; then
+              echo "::error::Missing required credential: $NAME"
+              exit 1
+            fi
+          done
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing-preflight.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/signing-preflight.p12"
+          NOTARY_KEY_PATH="$RUNNER_TEMP/signing-preflight.p8"
+          PROBE_BINARY="$RUNNER_TEMP/signing-preflight-bin"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          cleanup() {
+            security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
+            rm -f "$CERTIFICATE_PATH" "$NOTARY_KEY_PATH" "$PROBE_BINARY"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64" | base64 -D > "$CERTIFICATE_PATH"
+          printf '%s' "$APPLE_NOTARY_API_KEY_P8_BASE64" | base64 -D > "$NOTARY_KEY_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -P "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -k "$KEYCHAIN_PATH"
+          echo "::notice::Certificate import succeeded"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          echo "::notice::Key partition configuration succeeded"
+          IDENTITIES="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")"
+          if ! printf '%s\n' "$IDENTITIES" | grep -Fq -- "$APPLE_DEVELOPER_ID_SIGNING_IDENTITY"; then
+            echo "::error::The requested signing identity is not valid in the temporary keychain"
+            printf '%s\n' "$IDENTITIES"
+            exit 1
+          fi
+          echo "::notice::Signing identity is valid"
+          cp /usr/bin/true "$PROBE_BINARY"
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN_PATH" --sign "$APPLE_DEVELOPER_ID_SIGNING_IDENTITY" "$PROBE_BINARY"
+          codesign --verify --strict "$PROBE_BINARY"
+          echo "::notice::Disposable binary signed and verified"
+          xcrun notarytool history --key "$NOTARY_KEY_PATH" \
+            --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" >/dev/null
+          echo "::notice::Notarization credentials authenticated"
