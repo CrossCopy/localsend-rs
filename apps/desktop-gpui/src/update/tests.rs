@@ -9,6 +9,31 @@ use flate2::Compression;
 use sha2::{Digest, Sha256};
 use tar::{Builder, Header};
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a real signed and notarized app and its Apple Team ID"]
+fn real_signed_bundle_accepts_the_pinned_team_and_rejects_a_different_team() {
+    let path = PathBuf::from(std::env::var_os("LOCALSEND_SIGNED_TEST_APP").expect("signed app"));
+    let team = std::env::var("APPLE_DEVELOPER_TEAM_ID").expect("Apple Team ID");
+    let publisher = PublisherIdentity::new(&team).unwrap();
+    let other_team = if team == "AAAAAAAAAA" {
+        "BBBBBBBBBB"
+    } else {
+        "AAAAAAAAAA"
+    };
+    let wrong_publisher = PublisherIdentity::new(other_team).unwrap();
+    let target = UpdateTarget::current().unwrap();
+    let verifier = MacOsBundleVerifier;
+
+    verifier
+        .verify(&path, &publisher, target)
+        .expect("real notarized app must match its pinned publisher");
+    assert!(matches!(
+        verifier.verify(&path, &wrong_publisher, target),
+        Err(UpdateError::PublisherSignatureInvalid)
+    ));
+}
+
 struct TestVerifier {
     accepted: bool,
 }
@@ -906,7 +931,7 @@ fn signing_requirement_pins_the_bundle_id_and_team_identifier() {
     assert_eq!(
         publisher_requirement("ABCDEFGHIJ"),
         format!(
-            "identifier \"{BUNDLE_ID}\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"ABCDEFGHIJ\""
+            "=identifier \"{BUNDLE_ID}\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"ABCDEFGHIJ\""
         )
     );
 }

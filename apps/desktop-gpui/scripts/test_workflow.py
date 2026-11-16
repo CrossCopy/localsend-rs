@@ -49,6 +49,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(search_list, 0, "temporary keychain must be searchable")
         self.assertGreater(codesign, search_list, "configure search list before signing")
 
+    def test_signed_artifact_is_checked_by_the_real_updater_verifier(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        workflow = (repository / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        macos = workflow.split("\n  macos-app:\n", 1)[1].split("\n  release:\n", 1)[0]
+        check = macos.find(
+            "update::tests::real_signed_bundle_accepts_the_pinned_team_and_rejects_a_different_team"
+        )
+        staple = macos.find('xcrun stapler validate "$APP"')
+        archive = macos.find("python3 scripts/release.py archive")
+        self.assertGreater(check, staple, "verify the notarized app with the updater")
+        self.assertGreater(archive, check, "verify before archiving")
+
     def test_manual_check_uses_the_package_version_not_the_branch_name(self) -> None:
         repository = Path(__file__).resolve().parents[3]
         workflow = (repository / ".github/workflows/release.yml").read_text(

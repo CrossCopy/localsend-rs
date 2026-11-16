@@ -225,6 +225,17 @@ jobs:
           xcrun stapler staple "$APP"
           xcrun stapler validate "$APP"
 
+      - name: Verify the signed app with the updater
+        if: steps.signing.outputs.mode == 'signed'
+        working-directory: apps/desktop-gpui
+        env:
+          APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+          LOCALSEND_SIGNED_TEST_APP: ${{ runner.temp }}/localsend-gpui-stage/LocalSend RS.app
+        run: |
+          cargo test --locked --lib \
+            update::tests::real_signed_bundle_accepts_the_pinned_team_and_rejects_a_different_team \
+            -- --exact --ignored
+
       - name: Check Gatekeeper acceptance
         if: github.event_name == 'workflow_dispatch'
         run: spctl --assess --type execute --verbose=4 "$RUNNER_TEMP/localsend-gpui-stage/LocalSend RS.app"

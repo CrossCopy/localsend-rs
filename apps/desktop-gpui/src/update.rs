@@ -817,8 +817,9 @@ impl BundleSignatureVerifier for MacOsBundleVerifier {
 fn publisher_requirement(team_id: &str) -> String {
     // The leaf OID excludes Apple Development certificates; the intermediate OID and Apple
     // anchor require the Developer ID certificate chain in addition to the pinned Team ID.
+    // `codesign` treats a requirement as a file path unless it begins with `=`.
     format!(
-        "identifier \"{BUNDLE_ID}\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"{team_id}\""
+        "=identifier \"{BUNDLE_ID}\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"{team_id}\""
     )
 }
 

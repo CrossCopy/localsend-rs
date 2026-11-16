@@ -659,8 +659,12 @@ mod tests {
     #[test]
     fn a_peer_is_one_row_even_when_it_announces_twice_from_a_new_address() {
         let mut session = Session::new();
-        session.apply(ServiceEvent::PeerFound(peer("abc", "iPhone", "10.0.0.9")));
-        session.apply(ServiceEvent::PeerFound(peer("abc", "iPhone", "10.0.0.42")));
+        let mut first = peer("abc", "iPhone", "10.0.0.9");
+        first.last_seen = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut second = peer("abc", "iPhone", "10.0.0.42");
+        second.last_seen = first.last_seen + Duration::from_secs(1);
+        session.apply(ServiceEvent::PeerFound(first));
+        session.apply(ServiceEvent::PeerFound(second));
         assert_eq!(session.peers.len(), 1);
         assert_eq!(session.peer("abc").unwrap().ip, "10.0.0.42");
         assert_eq!(session.peer("abc").unwrap().alias, "iPhone");
