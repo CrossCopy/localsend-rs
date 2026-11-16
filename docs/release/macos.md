@@ -103,7 +103,7 @@ From `apps/desktop-gpui`:
 
 ```bash
 python3 -m unittest discover -s scripts -p 'test_*.py'
-python3 scripts/release.py check-version --tag v0.2.0
+python3 scripts/release.py check-version --tag v0.2.1
 ```
 
 The packaging command is intended for a matching native macOS runner; it refuses

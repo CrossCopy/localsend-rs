@@ -11,7 +11,7 @@
 # crates.io `gpui-pre =0.3.9` snapshot of zed-industries/zed.
 [package]
 name = "localsend-gpui"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 publish = false

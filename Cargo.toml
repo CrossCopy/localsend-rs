@@ -1,6 +1,6 @@
 [package]
 name = "localsend-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Rust library for the LocalSend v2.1 protocol: discovery, HTTPS with certificate pinning, and file transfer. Includes a CLI and TUI."
 license = "MIT"
