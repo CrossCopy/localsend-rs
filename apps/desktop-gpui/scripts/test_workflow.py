@@ -1,11 +1,66 @@
 """Structural checks for the release workflow's repository-dependent steps."""
 
 import re
+import os
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def run_stapler_validation(self, failures: int) -> tuple[int, int]:
+        repository = Path(__file__).resolve().parents[3]
+        workflow = (repository / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(
+            r"(?ms)^          # BEGIN STAPLER VALIDATION\n"
+            r"(.*?)^          # END STAPLER VALIDATION$",
+            workflow,
+        )
+        self.assertIsNotNone(match, "workflow must have a bounded validation block")
+        script = textwrap.dedent(match.group(1))
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            xcrun = directory / "xcrun"
+            xcrun.write_text(
+                "#!/bin/sh\n"
+                'n=0; [ ! -f "$ATTEMPTS" ] || n="$(cat "$ATTEMPTS")"\n'
+                'n=$((n + 1)); printf "%s" "$n" > "$ATTEMPTS"\n'
+                '[ "$n" -gt "$FAILURES" ]\n',
+                encoding="utf-8",
+            )
+            xcrun.chmod(0o755)
+            sleep = directory / "sleep"
+            sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            sleep.chmod(0o755)
+            attempts = directory / "attempts"
+            environment = {
+                **os.environ,
+                "PATH": f"{directory}:{os.environ['PATH']}",
+                "APP": "test.app",
+                "ATTEMPTS": str(attempts),
+                "FAILURES": str(failures),
+            }
+            result = subprocess.run(
+                ["bash", "-e", "-o", "pipefail", "-c", script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.returncode, int(attempts.read_text(encoding="utf-8"))
+
+    def test_stapler_validation_retries_transient_failures(self) -> None:
+        self.assertEqual(self.run_stapler_validation(2), (0, 3))
+
+    def test_stapler_validation_fails_closed_after_retry_limit(self) -> None:
+        exit_code, attempts = self.run_stapler_validation(3)
+        self.assertNotEqual(exit_code, 0)
+        self.assertEqual(attempts, 3)
+
     def test_signing_preflight_has_explicit_checkpoints_and_cannot_release(self) -> None:
         repository = Path(__file__).resolve().parents[3]
         workflow = (repository / ".github/workflows/signing-preflight.yml").read_text(

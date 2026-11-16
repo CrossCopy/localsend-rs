@@ -223,7 +223,23 @@ jobs:
             --issuer "$APPLE_NOTARY_ISSUER_ID" \
             --wait
           xcrun stapler staple "$APP"
-          xcrun stapler validate "$APP"
+          # BEGIN STAPLER VALIDATION
+          VALIDATED=false
+          for ATTEMPT in 1 2 3; do
+            if xcrun stapler validate "$APP"; then
+              VALIDATED=true
+              break
+            fi
+            if [ "$ATTEMPT" -lt 3 ]; then
+              echo "::warning::Stapler validation failed; retrying ($ATTEMPT/3)"
+              sleep 5
+            fi
+          done
+          if [ "$VALIDATED" != true ]; then
+            echo "::error::Stapler validation failed after three attempts"
+            exit 1
+          fi
+          # END STAPLER VALIDATION
 
       - name: Verify the signed app with the updater
         if: steps.signing.outputs.mode == 'signed'
