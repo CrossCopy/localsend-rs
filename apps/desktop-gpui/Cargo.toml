@@ -1,0 +1,80 @@
+# The GPUI desktop shell for localsend-rs: a native window around the library's
+# receive/upload half.
+#
+# This crate is its own workspace. A shell that links the Metal/winit GUI stack
+# must never sit in the library's dependency graph (the library's `cargo test`
+# gate must stay GUI-free), and the library's default features — clap, indicatif,
+# inquire, comfy-table, ratatui — are CLI/TUI furniture a windowed app does not
+# use. Build and test from this directory.
+#
+# `gpui-kit` is the one GUI dependency: a meta crate pinning GPUI itself as the
+# crates.io `gpui-pre =0.3.9` snapshot of zed-industries/zed.
+[package]
+name = "localsend-gpui"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = ["mcp"]
+# The `localsend-gpui mcp` subcommand: a LocalSend node exposed to AI clients
+# over the Model Context Protocol. On by default because the app is the thing a
+# model should drive; `--no-default-features` drops `rmcp` from the build.
+mcp = ["dep:rmcp"]
+
+[workspace]
+
+[[bin]]
+name = "localsend-gpui"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = "=0.7.3"
+# Only for forwarding argv to the library CLI with the same parser it uses; the
+# window itself never sees a clap type.
+clap = { version = "4.5", features = ["derive"] }
+# The product layer: the library only, no CLI/TUI surface. HTTPS is required —
+# the official LocalSend app speaks it by default, and the receive half derives
+# its fingerprint from the served certificate.
+localsend-rs = { path = "../..", default-features = false, features = ["https", "cli", "tui"] }
+# The library is tokio-native (axum server, discovery sockets, reqwest client);
+# the app owns one multi-thread runtime and bridges results to the GPUI executor
+# over smol channels.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+smol = "2"
+# Native file and folder pickers (the OS panel, not a hand-rolled dialog).
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Updater boundary: releases are discovered over HTTPS, compared as SemVer, and
+# unpacked into a private staging directory before any installed bundle is touched.
+reqwest = { version = "0.13", features = ["json"] }
+semver = "1"
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+plist = "1"
+tempfile = "3"
+thiserror = "2"
+# The official Rust SDK for the Model Context Protocol. `transport-io` gives the
+# stdio server an AI client launches as a child process; `schemars` is what turns
+# each tool's argument struct into the JSON Schema the client shows the model.
+rmcp = { version = "3.10", features = ["transport-io", "schemars"], optional = true }
+
+# Setting the Dock icon is one AppKit call; `objc2` only builds for Apple
+# platforms, so it stays out of the graph everywhere else.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSImage",
+    "NSResponder",
+] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSGeometry"] }
+
+[dev-dependencies]
+# `#[gpui_kit::test]` + the interaction helpers (click, input, wait_for).
+gpui-kit = { version = "=0.7.3", features = ["test-support"] }
+tokio = { version = "1", features = ["full", "test-util"] }

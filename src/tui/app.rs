@@ -253,8 +253,12 @@ impl App {
     /// Run the TUI application.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         // Start background services
-        self.start_discovery().await?;
+        let discovery_warning = self.start_discovery().await;
         self.start_server().await?;
+        if let Some(warning) = discovery_warning {
+            self.status_message = Some((warning, MessageLevel::Info));
+            self.dirty = true;
+        }
 
         // Main event loop. We poll for input on a short tick but only repaint
         // when something actually changed (`self.dirty`), so an idle TUI does
@@ -309,7 +313,12 @@ impl App {
     }
 
     /// Start multicast discovery in background.
-    async fn start_discovery(&mut self) -> Result<()> {
+    ///
+    /// Returns a status line when discovery is unavailable. That is not a
+    /// failure: discovery is how peers *find* this machine, not how they reach
+    /// it, so a network without a multicast route (VPN, locked-down Wi-Fi,
+    /// container) still receives transfers sent to its address.
+    async fn start_discovery(&mut self) -> Option<String> {
         let devices = self.devices.clone();
         let device_info = self.device_info.clone();
 
@@ -329,12 +338,18 @@ impl App {
             remember_device(&mut devices_guard, &device_info.fingerprint, device);
         });
 
-        discovery.start().await?;
-        discovery.announce_presence().await?;
+        if let Err(error) = discovery.start().await {
+            return Some(format!("Discovery unavailable: {error}"));
+        }
+        if let Err(error) = discovery.announce_presence().await {
+            return Some(format!(
+                "Could not announce on this network ({error}); peers must send to this address"
+            ));
+        }
 
         self.discovery = Some(discovery);
 
-        Ok(())
+        None
     }
 
     /// Start receiver server in background.

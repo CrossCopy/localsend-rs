@@ -5,10 +5,11 @@ use crate::error::LocalSendError;
 use crate::protocol::{DeviceInfo, PROTOCOL_VERSION, Protocol};
 use futures_util::{StreamExt, stream};
 use reqwest::Client;
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
 
 pub type Result<T> = std::result::Result<T, LocalSendError>;
@@ -34,10 +35,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(2000);
 /// failure a deadline introduces if it is not reported.
 #[derive(Debug, Clone)]
 pub struct ScanOutcome {
-    pub devices: Vec<DeviceInfo>,
+    pub devices: Vec<ObservedDevice>,
     /// False when the deadline arrived before the last probe did. The probes
     /// still in flight were cancelled.
     pub complete: bool,
+}
+
+/// One HTTP discovery response and the time it was actually observed.
+#[derive(Debug, Clone)]
+pub struct ObservedDevice {
+    pub device: DeviceInfo,
+    pub observed_at: SystemTime,
 }
 
 pub struct HttpDiscovery {
@@ -102,13 +110,42 @@ impl HttpDiscovery {
         Self::with_client_identity(device, None)
     }
 
+    /// Builds a discovery client whose outbound connections originate from the
+    /// selected local interface address. The caller must validate that address
+    /// against the machine's current non-loopback interfaces before using it.
+    pub fn for_device_on_interface(device: DeviceInfo, address: Ipv4Addr) -> Result<Self> {
+        Self::with_client_identity_and_source(device, None, Some(address.into()))
+    }
+
+    /// The interface-bound form of [`Self::new_with_client_certificate`].
+    /// Mobile peers that require mutual TLS during discovery still receive the
+    /// running receiver's persisted identity.
+    #[cfg(feature = "https")]
+    pub fn for_device_on_interface_with_client_certificate(
+        device: DeviceInfo,
+        address: Ipv4Addr,
+        certificate: &crate::crypto::TlsCertificate,
+    ) -> Result<Self> {
+        let pem = format!("{}\n{}", certificate.cert_pem, certificate.key_pem);
+        let identity = reqwest::Identity::from_pem(pem.as_bytes()).map_err(LocalSendError::from)?;
+        Self::with_client_identity_and_source(device, Some(identity), Some(address.into()))
+    }
+
     fn with_client_identity(
         device: DeviceInfo,
         client_identity: Option<reqwest::Identity>,
     ) -> Result<Self> {
+        Self::with_client_identity_and_source(device, client_identity, None)
+    }
+
+    fn with_client_identity_and_source(
+        device: DeviceInfo,
+        client_identity: Option<reqwest::Identity>,
+        source_address: Option<IpAddr>,
+    ) -> Result<Self> {
         Ok(Self {
             local_device: device,
-            client: build_discovery_client(client_identity)?,
+            client: build_discovery_client(client_identity, source_address)?,
             running: Arc::new(AtomicBool::new(false)),
             tx: None,
         })
@@ -130,7 +167,10 @@ impl HttpDiscovery {
         Ok(self
             .scan_hosts(subnet_hosts(base_ip)?, self.local_device.port, None, false)
             .await
-            .devices)
+            .devices
+            .into_iter()
+            .map(|observed| observed.device)
+            .collect())
     }
 
     /// [`Self::scan_subnet`], abandoned after `within`.
@@ -149,6 +189,20 @@ impl HttpDiscovery {
             .await)
     }
 
+    /// Sweep a `/24` using an explicitly selected peer port, abandoned after
+    /// `within`. The local device identity and its advertised receiver port are
+    /// unchanged; only the port used to probe candidate peers is overridden.
+    pub async fn scan_subnet_on_port_within(
+        &self,
+        base_ip: &str,
+        target_port: u16,
+        within: Duration,
+    ) -> Result<ScanOutcome> {
+        Ok(self
+            .scan_hosts(subnet_hosts(base_ip)?, target_port, Some(within), false)
+            .await)
+    }
+
     /// Probe a caller-supplied set of hosts over the normal LocalSend `/info`
     /// endpoint.  This is useful for routed networks where the caller knows a
     /// reachable address but cannot enumerate it through multicast; it still
@@ -162,7 +216,10 @@ impl HttpDiscovery {
         Ok(self
             .scan_hosts(ips, self.local_device.port, None, true)
             .await
-            .devices)
+            .devices
+            .into_iter()
+            .map(|observed| observed.device)
+            .collect())
     }
 
     /// [`Self::scan_ips`], abandoned after `within`.
@@ -202,6 +259,10 @@ impl HttpDiscovery {
             .map(|ip| async move {
                 self.probe_info(&ip, target_port, allow_register_fallback)
                     .await
+                    .map(|device| ObservedDevice {
+                        device,
+                        observed_at: SystemTime::now(),
+                    })
             })
             .buffer_unordered(SCAN_CONCURRENCY);
         futures_util::pin_mut!(probes);
@@ -230,15 +291,20 @@ impl HttpDiscovery {
 
         // Skip ourselves and de-duplicate by fingerprint (a peer may answer on more than
         // one address). Fingerprint is a peer's identity; a device without one is ignored.
-        let mut seen = HashSet::new();
-        let mut result = Vec::new();
-        for device in discovered {
-            if device.fingerprint.is_empty() || device.fingerprint == self.local_device.fingerprint
-            {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut result: Vec<ObservedDevice> = Vec::new();
+        for observed in discovered {
+            let fingerprint = &observed.device.fingerprint;
+            if fingerprint.is_empty() || fingerprint == &self.local_device.fingerprint {
                 continue;
             }
-            if seen.insert(device.fingerprint.clone()) {
-                result.push(device);
+            if let Some(index) = seen.get(fingerprint).copied() {
+                if result[index].observed_at < observed.observed_at {
+                    result[index] = observed;
+                }
+            } else {
+                seen.insert(fingerprint.clone(), result.len());
+                result.push(observed);
             }
         }
         ScanOutcome {
@@ -471,7 +537,10 @@ pub fn local_ipv4_interfaces() -> Result<Vec<(String, std::net::Ipv4Addr)>> {
 
 /// A reqwest client tuned for LAN discovery: accepts the self-signed certificates that
 /// every LocalSend device presents, and bounds each probe so the scan finishes promptly.
-fn build_discovery_client(client_identity: Option<reqwest::Identity>) -> Result<Client> {
+fn build_discovery_client(
+    client_identity: Option<reqwest::Identity>,
+    source_address: Option<IpAddr>,
+) -> Result<Client> {
     crate::crypto::ensure_crypto_provider();
     let mut builder = Client::builder()
         // **No proxy**, for the reason `LocalSendClient::new` says: the hosts
@@ -484,6 +553,9 @@ fn build_discovery_client(client_identity: Option<reqwest::Identity>) -> Result<
         .danger_accept_invalid_certs(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT);
+    if let Some(source_address) = source_address {
+        builder = builder.local_address(source_address);
+    }
     if let Some(identity) = client_identity {
         builder = builder.identity(identity);
     }
@@ -862,6 +934,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subnet_scan_binds_to_the_selected_local_address_and_uses_its_target_port() {
+        use crate::{DeviceInfo, Protocol};
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind local peer");
+        let target_port = listener.local_addr().expect("peer address").port();
+        let mut peer = DeviceInfo::new("loopback peer".into(), target_port, Protocol::Http);
+        peer.fingerprint = "loopback-peer-fingerprint".into();
+        let served = serde_json::to_vec(&peer).expect("encode peer");
+        let peer_task = tokio::spawn(async move {
+            let (mut stream, remote): (tokio::net::TcpStream, SocketAddr) =
+                listener.accept().await.expect("accept probe");
+            let mut request = [0u8; 1024];
+            let length = stream.read(&mut request).await.expect("read probe");
+            assert!(
+                String::from_utf8_lossy(&request[..length])
+                    .starts_with("GET /api/localsend/v2/info")
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        served.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write response headers");
+            stream.write_all(&served).await.expect("write peer");
+            remote.ip()
+        });
+
+        // The scanner advertises the usual LocalSend port, but the fixture peer
+        // is on an OS-assigned port. The actual outbound socket must also use
+        // 127.0.0.1, not the machine's default route.
+        let mut local = DeviceInfo::new("scanner".into(), 53317, Protocol::Http);
+        local.fingerprint = "scanner-fingerprint".into();
+        let discovery = HttpDiscovery::for_device_on_interface(local, Ipv4Addr::new(127, 0, 0, 1))
+            .expect("build interface-bound discovery");
+        let outcome = discovery
+            .scan_subnet_on_port_within("127.0.0.2", target_port, Duration::from_secs(1))
+            .await
+            .expect("scan loopback subnet");
+        let remote_ip = peer_task.await.expect("peer fixture completed");
+
+        assert!(
+            outcome
+                .devices
+                .iter()
+                .any(|observed| observed.device.fingerprint == "loopback-peer-fingerprint"),
+            "the peer on the explicitly configured target port must be discovered: {outcome:?}"
+        );
+        assert_eq!(
+            remote_ip,
+            Ipv4Addr::new(127, 0, 0, 1),
+            "the request must originate from the selected interface address"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_interface_is_the_source_of_the_actual_http_probe() {
+        use crate::{DeviceInfo, Protocol};
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::time::SystemTime;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let source_address = super::local_ipv4_interfaces()
+            .expect("list local interfaces")
+            .first()
+            .map(|(_, address)| *address)
+            .unwrap_or(Ipv4Addr::LOCALHOST);
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind loopback peer");
+        let target_port = listener.local_addr().expect("peer address").port();
+        let mut peer = DeviceInfo::new("bound-source peer".into(), target_port, Protocol::Http);
+        peer.fingerprint = "bound-source-fingerprint".into();
+        let served = serde_json::to_vec(&peer).expect("encode peer");
+        let peer_task = tokio::spawn(async move {
+            let (mut stream, remote): (tokio::net::TcpStream, SocketAddr) =
+                listener.accept().await.expect("accept probe");
+            let mut request = [0u8; 1024];
+            let length = stream.read(&mut request).await.expect("read probe");
+            assert!(
+                String::from_utf8_lossy(&request[..length])
+                    .starts_with("GET /api/localsend/v2/info")
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        served.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write response headers");
+            stream.write_all(&served).await.expect("write peer");
+            remote.ip()
+        });
+
+        let mut local = DeviceInfo::new("scanner".into(), 53317, Protocol::Http);
+        local.fingerprint = "scanner-fingerprint".into();
+        let discovery =
+            HttpDiscovery::for_device_on_interface(local, source_address).expect("build scanner");
+        let scan_started = SystemTime::now();
+        let outcome = discovery
+            .scan_hosts(vec!["127.0.0.1".into()], target_port, None, false)
+            .await;
+        let scan_finished = SystemTime::now();
+
+        assert!(
+            outcome
+                .devices
+                .iter()
+                .any(|observed| observed.device.fingerprint == "bound-source-fingerprint"),
+            "the loopback fixture must answer the real discovery probe"
+        );
+        let observed = outcome
+            .devices
+            .iter()
+            .find(|observed| observed.device.fingerprint == "bound-source-fingerprint")
+            .expect("fixture observation");
+        assert!(
+            observed.observed_at >= scan_started && observed.observed_at <= scan_finished,
+            "the observation timestamp must be captured while the actual scan is running"
+        );
+        assert_eq!(
+            peer_task.await.expect("peer fixture completed"),
+            source_address,
+            "the HTTP connection must originate from the selected IPv4 address"
+        );
+    }
+
+    #[tokio::test]
     async fn https_scanner_falls_back_to_an_http_server() {
         use crate::{LocalSendServer, Protocol};
 
@@ -888,10 +1101,10 @@ mod tests {
 
         let target = found
             .iter()
-            .find(|device| device.fingerprint == expected_fingerprint)
+            .find(|observed| observed.device.fingerprint == expected_fingerprint)
             .expect("the HTTP server must be discovered after the HTTPS attempt");
-        assert_eq!(target.alias, "http-scan-target");
-        assert_eq!(target.protocol, Protocol::Http);
+        assert_eq!(target.device.alias, "http-scan-target");
+        assert_eq!(target.device.protocol, Protocol::Http);
 
         server.stop().await;
     }
@@ -907,6 +1120,7 @@ mod tests {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
         use rustls::server::WebPkiClientVerifier;
         use rustls::{RootCertStore, ServerConfig};
+        use std::net::Ipv4Addr;
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -965,13 +1179,13 @@ mod tests {
             }
         });
 
-        let discovery = HttpDiscovery::new_with_client_certificate(
-            "scanner".into(),
-            port,
-            Protocol::Https,
+        let local = DeviceInfo::new("scanner".into(), port, Protocol::Https);
+        let discovery = HttpDiscovery::for_device_on_interface_with_client_certificate(
+            local,
+            Ipv4Addr::LOCALHOST,
             &client_certificate,
         )
-        .expect("build mTLS discovery client");
+        .expect("build interface-bound mTLS discovery client");
         let found = discovery
             .scan_hosts(vec!["127.0.0.1".into()], port, None, true)
             .await
@@ -979,10 +1193,10 @@ mod tests {
 
         let found_peer = found
             .iter()
-            .find(|device| device.fingerprint == server_certificate.fingerprint)
+            .find(|observed| observed.device.fingerprint == server_certificate.fingerprint)
             .expect("the peer must be found through /register");
-        assert_eq!(found_peer.alias, "mTLS register peer");
-        assert_eq!(found_peer.protocol, Protocol::Https);
+        assert_eq!(found_peer.device.alias, "mTLS register peer");
+        assert_eq!(found_peer.device.protocol, Protocol::Https);
         server_task.await.expect("test server completed");
     }
 

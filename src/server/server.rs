@@ -5,12 +5,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "https")]
 use axum_server::tls_rustls::RustlsConfig;
+
+/// Why a LocalSend listener cannot yet promise update-safe quiescence.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ServerQuiescenceError {
+    #[error("the LocalSend server is not running")]
+    NotRunning,
+    #[error("update quiescence has not been confirmed")]
+    NotConfirmed,
+    #[error("a transfer is pending or active")]
+    Busy,
+}
 
 pub struct LocalSendServer {
     device: DeviceInfo,
@@ -21,6 +33,8 @@ pub struct LocalSendServer {
     https: bool,
     #[cfg(feature = "https")]
     tls_cert: Option<crate::crypto::TlsCertificate>,
+    #[cfg(feature = "https")]
+    https_server_handle: Option<axum_server::Handle<std::net::SocketAddr>>,
     events_rx: Option<mpsc::Receiver<ServerEvent>>,
     /// Shared with the running [`ServerState`] so `set_auto_accept` takes
     /// effect on in-flight requests, not just at `start()` time.
@@ -34,6 +48,9 @@ pub struct LocalSendServer {
         Option<Arc<dyn super::crosscopy_authorized::CrossCopyAuthorizedUploadGate>>,
     sink: Arc<dyn crate::core::ReceiveSink>,
     state: Option<Arc<RwLock<ServerState>>>,
+    /// Serializes close/check and reopen operations, which span the server and
+    /// Web Share admission locks without holding either over network I/O.
+    quiescence_lock: Mutex<()>,
 }
 
 impl LocalSendServer {
@@ -80,6 +97,55 @@ impl LocalSendServer {
     /// Current auto-accept setting.
     pub fn auto_accept(&self) -> bool {
         self.auto_accept.load(Ordering::Relaxed)
+    }
+
+    /// Close new upload-session admission and check every server-owned receive
+    /// lifecycle, including reservations that have not emitted progress.
+    ///
+    /// A busy result leaves admission closed so existing transfers can drain;
+    /// call this again to re-check, or [`Self::cancel_update_quiescence`] if the
+    /// update is abandoned. Existing sessions remain allowed to upload.
+    pub async fn prepare_update_quiescence(
+        &self,
+    ) -> std::result::Result<(), ServerQuiescenceError> {
+        let _barrier = self.quiescence_lock.lock().await;
+        let state_ref = self
+            .state
+            .as_ref()
+            .ok_or(ServerQuiescenceError::NotRunning)?;
+        let (web, busy) = {
+            let mut state = state_ref.write().await;
+            state.update_quiescing = true;
+            let busy = state.current_session.is_some()
+                || state.crosscopy_authorized_session.is_some()
+                || state.crosscopy_authorized_active_upload.is_some()
+                || state.crosscopy_authorized_preparing > 0
+                || state.standard_active_uploads.load(Ordering::Acquire) > 0
+                || state.standard_active_prepares.load(Ordering::Acquire) > 0;
+            (Arc::clone(&state.web), busy)
+        };
+        let web_busy = web.write().await.set_admission_closed(!busy);
+        if busy || web_busy {
+            Err(ServerQuiescenceError::Busy)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Re-open session admission after an update attempt is cancelled or fails.
+    pub async fn cancel_update_quiescence(&self) -> std::result::Result<(), ServerQuiescenceError> {
+        let _barrier = self.quiescence_lock.lock().await;
+        let state_ref = self
+            .state
+            .as_ref()
+            .ok_or(ServerQuiescenceError::NotRunning)?;
+        let web = {
+            let mut state = state_ref.write().await;
+            state.update_quiescing = false;
+            Arc::clone(&state.web)
+        };
+        web.write().await.reopen_admission();
+        Ok(())
     }
 
     #[cfg(feature = "https")]
@@ -146,10 +212,15 @@ impl LocalSendServer {
                     crosscopy_authorized_session: None,
                     crosscopy_authorized_active_upload: None,
                     crosscopy_authorized_stopping: false,
+                    update_quiescing: false,
+                    crosscopy_authorized_preparing: 0,
+                    standard_active_uploads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    standard_active_prepares: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 }));
                 self.state = Some(state.clone());
                 let router = super::routes::create_router(state.clone(), Arc::clone(&web));
 
+                let https_server_handle = axum_server::Handle::<std::net::SocketAddr>::new();
                 let server = axum_server::from_tcp_rustls(std_listener, tls_config)
                     .map_err(|e| {
                         crate::error::LocalSendError::network(format!(
@@ -157,23 +228,31 @@ impl LocalSendServer {
                             e
                         ))
                     })?
+                    .handle(https_server_handle.clone())
                     .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>());
 
+                let shutdown_handle = https_server_handle.clone();
                 let handle = tokio::spawn(async move {
                     tracing::info!("Starting HTTPS server on port {}", bound_port);
+                    let mut server = Box::pin(server);
 
                     tokio::select! {
-                        res = server => {
+                        res = &mut server => {
                             if let Err(e) = res {
                                 tracing::error!("HTTPS server error: {}", e);
                             }
                         }
                         _ = shutdown_rx => {
                             tracing::info!("Stopping HTTPS server");
+                            shutdown_handle.graceful_shutdown(None);
+                            if let Err(e) = server.await {
+                                tracing::error!("HTTPS server error during graceful shutdown: {}", e);
+                            }
                         }
                     }
                 });
 
+                self.https_server_handle = Some(https_server_handle);
                 self.handle = Some(handle);
                 self.sweep_handle = Some(spawn_session_sweep(state));
                 Ok(())
@@ -215,6 +294,10 @@ impl LocalSendServer {
                 crosscopy_authorized_session: None,
                 crosscopy_authorized_active_upload: None,
                 crosscopy_authorized_stopping: false,
+                update_quiescing: false,
+                crosscopy_authorized_preparing: 0,
+                standard_active_uploads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                standard_active_prepares: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }));
             self.state = Some(state.clone());
             let router = super::routes::create_router(state.clone(), Arc::clone(&web));
@@ -361,6 +444,10 @@ impl LocalSendServer {
             handle.abort();
             let _ = handle.await;
         }
+        #[cfg(feature = "https")]
+        {
+            self.https_server_handle = None;
+        }
         // The two tasks above held the only other strong references, so dropping
         // ours is what actually releases `ServerState` — and with it the save
         // directory, the event sender, the pin gate, and any host-supplied
@@ -369,6 +456,55 @@ impl LocalSendServer {
         // agrees with what every other method already reports once stopped
         // ("Server is not running"), and `start` reassigns it.
         self.state = None;
+    }
+
+    /// Gracefully stop the listener only after the update admission barrier has
+    /// confirmed that no receive lifecycle is pending. Unlike [`Self::stop`],
+    /// this allows already-admitted HTTP responses to finish before returning.
+    pub async fn stop_for_update(&mut self) -> std::result::Result<(), ServerQuiescenceError> {
+        let _barrier = self.quiescence_lock.lock().await;
+        let state_ref = self
+            .state
+            .as_ref()
+            .ok_or(ServerQuiescenceError::NotRunning)?;
+        let (web, busy) = {
+            let state = state_ref.read().await;
+            if !state.update_quiescing {
+                return Err(ServerQuiescenceError::NotConfirmed);
+            }
+            let busy = state.current_session.is_some()
+                || state.crosscopy_authorized_session.is_some()
+                || state.crosscopy_authorized_active_upload.is_some()
+                || state.crosscopy_authorized_preparing > 0
+                || state.standard_active_uploads.load(Ordering::Acquire) > 0
+                || state.standard_active_prepares.load(Ordering::Acquire) > 0;
+            (Arc::clone(&state.web), busy)
+        };
+        let web_busy = web.write().await.set_admission_closed(true);
+        if busy || web_busy {
+            return Err(ServerQuiescenceError::Busy);
+        }
+
+        #[cfg(feature = "https")]
+        if let Some(handle) = &self.https_server_handle {
+            handle.graceful_shutdown(None);
+        }
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.sweep_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+        #[cfg(feature = "https")]
+        {
+            self.https_server_handle = None;
+        }
+        self.state = None;
+        Ok(())
     }
 
     pub async fn start_web_share(
@@ -629,6 +765,8 @@ impl LocalSendServerBuilder {
             https,
             #[cfg(feature = "https")]
             tls_cert: None,
+            #[cfg(feature = "https")]
+            https_server_handle: None,
             events_rx: None,
             auto_accept: Arc::new(AtomicBool::new(self.auto_accept)),
             accept_timeout: self.accept_timeout,
@@ -638,6 +776,7 @@ impl LocalSendServerBuilder {
             crosscopy_authorized_upload_gate: self.crosscopy_authorized_upload_gate,
             sink: self.sink,
             state: None,
+            quiescence_lock: Mutex::new(()),
         };
         #[cfg(feature = "https")]
         if let Some(cert) = tls_cert {

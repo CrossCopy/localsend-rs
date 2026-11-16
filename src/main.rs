@@ -6,28 +6,9 @@ async fn main() -> anyhow::Result<()> {
     localsend_rs::crypto::ensure_crypto_provider();
 
     use clap::Parser;
-    #[cfg(feature = "tui")]
-    use localsend_rs::cli::run_tui;
-    use localsend_rs::cli::{Cli, Commands};
-    use localsend_rs::cli::{run_discover, run_receive, run_send};
+    use localsend_rs::cli::Cli;
 
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Discover(cmd) => {
-            run_discover(cmd).await?;
-        }
-        Commands::Receive(cmd) => {
-            run_receive(cmd).await?;
-        }
-        Commands::Send(cmd) => {
-            run_send(cmd).await?;
-        }
-        #[cfg(feature = "tui")]
-        Commands::Tui(cmd) => {
-            run_tui(cmd).await?;
-        }
-    }
-
-    Ok(())
+    // Parsing and dispatch both live in the library so the desktop app, which
+    // forwards its unknown arguments here, runs exactly the same commands.
+    Cli::parse().run().await
 }

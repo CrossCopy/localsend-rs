@@ -3,6 +3,7 @@ use super::{
     select_multicast_candidate_addresses,
 };
 use crate::LocalSendError;
+use crate::discovery::Discovery;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 
@@ -30,6 +31,26 @@ fn multicast_config_rejects_non_multicast_address() {
         result,
         Err(LocalSendError::InvalidMulticastAddress(_))
     ));
+}
+
+#[tokio::test]
+async fn stop_and_wait_allows_the_same_discovery_to_restart() {
+    let config = MulticastConfig::new(
+        crate::DEFAULT_MULTICAST_ADDRESS.parse().unwrap(),
+        crate::DEFAULT_MULTICAST_PORT,
+        Some(BTreeSet::new()),
+    )
+    .unwrap();
+    let mut discovery = MulticastDiscovery::new_with_device_and_config(
+        crate::DeviceInfo::new("restart test".into(), 0, crate::Protocol::Http),
+        config,
+    )
+    .unwrap();
+
+    discovery.start().await.unwrap();
+    discovery.stop_and_wait().await;
+    discovery.start().await.unwrap();
+    discovery.stop_and_wait().await;
 }
 
 #[test]

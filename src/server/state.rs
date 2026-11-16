@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +20,35 @@ pub(crate) struct ConsentReservation {
     /// Wakes the parked `prepare-upload` handler when the sender gives up, so
     /// the slot is released at once rather than at the accept timeout.
     pub(crate) withdraw: CancellationToken,
+}
+
+pub(crate) struct ActiveStandardUploadGuard(Arc<AtomicUsize>);
+pub(crate) struct ActiveStandardPrepareGuard(Arc<AtomicUsize>);
+
+impl ActiveStandardUploadGuard {
+    pub(crate) fn new(active_uploads: &Arc<AtomicUsize>) -> Self {
+        active_uploads.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(active_uploads))
+    }
+}
+
+impl Drop for ActiveStandardUploadGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ActiveStandardPrepareGuard {
+    pub(crate) fn new(active_prepares: &Arc<AtomicUsize>) -> Self {
+        active_prepares.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(active_prepares))
+    }
+}
+
+impl Drop for ActiveStandardPrepareGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub struct ServerState {
@@ -42,6 +71,18 @@ pub struct ServerState {
     pub auto_accept: Arc<AtomicBool>,
     pub accept_timeout: std::time::Duration,
     pub session_timeout: std::time::Duration,
+    /// Closes both standard and protected prepare admission. Uploads belonging
+    /// to sessions admitted before this point remain able to drain.
+    pub(crate) update_quiescing: bool,
+    /// An external File-v3 prepare can await a host-owned linear slot outside
+    /// this lock. It remains visible until installed or terminalized.
+    pub(crate) crosscopy_authorized_preparing: usize,
+    /// Normal uploads can outlive `current_session` after a sender cancels.
+    /// This count covers the remainder of those handlers' sink cleanup.
+    pub(crate) standard_active_uploads: Arc<AtomicUsize>,
+    /// A standard prepare that reserved consent but has not returned its HTTP
+    /// response. Cancellation can clear the session while event delivery waits.
+    pub(crate) standard_active_prepares: Arc<AtomicUsize>,
     pub receive_rate_limit_bytes_per_second: Option<u64>,
     pub pin_gate: crate::server::pin::PinGate,
     /// The Web Share half, behind its own lock.

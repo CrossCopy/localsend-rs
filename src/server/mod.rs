@@ -25,5 +25,5 @@ pub use crosscopy_authorized::{
 };
 pub use events::{PendingRequest, PendingWebShareRequest, ServerEvent, TransferDecision};
 pub use pin::{GUESS_PRESSURE, LOCKOUT, MAX_FAILURES, MAX_TRACKED_PEERS, PinGate, PinVerdict};
-pub use server::{LocalSendServer, LocalSendServerBuilder};
+pub use server::{LocalSendServer, LocalSendServerBuilder, ServerQuiescenceError};
 pub use web_share::{WebShareFile, WebShareHost, WebShareSource, WebShareState, web_share_router};

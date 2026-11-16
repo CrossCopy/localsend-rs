@@ -13,9 +13,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock;
 use tokio_util::io::ReaderStream;
+
+/// A browser that abandons an approved download must not reserve update
+/// quiescence forever; an idle session remains valid for five minutes.
+const WEB_SHARE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Everything the Web Share half of the protocol needs, and nothing else.
 ///
@@ -46,6 +51,10 @@ pub struct WebShareHost {
     pub events_tx: tokio::sync::mpsc::Sender<crate::server::events::ServerEvent>,
     pub accept_timeout: std::time::Duration,
     pub share: Option<WebShareState>,
+    admission_closed: bool,
+    fully_quiescent: bool,
+    active_downloads: Arc<AtomicUsize>,
+    active_prepares: Arc<AtomicUsize>,
 }
 
 impl WebShareHost {
@@ -59,7 +68,58 @@ impl WebShareHost {
             events_tx,
             accept_timeout,
             share: None,
+            admission_closed: false,
+            fully_quiescent: false,
+            active_downloads: Arc::new(AtomicUsize::new(0)),
+            active_prepares: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Close new Web Share preparations, expire idle abandoned sessions, and
+    /// report pending or active downloads.
+    pub(crate) fn set_admission_closed(&mut self, fully_quiescent_if_idle: bool) -> bool {
+        self.admission_closed = true;
+        let active_download = self.active_downloads.load(Ordering::Acquire) > 0;
+        if !active_download && let Some(share) = self.share.as_mut() {
+            let consent_timeout = self.accept_timeout;
+            share.sessions.retain(|_, session| {
+                let timeout = if session.approved {
+                    WEB_SHARE_SESSION_TIMEOUT
+                } else {
+                    consent_timeout
+                };
+                session.last_activity.elapsed() < timeout
+            });
+        }
+        let pending_session = self.share.as_ref().is_some_and(|share| {
+            share.sessions.values().any(|session| {
+                !session.approved || session.downloaded_files.len() < share.files.len()
+            })
+        });
+        let active_prepare = self.active_prepares.load(Ordering::Acquire) > 0;
+        let busy = active_download || active_prepare || pending_session;
+        self.fully_quiescent = fully_quiescent_if_idle && !busy;
+        busy
+    }
+
+    pub(crate) fn reopen_admission(&mut self) {
+        self.admission_closed = false;
+        self.fully_quiescent = false;
+    }
+}
+
+struct ActiveWebSharePrepareGuard(Arc<AtomicUsize>);
+
+impl ActiveWebSharePrepareGuard {
+    fn new(active_prepares: &Arc<AtomicUsize>) -> Self {
+        active_prepares.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(active_prepares))
+    }
+}
+
+impl Drop for ActiveWebSharePrepareGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -137,13 +197,17 @@ impl WebShareFile {
 }
 
 #[derive(Debug)]
-/// One browser talking to a running share. `pub` for the same reason
-/// [`WebShareState`] is.
+/// One browser talking to a running share. Approved but idle sessions expire
+/// after [`WEB_SHARE_SESSION_TIMEOUT`], so a browser abandoned after prepare
+/// cannot keep update quiescence busy forever.
+///
+/// `pub` for the same reason [`WebShareState`] is.
 pub struct WebShareSession {
     pub ip: IpAddr,
     pub approved: bool,
     pub response_tx: Option<tokio::sync::oneshot::Sender<bool>>,
     pub downloaded_files: HashSet<FileId>,
+    last_activity: tokio::time::Instant,
 }
 
 #[derive(Debug)]
@@ -196,17 +260,31 @@ async fn handle_prepare_download(
     let mut state = state_ref.write().await;
     let device = state.device.clone();
     let events_tx = state.events_tx.clone();
+    let admission_closed = state.admission_closed;
+    let accept_timeout = state.accept_timeout;
+    let active_prepares = Arc::clone(&state.active_prepares);
+    if state.fully_quiescent {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let Some(web) = state.share.as_mut() else {
         return (StatusCode::FORBIDDEN, "Web share not initialized").into_response();
     };
 
-    if let Some(session_id) = query.session_id
-        && web
+    if let Some(session_id) = query.session_id {
+        let reusable = web
             .sessions
             .get(&session_id)
-            .is_some_and(|session| session.approved && session.ip == peer.ip())
-    {
-        return prepare_response(device, session_id, web);
+            .is_some_and(|session| session.approved && session.ip == peer.ip());
+        if reusable {
+            if let Some(session) = web.sessions.get_mut(&session_id) {
+                session.last_activity = tokio::time::Instant::now();
+            }
+            return prepare_response(device, session_id, web);
+        }
+    }
+
+    if admission_closed {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
 
     match web.pin_gate.check(query.pin.as_deref(), peer.ip()) {
@@ -217,6 +295,7 @@ async fn handle_prepare_download(
 
     let session_id = SessionId::new();
     let approved = web.auto_accept;
+    let _active_prepare = ActiveWebSharePrepareGuard::new(&active_prepares);
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     web.sessions.insert(
         session_id.clone(),
@@ -225,6 +304,7 @@ async fn handle_prepare_download(
             approved,
             response_tx: (!approved).then_some(response_tx),
             downloaded_files: HashSet::new(),
+            last_activity: tokio::time::Instant::now(),
         },
     );
     if approved {
@@ -234,20 +314,24 @@ async fn handle_prepare_download(
         return prepare_response(device, session_id, web);
     }
 
-    let timeout = state.accept_timeout;
+    let deadline = tokio::time::Instant::now() + accept_timeout;
     drop(state);
-    if events_tx
-        .send(crate::server::events::ServerEvent::WebShareRequest(
-            crate::server::events::PendingWebShareRequest::new(session_id.clone(), peer.ip()),
-        ))
-        .await
-        .is_err()
-    {
+    let event = crate::server::events::ServerEvent::WebShareRequest(
+        crate::server::events::PendingWebShareRequest::new(session_id.clone(), peer.ip()),
+    );
+    if !matches!(
+        tokio::time::timeout_at(deadline, events_tx.send(event)).await,
+        Ok(Ok(()))
+    ) {
+        let mut state = state_ref.write().await;
+        if let Some(web) = state.share.as_mut() {
+            web.sessions.remove(&session_id);
+        }
         return StatusCode::FORBIDDEN.into_response();
     }
 
     let accepted = matches!(
-        tokio::time::timeout(timeout, response_rx).await,
+        tokio::time::timeout_at(deadline, response_rx).await,
         Ok(Ok(true))
     );
     let mut state = state_ref.write().await;
@@ -259,10 +343,12 @@ async fn handle_prepare_download(
         web.sessions.remove(&session_id);
         return (StatusCode::FORBIDDEN, "File transfer rejected").into_response();
     }
-    if let Some(session) = web.sessions.get_mut(&session_id) {
-        session.approved = true;
-        session.response_tx = None;
-    }
+    let Some(session) = web.sessions.get_mut(&session_id) else {
+        return (StatusCode::FORBIDDEN, "File transfer rejected").into_response();
+    };
+    session.approved = true;
+    session.response_tx = None;
+    session.last_activity = tokio::time::Instant::now();
     prepare_response(device, session_id, web)
 }
 
@@ -297,22 +383,34 @@ async fn handle_download(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
-    let (file, events_tx) = {
-        let state = state_ref.read().await;
-        let Some(web) = state.share.as_ref() else {
+    let (file, events_tx, active_download) = {
+        let mut state = state_ref.write().await;
+        if state.fully_quiescent {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        let Some(web) = state.share.as_mut() else {
             return StatusCode::FORBIDDEN.into_response();
         };
-        if !web
+        let authorized = web
             .sessions
             .get(&query.session_id)
-            .is_some_and(|session| session.approved && session.ip == peer.ip())
-        {
+            .is_some_and(|session| session.approved && session.ip == peer.ip());
+        if !authorized {
             return StatusCode::FORBIDDEN.into_response();
         }
         let Some(file) = web.files.get(&query.file_id) else {
             return StatusCode::FORBIDDEN.into_response();
         };
-        (file.clone(), state.events_tx.clone())
+        let file = file.clone();
+        if let Some(session) = web.sessions.get_mut(&query.session_id) {
+            session.last_activity = tokio::time::Instant::now();
+        }
+        state.active_downloads.fetch_add(1, Ordering::AcqRel);
+        (
+            file,
+            state.events_tx.clone(),
+            ActiveWebShareDownload(Arc::clone(&state.active_downloads)),
+        )
     };
 
     let (source, length): (
@@ -345,6 +443,7 @@ async fn handle_download(
         bytes_sent: 0,
         total_bytes: length,
         finished: false,
+        _active_download: active_download,
     });
 
     let safe_name = file.metadata.file_name.replace(['/', '\\'], "-");
@@ -374,6 +473,15 @@ struct WebShareProgressStream {
     bytes_sent: u64,
     total_bytes: u64,
     finished: bool,
+    _active_download: ActiveWebShareDownload,
+}
+
+struct ActiveWebShareDownload(Arc<AtomicUsize>);
+
+impl Drop for ActiveWebShareDownload {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Stream for WebShareProgressStream {
@@ -426,6 +534,7 @@ impl WebShareProgressStream {
                     return;
                 };
                 session.downloaded_files.insert(file_id);
+                session.last_activity = tokio::time::Instant::now();
                 session.downloaded_files.len() == file_count
             };
             if session_done {
@@ -474,4 +583,106 @@ async fn handle_web_i18n(State(state_ref): State<Arc<RwLock<WebShareHost>>>) -> 
         "size": "Size"
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_barrier_reclaims_an_abandoned_approved_share_session_after_its_idle_ttl() {
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel(4);
+        let mut host = WebShareHost::new(
+            DeviceInfo::new(
+                "receiver".to_string(),
+                53317,
+                crate::protocol::Protocol::Http,
+            ),
+            events_tx,
+            std::time::Duration::from_secs(30),
+        );
+        let file = WebShareFile::inline("share.bin", b"share".to_vec());
+        let mut share = WebShareState::new(vec![file], None, true);
+        share.sessions.insert(
+            SessionId::new(),
+            WebShareSession {
+                ip: "127.0.0.1".parse().unwrap(),
+                approved: true,
+                response_tx: None,
+                downloaded_files: HashSet::new(),
+                last_activity: tokio::time::Instant::now() - WEB_SHARE_SESSION_TIMEOUT,
+            },
+        );
+        host.share = Some(share);
+
+        assert!(
+            !host.set_admission_closed(true),
+            "an abandoned session past its idle TTL must not wedge updates forever"
+        );
+        assert!(
+            host.share.as_ref().unwrap().sessions.is_empty(),
+            "expired credentials must no longer authorize a later download"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_web_share_session_stays_busy_until_blocked_event_delivery_returns() {
+        use axum::extract::{ConnectInfo, Query, State};
+
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel(1);
+        events_tx
+            .try_send(crate::server::events::ServerEvent::PeerRegistered(
+                DeviceInfo::new(
+                    "already queued".to_string(),
+                    53317,
+                    crate::protocol::Protocol::Http,
+                ),
+            ))
+            .unwrap();
+        let accept_timeout = std::time::Duration::from_secs(30);
+        let mut host = WebShareHost::new(
+            DeviceInfo::new(
+                "receiver".to_string(),
+                53317,
+                crate::protocol::Protocol::Http,
+            ),
+            events_tx,
+            accept_timeout,
+        );
+        host.share = Some(WebShareState::new(
+            vec![WebShareFile::inline("share.bin", b"share".to_vec())],
+            None,
+            false,
+        ));
+        let host = Arc::new(RwLock::new(host));
+        let prepare_host = Arc::clone(&host);
+        let prepare = tokio::spawn(async move {
+            handle_prepare_download(
+                State(prepare_host),
+                ConnectInfo("127.0.0.1:40000".parse().unwrap()),
+                Query(PrepareDownloadQuery {
+                    session_id: None,
+                    pin: None,
+                }),
+            )
+            .await
+        });
+
+        while host.read().await.active_prepares.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(accept_timeout + std::time::Duration::from_millis(1)).await;
+        {
+            let mut state = host.write().await;
+            assert!(
+                state.set_admission_closed(true),
+                "the handler remains active even after its expired session is reclaimed"
+            );
+            assert!(state.share.as_ref().unwrap().sessions.is_empty());
+        }
+
+        let response = prepare.await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!host.write().await.set_admission_closed(true));
+    }
 }

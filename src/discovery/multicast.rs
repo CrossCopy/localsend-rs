@@ -10,12 +10,13 @@ use crate::protocol::{
 use if_addrs::{IfAddr, get_if_addrs};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex as AsyncMutex, broadcast, watch};
 
 mod announcement;
 mod interfaces;
@@ -24,6 +25,11 @@ use announcement::{AnnouncementSendSummary, send_announcement_round};
 use interfaces::{select_interface_addresses, select_multicast_candidate_addresses};
 
 pub type Result<T> = std::result::Result<T, LocalSendError>;
+
+/// An announcement responder is best-effort discovery work, not a transfer.
+/// Bound registration so a peer that accepts TCP but never answers cannot
+/// prevent an awaited stop from quiescing forever.
+const ANNOUNCEMENT_REGISTER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MulticastConfig {
@@ -68,11 +74,137 @@ impl Default for MulticastConfig {
 pub struct MulticastDiscovery {
     local_device: DeviceInfo,
     config: MulticastConfig,
-    sockets: Vec<Arc<UdpSocket>>,
-    running: Arc<AtomicBool>,
+    lifecycle: Arc<DiscoveryLifecycle>,
     tx: Option<broadcast::Sender<DeviceInfo>>,
     #[cfg(feature = "https")]
     client_certificate: Option<crate::crypto::TlsCertificate>,
+}
+
+/// Coordinates the current multicast run across clones of a discovery value.
+///
+/// The transition lock serializes starts and awaited stops. Synchronous
+/// `Discovery::stop` only signals the current run; it never blocks on network
+/// work and leaves final socket release to `stop_and_wait` or the next start.
+struct DiscoveryLifecycle {
+    current: Mutex<Option<Arc<DiscoveryRun>>>,
+    transition: AsyncMutex<()>,
+}
+
+/// One generation of discovery workers. A fresh stop signal per generation
+/// prevents old workers from observing a later restart as permission to resume.
+struct DiscoveryRun {
+    running: AtomicBool,
+    stop_tx: watch::Sender<bool>,
+    active_tasks: watch::Sender<usize>,
+    sockets: Mutex<Vec<Arc<UdpSocket>>>,
+}
+
+struct DiscoveryTaskGuard {
+    run: Arc<DiscoveryRun>,
+}
+
+impl DiscoveryLifecycle {
+    fn new() -> Self {
+        Self {
+            current: Mutex::new(None),
+            transition: AsyncMutex::new(()),
+        }
+    }
+
+    fn current(&self) -> Option<Arc<DiscoveryRun>> {
+        self.current.lock().unwrap().clone()
+    }
+
+    fn clear_if_current(&self, run: &Arc<DiscoveryRun>) {
+        let mut current = self.current.lock().unwrap();
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, run))
+        {
+            *current = None;
+        }
+    }
+}
+
+impl DiscoveryRun {
+    fn new() -> Self {
+        let (stop_tx, _) = watch::channel(false);
+        let (active_tasks, _) = watch::channel(0);
+        Self {
+            running: AtomicBool::new(true),
+            stop_tx,
+            active_tasks,
+            sockets: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn request_stop(&self) {
+        self.running.store(false, Ordering::Release);
+        self.stop_tx.send_replace(true);
+        self.clear_sockets_if_idle();
+    }
+
+    fn clear_sockets_if_idle(&self) {
+        if *self.active_tasks.borrow() == 0 {
+            self.sockets.lock().unwrap().clear();
+        }
+    }
+
+    fn sockets(&self) -> Vec<Arc<UdpSocket>> {
+        self.sockets.lock().unwrap().clone()
+    }
+
+    fn add_task_guard(self: &Arc<Self>) -> Option<DiscoveryTaskGuard> {
+        if !self.running.load(Ordering::Acquire) {
+            return None;
+        }
+
+        self.active_tasks.send_modify(|active| *active += 1);
+        let guard = DiscoveryTaskGuard { run: self.clone() };
+        if !self.running.load(Ordering::Acquire) {
+            drop(guard);
+            return None;
+        }
+        Some(guard)
+    }
+
+    fn spawn<F>(self: &Arc<Self>, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let Some(guard) = self.add_task_guard() else {
+            return false;
+        };
+        tokio::spawn(async move {
+            let _guard = guard;
+            future.await;
+        });
+        true
+    }
+
+    async fn wait_for_idle(&self) {
+        let mut active = self.active_tasks.subscribe();
+        loop {
+            if *active.borrow_and_update() == 0 {
+                return;
+            }
+            if active.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for DiscoveryTaskGuard {
+    fn drop(&mut self) {
+        self.run.active_tasks.send_modify(|active| {
+            debug_assert!(*active > 0);
+            *active = active.saturating_sub(1);
+        });
+        if !self.run.running.load(Ordering::Acquire) {
+            self.run.clear_sockets_if_idle();
+        }
+    }
 }
 
 impl MulticastDiscovery {
@@ -103,8 +235,7 @@ impl MulticastDiscovery {
         Ok(Self {
             local_device: device,
             config,
-            sockets: Vec::new(),
-            running: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(DiscoveryLifecycle::new()),
             tx: Some(tx),
             #[cfg(feature = "https")]
             client_certificate: None,
@@ -130,111 +261,189 @@ impl MulticastDiscovery {
         }
         self.client_certificate = Some(certificate);
     }
+
+    /// Requests discovery shutdown and waits until every receive, response,
+    /// and announcement task from the current run has returned. Unlike the
+    /// synchronous [`Discovery::stop`], this is a quiescence boundary: after it
+    /// resolves, the run's sockets have been released and restart is safe.
+    ///
+    /// Active HTTP registrations are allowed to finish; they are never aborted
+    /// just because shutdown was requested.
+    pub async fn stop_and_wait(&self) {
+        let _transition = self.lifecycle.transition.lock().await;
+        let Some(run) = self.lifecycle.current() else {
+            return;
+        };
+
+        run.request_stop();
+        run.wait_for_idle().await;
+        run.sockets.lock().unwrap().clear();
+        self.lifecycle.clear_if_current(&run);
+    }
 }
 
 #[async_trait::async_trait]
 impl Discovery for MulticastDiscovery {
     async fn start(&mut self) -> std::result::Result<(), LocalSendError> {
-        if self.running.load(Ordering::Relaxed) {
-            return Err(LocalSendError::network("Discovery already running"));
+        let _transition = self.lifecycle.transition.lock().await;
+        if let Some(previous) = self.lifecycle.current() {
+            if previous.running.load(Ordering::Acquire) {
+                return Err(LocalSendError::network("Discovery already running"));
+            }
+
+            previous.request_stop();
+            previous.wait_for_idle().await;
+            previous.sockets.lock().unwrap().clear();
+            self.lifecycle.clear_if_current(&previous);
         }
 
-        let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, self.config.port));
-        let sockets = Self::multicast_interfaces(self.config.interface_names.as_ref())?
-            .into_iter()
-            .map(|interface| create_reusable_udp_socket(&bind_addr, interface, self.config.address))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(Arc::new)
-            .collect::<Vec<_>>();
+        if self.tx.is_none() {
+            let (tx, _rx) = broadcast::channel(100);
+            self.tx = Some(tx);
+        }
 
-        self.sockets = sockets.clone();
-        self.running.store(true, Ordering::Relaxed);
+        let run = Arc::new(DiscoveryRun::new());
+        *self.lifecycle.current.lock().unwrap() = Some(run.clone());
+
+        let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, self.config.port));
+        let sockets = match Self::multicast_interfaces(self.config.interface_names.as_ref())
+            .and_then(|interfaces| {
+                interfaces
+                    .into_iter()
+                    .map(|interface| {
+                        create_reusable_udp_socket(&bind_addr, interface, self.config.address)
+                            .map(Arc::new)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            }) {
+            Ok(sockets) => sockets,
+            Err(error) => {
+                run.request_stop();
+                self.lifecycle.clear_if_current(&run);
+                return Err(error);
+            }
+        };
+
+        if !run.running.load(Ordering::Acquire) {
+            self.lifecycle.clear_if_current(&run);
+            return Err(LocalSendError::network(
+                "Discovery was stopped while starting",
+            ));
+        }
+        *run.sockets.lock().unwrap() = sockets.clone();
 
         for socket in sockets {
             let tx = self.tx.as_ref().unwrap().clone();
             let local_fingerprint = self.local_device.fingerprint.clone();
-            let running = self.running.clone();
             let local_device = self.local_device.clone();
             let multicast_addr = SocketAddr::from((self.config.address, self.config.port));
+            let mut stop = run.stop_tx.subscribe();
+            let receiver_run = run.clone();
             #[cfg(feature = "https")]
             let client_certificate = self.client_certificate.clone();
 
-            tokio::spawn(async move {
+            run.spawn(async move {
                 let mut buf = vec![0u8; 65536];
 
-                while running.load(Ordering::Relaxed) {
-                    match tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
-                        .await
-                    {
-                        Ok(Ok((len, src))) => {
-                            if len > 0 {
-                                let msg = match String::from_utf8(buf[..len].to_vec()) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-
-                                if let Ok(announcement) =
-                                    serde_json::from_str::<AnnouncementMessage>(&msg)
-                                {
-                                    if announcement.fingerprint == local_fingerprint {
-                                        continue;
-                                    }
-
-                                    let device = DeviceInfo {
-                                        alias: announcement.alias.clone(),
-                                        version: announcement.version.clone(),
-                                        device_model: announcement.device_model.clone(),
-                                        device_type: announcement.device_type,
-                                        fingerprint: announcement.fingerprint.clone(),
-                                        port: announcement.port,
-                                        protocol: announcement.protocol,
-                                        download: announcement.download,
-                                        ip: Some(src.ip().to_string()),
-                                    };
-
-                                    let is_announcement = announcement.announce
-                                        || announcement.announcement.unwrap_or(false);
-                                    let _ = tx.send(device.clone());
-
-                                    if is_announcement {
-                                        let local_device = local_device.clone();
-                                        let socket = socket.clone();
-                                        #[cfg(feature = "https")]
-                                        let client_certificate = client_certificate.clone();
-
-                                        tokio::spawn(async move {
-                                            Self::respond_to_announcement(
-                                                &device,
-                                                &local_device,
-                                                &socket,
-                                                multicast_addr,
-                                                #[cfg(feature = "https")]
-                                                client_certificate,
-                                            )
-                                            .await;
-                                        });
-                                    }
-                                }
+                loop {
+                    tokio::select! {
+                        biased;
+                        changed = stop.changed() => {
+                            if changed.is_err() || *stop.borrow() {
+                                break;
                             }
                         }
-                        Ok(Err(_)) | Err(_) => continue,
+                        result = socket.recv_from(&mut buf) => {
+                            let Ok((len, src)) = result else {
+                                continue;
+                            };
+                            if len == 0 {
+                                continue;
+                            }
+
+                            let msg = match String::from_utf8(buf[..len].to_vec()) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            let Ok(announcement) =
+                                serde_json::from_str::<AnnouncementMessage>(&msg)
+                            else {
+                                continue;
+                            };
+                            if announcement.fingerprint == local_fingerprint {
+                                continue;
+                            }
+
+                            let device = DeviceInfo {
+                                alias: announcement.alias.clone(),
+                                version: announcement.version.clone(),
+                                device_model: announcement.device_model.clone(),
+                                device_type: announcement.device_type,
+                                fingerprint: announcement.fingerprint.clone(),
+                                port: announcement.port,
+                                protocol: announcement.protocol,
+                                download: announcement.download,
+                                ip: Some(src.ip().to_string()),
+                            };
+                            let is_announcement =
+                                announcement.announce || announcement.announcement.unwrap_or(false);
+                            let _ = tx.send(device.clone());
+
+                            if is_announcement && receiver_run.running.load(Ordering::Acquire) {
+                                let response_local_device = local_device.clone();
+                                let response_socket = socket.clone();
+                                let response_run = receiver_run.clone();
+                                #[cfg(feature = "https")]
+                                let client_certificate = client_certificate.clone();
+
+                                receiver_run.spawn(async move {
+                                    Self::respond_to_announcement(
+                                        &device,
+                                        &response_local_device,
+                                        &response_socket,
+                                        multicast_addr,
+                                        &response_run,
+                                        #[cfg(feature = "https")]
+                                        client_certificate,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
                     }
                 }
             });
+        }
+
+        if !run.running.load(Ordering::Acquire) {
+            run.wait_for_idle().await;
+            run.sockets.lock().unwrap().clear();
+            self.lifecycle.clear_if_current(&run);
+            return Err(LocalSendError::network(
+                "Discovery was stopped while starting",
+            ));
         }
 
         Ok(())
     }
 
     fn stop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        self.sockets.clear();
+        if let Some(run) = self.lifecycle.current() {
+            run.request_stop();
+        }
         self.tx = None;
     }
 
     async fn announce_presence(&self) -> std::result::Result<(), LocalSendError> {
-        if self.sockets.is_empty() {
+        let run = self
+            .lifecycle
+            .current()
+            .ok_or_else(|| LocalSendError::network("Discovery not started"))?;
+        let _task = run
+            .add_task_guard()
+            .ok_or_else(|| LocalSendError::network("Discovery not started"))?;
+        let sockets = run.sockets();
+        if sockets.is_empty() {
             return Err(LocalSendError::network("Discovery not started"));
         }
 
@@ -255,14 +464,26 @@ impl Discovery for MulticastDiscovery {
         let buf = msg.as_bytes();
         let multicast_addr = SocketAddr::from((self.config.address, self.config.port));
 
-        // Send announcement multiple times with delays to improve reliability
+        // Send announcement multiple times with delays to improve reliability.
+        // The task guard makes stop_and_wait wait rather than release sockets
+        // or restart while these announcements are still in flight.
         let delays = [100, 500, 2000];
         let mut summary = AnnouncementSendSummary::default();
         let mut attempt = 0;
+        let mut stop = run.stop_tx.subscribe();
         for delay in delays {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-            send_announcement_round(&self.sockets, buf, multicast_addr, attempt, &mut summary)
-                .await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                _ = stop.changed() => {
+                    return Err(LocalSendError::network("Discovery stopped during announcement"));
+                }
+            }
+            if !run.running.load(Ordering::Acquire) {
+                return Err(LocalSendError::network(
+                    "Discovery stopped during announcement",
+                ));
+            }
+            send_announcement_round(&sockets, buf, multicast_addr, attempt, &mut summary).await;
             attempt += 1;
         }
 
@@ -274,9 +495,18 @@ impl Discovery for MulticastDiscovery {
                 delay_ms = delay,
                 "every LocalSend multicast interface failed; retrying after a startup grace period"
             );
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-            send_announcement_round(&self.sockets, buf, multicast_addr, attempt, &mut summary)
-                .await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                _ = stop.changed() => {
+                    return Err(LocalSendError::network("Discovery stopped during announcement"));
+                }
+            }
+            if !run.running.load(Ordering::Acquire) {
+                return Err(LocalSendError::network(
+                    "Discovery stopped during announcement",
+                ));
+            }
+            send_announcement_round(&sockets, buf, multicast_addr, attempt, &mut summary).await;
             attempt += 1;
         }
 
@@ -293,8 +523,8 @@ impl Discovery for MulticastDiscovery {
             return;
         };
 
+        let mut rx = tx.subscribe();
         tokio::spawn(async move {
-            let mut rx = tx.subscribe();
             while let Ok(device) = rx.recv().await {
                 callback(device);
             }
@@ -387,11 +617,15 @@ impl MulticastDiscovery {
         duration: Duration,
         devices: Arc<RwLock<Vec<DeviceInfo>>>,
     ) -> Result<()> {
-        if !self.running.load(Ordering::Relaxed) {
+        if self
+            .lifecycle
+            .current()
+            .is_none_or(|run| !run.running.load(Ordering::Acquire))
+        {
             self.start().await?;
         }
 
-        // Register a callback to update the devices list during the scan
+        // Register a callback to update the devices list during the scan.
         let devices_clone = devices.clone();
         self.on_discovered(move |device| {
             let mut guard = devices_clone.write().unwrap();
@@ -400,13 +634,13 @@ impl MulticastDiscovery {
             }
         });
 
-        // Clear devices
+        // Clear devices.
         devices.write().unwrap().clear();
 
-        // Announce
+        // Announce.
         self.announce_presence().await?;
 
-        // Wait for responses
+        // Wait for responses.
         tokio::time::sleep(duration).await;
 
         Ok(())
@@ -417,6 +651,7 @@ impl MulticastDiscovery {
         local_device: &DeviceInfo,
         socket: &UdpSocket,
         multicast_addr: SocketAddr,
+        run: &DiscoveryRun,
         #[cfg(feature = "https")] client_certificate: Option<crate::crypto::TlsCertificate>,
     ) {
         tracing::debug!(
@@ -437,21 +672,32 @@ impl MulticastDiscovery {
         let client_result = Self::client_for_announcement(local_device.clone(), target_device);
 
         match client_result {
-            Ok(client) => match client.register(target_device).await {
-                Ok(_) => {
+            Ok(client) => match tokio::time::timeout(
+                ANNOUNCEMENT_REGISTER_TIMEOUT,
+                client.register(target_device),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
                     tracing::debug!(
                         "Successfully registered with {} via HTTP",
                         target_device.alias
                     );
                     return;
                 }
-                Err(error) => {
-                    // If HTTP failed, we just fall back to UDP. This is common if the other device
-                    // has a strict firewall or if we couldn't parse their response.
-                    // It's not a critical error.
+                Ok(Err(error)) => {
+                    // If HTTP failed, fall back to UDP only while this run is
+                    // active. A failed registration completing during shutdown
+                    // must not announce an identity from the stopped run.
                     tracing::debug!(
                         "HTTP registration failed ({}), falling back to UDP...",
                         error
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "HTTP registration with {} timed out, falling back to UDP...",
+                        target_device.alias
                     );
                 }
             },
@@ -463,7 +709,11 @@ impl MulticastDiscovery {
             }
         }
 
-        // Fallback: Send UDP response
+        if !run.running.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Fallback: Send UDP response.
         let announcement = AnnouncementMessage {
             alias: local_device.alias.clone(),
             version: local_device.version.clone(),
@@ -512,12 +762,12 @@ fn create_reusable_udp_socket(
     let socket = Socket::new(domain, Type::DGRAM, Some(SocketProtocol::UDP))
         .map_err(|e| LocalSendError::network(format!("Failed to create socket: {}", e)))?;
 
-    // Enable address reuse (supported on most platforms including Windows)
+    // Enable address reuse (supported on most platforms including Windows).
     socket
         .set_reuse_address(true)
         .map_err(|e| LocalSendError::network(format!("Failed to set reuse_address: {}", e)))?;
 
-    // Enable port reuse on Unix platforms to allow multiple processes to bind exactly to the same port
+    // Enable port reuse on Unix platforms to allow multiple processes to bind exactly to the same port.
     #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
     socket
         .set_reuse_port(true)
@@ -550,3 +800,6 @@ fn create_reusable_udp_socket(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lifecycle_tests;

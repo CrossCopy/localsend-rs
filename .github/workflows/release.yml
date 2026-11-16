@@ -1,10 +1,10 @@
-# Builds the `localsend-rs` binary on `v<version>` tags and attaches prebuilt
-# archives to the GitHub release. Archive names and layout follow what
-# [package.metadata.binstall] in Cargo.toml describes, so
-# `cargo binstall localsend-rs` can download them instead of compiling.
+# Builds `localsend-rs` binaries and macOS desktop app bundles on `v<version>`
+# tags, then attaches the archives and SHA256SUMS to the GitHub release.
 #
 #   localsend-rs-<target>-v<version>.tar.gz   (zip on Windows)
 #     └── localsend-rs-<target>-v<version>/localsend-rs
+#   localsend-gpui-<target>-v<version>.tar.gz
+#     └── LocalSend RS.app/
 
 name: Release
 
@@ -12,17 +12,48 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  version:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test release helpers and workflow structure
+        working-directory: apps/desktop-gpui
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Validate package versions
+        id: version
+        working-directory: apps/desktop-gpui
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="v$(python3 -c 'import sys; sys.path.insert(0, "scripts"); from release import package_metadata; print(package_metadata()[0])')"
+          else
+            TAG="$GITHUB_REF_NAME"
+          fi
+          python3 scripts/release.py check-version --tag "$TAG"
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.target }}
+    if: github.event_name == 'push'
+    needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -80,23 +111,187 @@ jobs:
             localsend-rs-*.tar.gz
             localsend-rs-*.zip
 
-  release:
-    name: Attach archives to the release
-    needs: build
-    runs-on: ubuntu-latest
+  macos-app:
+    name: macOS app · ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Select signing mode
+        id: signing
+        working-directory: apps/desktop-gpui
+        env:
+          APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID_SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_SIGNING_IDENTITY }}
+          APPLE_NOTARY_API_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+        run: python3 scripts/release.py signing-mode --github-output "$GITHUB_OUTPUT"
+
+      - name: Require signing credentials for the manual check
+        if: github.event_name == 'workflow_dispatch' && steps.signing.outputs.mode != 'signed'
+        run: exit 1
+
+      - name: Build and package the native-architecture app
+        working-directory: apps/desktop-gpui
+        env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+          APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          python3 scripts/release.py package \
+            --tag "$RELEASE_TAG" \
+            --target "${{ matrix.target }}" \
+            --output-dir "$RUNNER_TEMP/localsend-gpui-stage" \
+            --signing-mode "$SIGNING_MODE" \
+            --team-id "$APPLE_DEVELOPER_TEAM_ID"
+
+      - name: Sign and notarize the app
+        if: steps.signing.outputs.mode == 'signed'
+        working-directory: apps/desktop-gpui
+        env:
+          APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID_SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_SIGNING_IDENTITY }}
+          APPLE_NOTARY_API_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/localsend-gpui-stage/LocalSend RS.app"
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          NOTARY_KEY_PATH="$RUNNER_TEMP/notary-key.p8"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          NOTARY_ZIP="$RUNNER_TEMP/localsend-gpui-notarization.zip"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+
+          cleanup() {
+            security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
+            rm -f "$CERTIFICATE_PATH" "$NOTARY_KEY_PATH" "$NOTARY_ZIP"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64" \
+            | base64 -D > "$CERTIFICATE_PATH"
+          printf '%s' "$APPLE_NOTARY_API_KEY_P8_BASE64" \
+            | base64 -D > "$NOTARY_KEY_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -P "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -k "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          codesign --force --deep --options runtime --timestamp \
+            --keychain "$KEYCHAIN_PATH" \
+            --sign "$APPLE_DEVELOPER_ID_SIGNING_IDENTITY" \
+            "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          SIGNATURE_DETAILS="$(codesign -dv --verbose=4 "$APP" 2>&1)"
+          if ! printf '%s\n' "$SIGNATURE_DETAILS" \
+            | grep -Fqx "TeamIdentifier=$APPLE_DEVELOPER_TEAM_ID"; then
+            echo "The signed bundle Team ID does not match the build-time trust pin." >&2
+            exit 1
+          fi
+          ditto -c -k --keepParent "$APP" "$NOTARY_ZIP"
+          xcrun notarytool submit "$NOTARY_ZIP" \
+            --key "$NOTARY_KEY_PATH" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+
+      - name: Check Gatekeeper acceptance
+        if: github.event_name == 'workflow_dispatch'
+        run: spctl --assess --type execute --verbose=4 "$RUNNER_TEMP/localsend-gpui-stage/LocalSend RS.app"
+
+      - name: Mark the archive as unsigned
+        if: steps.signing.outputs.mode == 'unsigned'
+        run: |
+          echo "::notice::No complete Apple Developer signing configuration is present. This archive is unsigned and not notarized; it does not establish publisher identity."
+
+      - name: Record the artifact signing status
+        working-directory: apps/desktop-gpui
+        env:
+          APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+        run: |
+          python3 scripts/release.py signing-status \
+            --directory "$RUNNER_TEMP/localsend-gpui-dist" \
+            --target "${{ matrix.target }}" \
+            --mode "${{ steps.signing.outputs.mode }}" \
+            --team-id "$APPLE_DEVELOPER_TEAM_ID"
+
+      - name: Archive the app
+        working-directory: apps/desktop-gpui
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          python3 scripts/release.py archive \
+            --tag "$RELEASE_TAG" \
+            --target "${{ matrix.target }}" \
+            --app-path "$RUNNER_TEMP/localsend-gpui-stage/LocalSend RS.app" \
+            --output-dir "$RUNNER_TEMP/localsend-gpui-dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/localsend-gpui-dist/localsend-gpui-*.tar.gz
+            ${{ runner.temp }}/localsend-gpui-dist/MACOS-SIGNING-${{ matrix.target }}.txt
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    name: Attach archives to the release
+    needs: [build, macos-app]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      - name: Create the SHA-256 manifest
+        run: python3 apps/desktop-gpui/scripts/release.py checksums --directory dist
+
       - name: Create the release and attach archives
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          MACOS_SIGNING_NOTE="$(python3 apps/desktop-gpui/scripts/release.py release-note --directory dist)"
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "localsend-rs ${GITHUB_REF_NAME#v}" \
             --generate-notes \
-            dist/* \
-          || gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            --notes "$MACOS_SIGNING_NOTE" \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/MACOS-ARTIFACT-STATUS.txt \
+          || gh release upload "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/MACOS-ARTIFACT-STATUS.txt \
+            --repo "$GITHUB_REPOSITORY" --clobber

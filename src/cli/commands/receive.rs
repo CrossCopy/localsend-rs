@@ -116,9 +116,15 @@ pub async fn execute(command: ReceiveCommand) -> anyhow::Result<()> {
         discovery.set_client_certificate(certificate);
     }
     println!("Starting multicast discovery...");
-    discovery.start().await?;
-    println!("Announcing presence to network...");
-    discovery.announce_presence().await?;
+    match discovery.start().await {
+        Ok(()) => {
+            println!("Announcing presence to network...");
+            if let Err(error) = discovery.announce_presence().await {
+                eprintln!("{}", announce_warning(&error, server.port()));
+            }
+        }
+        Err(error) => eprintln!("{}", announce_warning(&error, server.port())),
+    }
 
     let auto_accept = command.auto_accept;
     let accept_delay_ms = command.accept_delay_ms;
@@ -203,9 +209,22 @@ fn server_auto_accept(auto_accept: bool, accept_delay_ms: u64) -> bool {
     auto_accept && accept_delay_ms == 0
 }
 
+/// What to say when multicast discovery cannot come up.
+///
+/// Discovery answers "who is here?", not "can they reach me?". A receiver on a
+/// network with no multicast route — a VPN, a locked-down Wi-Fi, a container
+/// with no 224.0.0.0/4 interface — is still a working receiver for anyone who
+/// addresses it directly, so this is a warning and the server keeps serving.
+fn announce_warning(error: &crate::error::LocalSendError, port: u16) -> String {
+    format!(
+        "warning: this machine could not announce itself on the local network ({error}). \
+         It is still receiving: send to it with `localsend send <this-ip>:{port} …`."
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ReceiveCommand, server_auto_accept};
+    use super::{ReceiveCommand, announce_warning, server_auto_accept};
     use clap::Parser;
 
     #[test]
@@ -250,5 +269,22 @@ mod tests {
     fn rejects_zero_receiver_rate_limit() {
         ReceiveCommand::try_parse_from(["receive", "--receive-rate-limit-kib", "0"])
             .expect_err("zero receiver limit should be rejected");
+    }
+
+    #[test]
+    fn a_receiver_without_multicast_says_how_to_reach_it_anyway() {
+        // A machine with no multicast route (VPN, locked-down Wi-Fi, container
+        // without 224.0.0.0/4) is a degraded receiver, not a dead one: it can
+        // still take a transfer sent to its address, so the warning has to say
+        // both what failed and how to send anyway.
+        let error = crate::error::LocalSendError::network("No route to host (os error 65)");
+        let warning = announce_warning(&error, 53317);
+
+        assert!(warning.starts_with("warning:"), "{warning}");
+        assert!(warning.contains("No route to host"), "{warning}");
+        assert!(
+            warning.contains("53317"),
+            "the warning must name the port that still works: {warning}"
+        );
     }
 }

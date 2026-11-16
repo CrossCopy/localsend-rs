@@ -106,6 +106,58 @@ Settings toggle relies on this). `server.auto_accept()` reads it back.
 | Discovery | `src/discovery/{multicast,http,traits}.rs` |
 | Path-traversal guard | `src/path_safety.rs` |
 
+## Desktop app (`apps/desktop-gpui`)
+
+A GPUI window **and CLI** over this library — receive/send/history/settings, its own cargo
+workspace (`[workspace]` table, `target/` ignored by the root `.gitignore`). It must never
+enter this crate's dependency graph; it depends back on `localsend-rs` with
+`default-features = false, features = ["https", "cli", "tui"]` — no clap/ratatui code is
+linked into the window, the features are only there so the same binary can forward argv to
+the library's CLI.
+
+```bash
+cd apps/desktop-gpui
+cargo run --bin localsend-gpui              # the window
+cargo run --bin localsend-gpui -- send …    # the library CLI, same binary (see src/entry.rs)
+cargo test                                  # 96: 72 unit/bin + 7 MCP + 5 real-network + 12 headless window
+cargo clippy --all-targets -- -D warnings && cargo fmt --check
+python3 assets/test_icon_grid.py
+```
+
+Layers, in the order you should read them: `src/entry.rs` (argv → window | library CLI |
+`install-cli`/`uninstall-cli` of a `localsend` symlink, `bundle` of a `LocalSend RS.app`),
+`src/service/` (tokio controller
+owning the server, discovery and sends; `Command` in, `ServiceEvent` out), `src/session.rs`
+(pure UI state machine, testable without GPUI), `src/store.rs` (GPUI entity + pump),
+`src/views/` (one function per pane). Settings live in
+`~/Library/Application Support/LocalSendGpui/settings.json`. Architecture notes and test
+map: `apps/desktop-gpui/README.md`.
+
+Two behaviours worth knowing before touching it:
+
+- **Port conflicts are expected.** The official LocalSend app shares 53317. On `AddrInUse`
+  the controller rebinds on an OS-assigned port, emits `NoticeLevel::Warning` naming it, and
+  keeps announcing the real port. Never "fix" this by failing to start.
+- **Favorites are fingerprints, not addresses**, and starring is a live command
+  (`Command::SetFavorites`), not a restart — a favorite must stay trusted across a network
+  change and must not drop a transfer in flight. `auto_accept_favorites` is the narrow
+  quick-save; plain `auto_accept` stays the blunt instrument.
+- **Window glass is GPUI's native `Blurred` appearance, not a custom AppKit layer.**
+  `glass_enabled` toggles it; `surface_opacity` controls alpha on app-owned surfaces.
+  GPUI does not expose blur radius, so don't promise or emulate an unsupported control.
+- **Zoom is one global factor, and every length must come from `theme::s()`.** GPUI has no
+  UI-scale hook, so `theme::s(v)` (= `px(v * zoom())`) is the only way a size, gap, radius
+  or font size enters a pane; gpui-kit's rem-based widgets follow `Theme::font_size`, which
+  `apply_zoom` keeps in step. A raw `px(...)` in `src/views/` silently ignores `Cmd +`.
+  Shortcuts live in `theme::bind_zoom` (macOS `cmd-*`, elsewhere `ctrl-*`) so the window and
+  the window tests register the same binding. Window tests hold `UI_LOCK` — the theme and
+  zoom are process-wide, so two rendering at once see each other's scale.
+- **The icon is generated, not hand-drawn:** `assets/make-icon.py` writes the themed
+  `AppIcon-{Light,Dark}.png` Dock images, `Mark-{Light,Dark}.png` sidebar/Icon Composer
+  layers, `AppIcon.icns`, and `Assets.car`. Keep the tile at 1024² and inset only the radar
+  foreground; `branding::sidebar_mark` selects the mark for the current UI appearance.
+  Never edit the binary assets directly; edit the script and regenerate them.
+
 ## Conventions
 
 - **Protocol**: v2.1, routes under `/api/localsend/v2/`. Upload = the **entire file in ONE POST** — never invent `Content-Range`/chunking headers. Multicast `224.0.0.167:53317`, default port `53317`.

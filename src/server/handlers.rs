@@ -3,7 +3,10 @@ use super::crosscopy_authorized::{
     CrossCopyAuthorizedPrepareMetadata, CrossCopyAuthorizedUpload, CrossCopyAuthorizedUploadBody,
 };
 use super::events::ServerEvent;
-use super::state::{CrossCopyAuthorizedSession, ServerState, write_body_to_file_with_progress};
+use super::state::{
+    ActiveStandardPrepareGuard, ActiveStandardUploadGuard, CrossCopyAuthorizedSession, ServerState,
+    write_body_to_file_with_progress,
+};
 use crate::protocol::{DeviceInfo, FileId, PrepareUploadRequest, PrepareUploadResponse, SessionId};
 use axum::{
     Json,
@@ -57,6 +60,40 @@ pub(crate) struct PrepareUploadParams {
 struct ReservationGuard {
     state: Arc<RwLock<ServerState>>,
     reserved: SessionId,
+}
+
+/// Keeps a File-v3 prepare visible to the update barrier while the host-owned
+/// gate is awaited outside `ServerState`'s lock.
+struct CrossCopyPrepareGuard {
+    state: Arc<RwLock<ServerState>>,
+    armed: bool,
+}
+
+impl CrossCopyPrepareGuard {
+    async fn release(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.state.write().await.crosscopy_authorized_preparing -= 1;
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CrossCopyPrepareGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let mut state = state.write().await;
+            state.crosscopy_authorized_preparing -= 1;
+        });
+    }
 }
 
 impl Drop for ReservationGuard {
@@ -136,40 +173,38 @@ async fn handle_crosscopy_authorized_prepare(
     }
     let metadata = CrossCopyAuthorizedPrepareMetadata::new(request.info, file_id, file);
 
-    // Avoid consuming an external, linear File-v3 receiver slot when this
-    // listener already has a protected upload in flight.  This is only a
-    // preflight: a concurrent prepare can still win the race after this read,
-    // so the post-take insertion below remains responsible for terminalizing
-    // the owner it cannot install.
-    let (stopping, occupied) = {
-        let state = state_ref.read().await;
-        (
-            state.crosscopy_authorized_stopping,
-            state.crosscopy_authorized_session.is_some(),
-        )
+    // Reserve admission under the same lock the barrier uses. The external
+    // gate call must not hold that lock, so this count is the in-flight lease.
+    let gate = {
+        let mut state = state_ref.write().await;
+        if state.crosscopy_authorized_stopping || state.update_quiescing {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if state.crosscopy_authorized_session.is_some()
+            || state.crosscopy_authorized_active_upload.is_some()
+            || state.crosscopy_authorized_preparing > 0
+        {
+            return StatusCode::CONFLICT.into_response();
+        }
+        let Some(gate) = state.crosscopy_authorized_upload_gate.clone() else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        state.crosscopy_authorized_preparing += 1;
+        gate
     };
-    if stopping {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    if occupied {
-        return StatusCode::CONFLICT.into_response();
-    }
-
-    let gate = state_ref
-        .read()
-        .await
-        .crosscopy_authorized_upload_gate
-        .clone();
-    let Some(gate) = gate else {
-        // The default listener intentionally has no File-v3 authority.
-        return StatusCode::FORBIDDEN.into_response();
+    let mut prepare_guard = CrossCopyPrepareGuard {
+        state: Arc::clone(&state_ref),
+        armed: true,
     };
     let owner = match gate
         .take_authorized_upload(CrossCopyAuthorizedPrepare::new(handoff, metadata.clone()))
         .await
     {
         Ok(owner) => owner,
-        Err(_) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => {
+            prepare_guard.release().await;
+            return StatusCode::FORBIDDEN.into_response();
+        }
     };
     let session = CrossCopyAuthorizedSession::new(metadata, owner);
     let response = PrepareUploadResponse {
@@ -178,12 +213,16 @@ async fn handle_crosscopy_authorized_prepare(
     };
     let rejected = {
         let mut state = state_ref.write().await;
-        if state.crosscopy_authorized_stopping {
+        if state.crosscopy_authorized_stopping || state.update_quiescing {
             Some((session.owner, StatusCode::SERVICE_UNAVAILABLE))
-        } else if state.crosscopy_authorized_session.is_some() {
+        } else if state.crosscopy_authorized_session.is_some()
+            || state.crosscopy_authorized_active_upload.is_some()
+        {
             Some((session.owner, StatusCode::CONFLICT))
         } else {
             state.crosscopy_authorized_session = Some(session);
+            state.crosscopy_authorized_preparing -= 1;
+            prepare_guard.disarm();
             None
         }
     };
@@ -192,6 +231,7 @@ async fn handle_crosscopy_authorized_prepare(
         // conflict or concurrent orderly shutdown must terminalize that owner
         // instead of leaking it.
         owner.cancel().await;
+        prepare_guard.release().await;
         return status.into_response();
     }
     Json(response).into_response()
@@ -252,8 +292,11 @@ async fn handle_standard_prepare_upload(
     let reserved: SessionId;
     let withdraw: tokio_util::sync::CancellationToken;
 
-    let (events_tx, auto_accept, accept_timeout) = {
+    let (events_tx, auto_accept, accept_timeout, _active_prepare_guard) = {
         let mut state = state_ref.write().await;
+        if state.update_quiescing {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
 
         // Check for existing session timeout (e.g. 5 minutes or session finished)
         if let Some(session) = &state.current_session {
@@ -281,11 +324,13 @@ async fn handle_standard_prepare_upload(
         });
         state.current_session_from = Some(peer.ip());
         state.current_session = Some(placeholder);
+        let active_prepare_guard = ActiveStandardPrepareGuard::new(&state.standard_active_prepares);
 
         (
             state.events_tx.clone(),
             state.auto_accept.load(std::sync::atomic::Ordering::Relaxed),
             state.accept_timeout,
+            active_prepare_guard,
         )
     };
 
@@ -304,20 +349,25 @@ async fn handle_standard_prepare_upload(
         reserved: reserved.clone(),
     };
 
+    // Bound both event delivery and the decision by the same deadline. A full
+    // event queue must not park the handler after `/cancel` withdraws its offer.
+    let decision_deadline = tokio::time::Instant::now() + accept_timeout;
+
     // Decide: auto-accept, or ask the event consumer.
     let decision = if auto_accept {
         crate::server::events::TransferDecision::Accept
     } else {
         let (pending_request, decision_rx) =
             crate::server::events::PendingRequest::new(request.info.clone(), request.files.clone());
-        if events_tx
-            .send(crate::server::events::ServerEvent::TransferRequest(
-                pending_request,
-            ))
-            .await
-            .is_err()
-        {
-            // No consumer listening -> decline.
+        let sent = tokio::select! {
+            biased;
+            _ = withdraw.cancelled() => false,
+            result = tokio::time::timeout_at(
+                decision_deadline,
+                events_tx.send(crate::server::events::ServerEvent::TransferRequest(pending_request)),
+            ) => matches!(result, Ok(Ok(()))),
+        };
+        if !sent {
             crate::server::events::TransferDecision::Decline
         } else {
             tokio::select! {
@@ -328,10 +378,10 @@ async fn handle_standard_prepare_upload(
                     tracing::info!("Sender withdrew its offer before it was answered");
                     crate::server::events::TransferDecision::Decline
                 }
-                answer = tokio::time::timeout(accept_timeout, decision_rx) => match answer {
-                    Ok(Ok(d)) => d,
-                    _ => crate::server::events::TransferDecision::Decline, // dropped or timed out
-                },
+                _ = tokio::time::sleep_until(decision_deadline) => {
+                    crate::server::events::TransferDecision::Decline
+                }
+                answer = decision_rx => answer.unwrap_or(crate::server::events::TransferDecision::Decline),
             }
         }
     };
@@ -568,17 +618,7 @@ pub(crate) async fn handle_upload(
             CrossCopyAuthorizedUploadBody::new(Box::pin(stream)),
         );
         let result = session.owner.receive(upload).await;
-        {
-            let mut state = state_ref.write().await;
-            if state
-                .crosscopy_authorized_active_upload
-                .as_ref()
-                .is_some_and(|active| active.session_id == active_session_id)
-            {
-                state.crosscopy_authorized_active_upload = None;
-            }
-        }
-        return match result {
+        let response = match result {
             Ok(receipt) => {
                 let _ = events_tx
                     .send(ServerEvent::FileReceived {
@@ -610,6 +650,19 @@ pub(crate) async fn handle_upload(
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         };
+        {
+            // Keep the upload visible to the update barrier until all awaited
+            // terminal events have been accepted and the HTTP response is ready.
+            let mut state = state_ref.write().await;
+            if state
+                .crosscopy_authorized_active_upload
+                .as_ref()
+                .is_some_and(|active| active.session_id == active_session_id)
+            {
+                state.crosscopy_authorized_active_upload = None;
+            }
+        }
+        return response;
     }
 
     // Verify session
@@ -627,6 +680,7 @@ pub(crate) async fn handle_upload(
         save_dir,
         sink,
         mut receive_lease,
+        _active_upload_guard,
     ) = if let Some(session) = &state.current_session {
         if session.id != params.session_id {
             tracing::warn!(
@@ -653,6 +707,8 @@ pub(crate) async fn handle_upload(
                 );
                 return StatusCode::CONFLICT.into_response();
             };
+            let active_upload_guard =
+                ActiveStandardUploadGuard::new(&state.standard_active_uploads);
             (
                 meta.file_name.clone(),
                 session.id.clone(),
@@ -671,6 +727,7 @@ pub(crate) async fn handle_upload(
                 state.save_dir.clone(),
                 state.sink.clone(),
                 receive_lease,
+                active_upload_guard,
             )
         } else {
             tracing::warn!(
@@ -1037,6 +1094,10 @@ mod tests {
             crosscopy_authorized_session: None,
             crosscopy_authorized_active_upload: None,
             crosscopy_authorized_stopping: false,
+            update_quiescing: false,
+            crosscopy_authorized_preparing: 0,
+            standard_active_uploads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            standard_active_prepares: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }));
 
         let stranger = handle_cancel(

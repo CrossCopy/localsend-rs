@@ -20,6 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test desktop release helpers and workflow contract
+        working-directory: apps/desktop-gpui
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
