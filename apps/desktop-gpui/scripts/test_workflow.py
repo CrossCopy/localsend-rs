@@ -17,6 +17,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("macos-15", workflow)
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("security find-identity -v -p codesigning", workflow)
+        self.assertIn('security list-keychains -d user -s "$KEYCHAIN_PATH"', workflow)
         self.assertIn("codesign --verify --strict", workflow)
         self.assertIn("xcrun notarytool history", workflow)
         self.assertIn("security delete-keychain", workflow)

@@ -62,6 +62,8 @@ jobs:
             exit 1
           fi
           echo "::notice::Signing identity is valid"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          echo "::notice::Temporary keychain is on the user search list"
           cp /usr/bin/true "$PROBE_BINARY"
           codesign --force --options runtime --timestamp \
             --keychain "$KEYCHAIN_PATH" --sign "$APPLE_DEVELOPER_ID_SIGNING_IDENTITY" "$PROBE_BINARY"
