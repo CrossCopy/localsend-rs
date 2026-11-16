@@ -74,6 +74,7 @@ impl Default for MulticastConfig {
 pub struct MulticastDiscovery {
     local_device: DeviceInfo,
     config: MulticastConfig,
+    require_http_confirmation: bool,
     lifecycle: Arc<DiscoveryLifecycle>,
     tx: Option<broadcast::Sender<DeviceInfo>>,
     #[cfg(feature = "https")]
@@ -235,6 +236,7 @@ impl MulticastDiscovery {
         Ok(Self {
             local_device: device,
             config,
+            require_http_confirmation: false,
             lifecycle: Arc::new(DiscoveryLifecycle::new()),
             tx: Some(tx),
             #[cfg(feature = "https")]
@@ -246,6 +248,17 @@ impl MulticastDiscovery {
     /// sockets or losing the current discovery cache.
     pub fn set_local_device(&mut self, device: DeviceInfo) {
         self.local_device = device;
+    }
+
+    /// Requires successful HTTP registration before publishing a peer learned
+    /// over UDP. In this mode, discovery probes both announcements and UDP
+    /// replies and skips UDP fallback replies when registration fails.
+    /// Devices supplied by [`Self::add_device`] still go directly to subscribers.
+    ///
+    /// Set this before [`Discovery::start`]. By default peers are published as
+    /// soon as their UDP packet arrives.
+    pub fn set_require_http_confirmation(&mut self, required: bool) {
+        self.require_http_confirmation = required;
     }
 
     /// Uses the receiver's TLS identity when answering HTTPS announcements.
@@ -337,6 +350,7 @@ impl Discovery for MulticastDiscovery {
             let local_fingerprint = self.local_device.fingerprint.clone();
             let local_device = self.local_device.clone();
             let multicast_addr = SocketAddr::from((self.config.address, self.config.port));
+            let require_http_confirmation = self.require_http_confirmation;
             let mut stop = run.stop_tx.subscribe();
             let receiver_run = run.clone();
             #[cfg(feature = "https")]
@@ -387,26 +401,36 @@ impl Discovery for MulticastDiscovery {
                             };
                             let is_announcement =
                                 announcement.announce || announcement.announcement.unwrap_or(false);
-                            let _ = tx.send(device.clone());
+                            if !require_http_confirmation {
+                                let _ = tx.send(device.clone());
+                            }
 
-                            if is_announcement && receiver_run.running.load(Ordering::Acquire) {
+                            if is_announcement || require_http_confirmation {
                                 let response_local_device = local_device.clone();
                                 let response_socket = socket.clone();
                                 let response_run = receiver_run.clone();
+                                let tx = tx.clone();
                                 #[cfg(feature = "https")]
                                 let client_certificate = client_certificate.clone();
 
                                 receiver_run.spawn(async move {
-                                    Self::respond_to_announcement(
+                                    let udp_fallback = (!require_http_confirmation)
+                                        .then_some((response_socket.as_ref(), multicast_addr));
+                                    let registered = Self::respond_to_announcement(
                                         &device,
                                         &response_local_device,
-                                        &response_socket,
-                                        multicast_addr,
+                                        udp_fallback,
                                         &response_run,
                                         #[cfg(feature = "https")]
                                         client_certificate,
                                     )
                                     .await;
+                                    if require_http_confirmation
+                                        && registered
+                                        && response_run.running.load(Ordering::Acquire)
+                                    {
+                                        let _ = tx.send(device);
+                                    }
                                 });
                             }
                         }
@@ -670,11 +694,10 @@ impl MulticastDiscovery {
     async fn respond_to_announcement(
         target_device: &DeviceInfo,
         local_device: &DeviceInfo,
-        socket: &UdpSocket,
-        multicast_addr: SocketAddr,
+        udp_fallback: Option<(&UdpSocket, SocketAddr)>,
         run: &DiscoveryRun,
         #[cfg(feature = "https")] client_certificate: Option<crate::crypto::TlsCertificate>,
-    ) {
+    ) -> bool {
         tracing::debug!(
             "Responding to announcement from {} ({:?})",
             target_device.alias,
@@ -704,37 +727,28 @@ impl MulticastDiscovery {
                         "Successfully registered with {} via HTTP",
                         target_device.alias
                     );
-                    return;
+                    return true;
                 }
                 Ok(Err(error)) => {
-                    // If HTTP failed, fall back to UDP only while this run is
-                    // active. A failed registration completing during shutdown
-                    // must not announce an identity from the stopped run.
-                    tracing::debug!(
-                        "HTTP registration failed ({}), falling back to UDP...",
-                        error
-                    );
+                    tracing::debug!(%error, "HTTP registration failed");
                 }
                 Err(_) => {
-                    tracing::debug!(
-                        "HTTP registration with {} timed out, falling back to UDP...",
-                        target_device.alias
-                    );
+                    tracing::debug!("HTTP registration with {} timed out", target_device.alias);
                 }
             },
             Err(error) => {
-                tracing::debug!(
-                    "Could not configure pinned registration ({}), falling back to UDP...",
-                    error
-                );
+                tracing::debug!(%error, "Could not configure pinned registration");
             }
         }
 
+        let Some((socket, multicast_addr)) = udp_fallback else {
+            return false;
+        };
+        // A registration completing during shutdown must not announce this run's identity.
         if !run.running.load(Ordering::Acquire) {
-            return;
+            return false;
         }
 
-        // Fallback: Send UDP response.
         let announcement = AnnouncementMessage {
             alias: local_device.alias.clone(),
             version: local_device.version.clone(),
@@ -756,6 +770,7 @@ impl MulticastDiscovery {
                 tracing::debug!("Sent UDP fallback response to multicast group");
             }
         }
+        false
     }
 }
 

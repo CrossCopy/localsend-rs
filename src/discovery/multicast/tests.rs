@@ -258,41 +258,124 @@ async fn add_device_reaches_a_listener_registered_before_send() {
     assert_eq!(found.alias, expected.alias);
 
     discovery.add_device(discovery.local_device.clone());
-    assert!(rx.try_recv().is_err(), "the local identity is not a peer");
     discovery.add_device(DeviceInfo::new(
         "empty fingerprint".into(),
         53317,
         Protocol::Http,
     ));
-    assert!(rx.try_recv().is_err(), "a peer needs a fingerprint");
+    discovery.add_device(expected.clone());
+    let found = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("discovery callback did not run")
+        .expect("discovery callback channel closed");
+    assert_eq!(
+        found, expected,
+        "only a distinct, nonempty fingerprint is a peer"
+    );
 }
 
 #[tokio::test]
 async fn discovery_listener_recovers_after_broadcast_lag() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     let mut discovery = MulticastDiscovery::new("discovery client".into(), 53317, Protocol::Http)
         .expect("build discovery");
-    let received = Arc::new(AtomicUsize::new(0));
-    let received_by_callback = received.clone();
-    discovery.on_discovered(move |_| {
-        received_by_callback.fetch_add(1, Ordering::Relaxed);
+    discovery.tx = Some(tokio::sync::broadcast::channel(2).0);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    discovery.on_discovered(move |device| {
+        let _ = tx.send(device.fingerprint);
     });
 
-    for index in 0..101 {
+    for index in 0..3 {
         let mut device = DeviceInfo::new(format!("peer {index}"), 53317, Protocol::Http);
         device.fingerprint = format!("peer-{index}");
         discovery.add_device(device);
     }
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while received.load(Ordering::Relaxed) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("discovery listener stopped after lagging");
+    let found = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("discovery listener did not recover after lagging");
+    assert_eq!(found.as_deref(), Some("peer-1"));
+}
+
+#[tokio::test]
+async fn confirmed_discovery_only_reports_peers_that_accept_registration() {
+    use crate::protocol::DEFAULT_HTTP_PORT;
+    use std::time::Duration;
+    use tokio::net::{TcpListener, UdpSocket};
+
+    let output = tempfile::tempdir().expect("output directory");
+    let (mut peer, _events) = LocalSendServer::builder()
+        .alias("confirmed peer")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Http)
+        .build()
+        .await
+        .expect("start LocalSend peer");
+    let rejecting_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind peer that rejects registration");
+    let rejecting_port = rejecting_listener.local_addr().unwrap().port();
+    let rejecting_peer =
+        tokio::spawn(async move { axum::serve(rejecting_listener, axum::Router::new()).await });
+
+    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let reservation = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+    let discovery_port = reservation.local_addr().unwrap().port();
+    let local = DeviceInfo {
+        fingerprint: "local-discovery-fingerprint".into(),
+        ..DeviceInfo::new("local discovery".into(), DEFAULT_HTTP_PORT, Protocol::Http)
+    };
+    let config = MulticastConfig {
+        port: discovery_port,
+        ..MulticastConfig::default()
+    };
+    let mut discovery = MulticastDiscovery::new_with_device_and_config(local, config).unwrap();
+    discovery.set_require_http_confirmation(true);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    discovery.on_discovered(move |device| {
+        let _ = tx.send(device);
+    });
+    drop(reservation);
+    discovery.start().await.expect("start multicast discovery");
+
+    for (fingerprint, port) in [
+        ("unconfirmed-discovery-fingerprint", rejecting_port),
+        (peer.device().fingerprint.as_str(), peer.port()),
+    ] {
+        let response = AnnouncementMessage {
+            alias: "peer".into(),
+            version: crate::protocol::PROTOCOL_VERSION.into(),
+            device_model: None,
+            device_type: None,
+            fingerprint: fingerprint.into(),
+            port,
+            protocol: Protocol::Http,
+            download: false,
+            announce: false,
+            announcement: Some(false),
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        sender
+            .send_to(&bytes, (Ipv4Addr::LOCALHOST, discovery_port))
+            .await
+            .unwrap();
+    }
+
+    let found = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("a reachable UDP peer should be confirmed")
+        .expect("callback stream closed");
+    assert_eq!(found.fingerprint, peer.device().fingerprint);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err(),
+        "the peer whose /register failed should be skipped"
+    );
+
+    discovery.stop();
+    peer.stop().await;
+    rejecting_peer.abort();
 }
 
 #[tokio::test]
@@ -316,8 +399,7 @@ async fn announcement_response_uses_udp_when_http_register_fails() {
     MulticastDiscovery::respond_to_announcement(
         &target,
         &local,
-        &udp_sender,
-        udp_address,
+        Some((&udp_sender, udp_address)),
         &DiscoveryRun::new(),
         #[cfg(feature = "https")]
         None,
@@ -360,8 +442,7 @@ async fn announcement_response_registers_over_http_when_available() {
     MulticastDiscovery::respond_to_announcement(
         &target,
         &local,
-        &udp_socket,
-        udp_address,
+        Some((&udp_socket, udp_address)),
         &DiscoveryRun::new(),
         #[cfg(feature = "https")]
         None,

@@ -198,7 +198,8 @@ impl HttpDiscovery {
     }
 
     /// Scans a local `/24` using the LocalSend v2.2 HTTP fallback: send a
-    /// `POST /api/localsend/v2/register` to each host on the configured port.
+    /// `POST /api/localsend/v2/register` to each host on `target_port`. The
+    /// registration body still advertises this device's own listening port.
     /// Use this when multicast discovery did not find peers. It is separate from the
     /// `/info` compatibility scan because every request announces this device's metadata
     /// to the addressed host. Callers should only run it as an explicit discovery action.
@@ -206,12 +207,13 @@ impl HttpDiscovery {
     pub async fn scan_subnet_register_within(
         &self,
         base_ip: &str,
+        target_port: u16,
         within: Duration,
     ) -> Result<ScanOutcome> {
         Ok(self
             .scan_hosts(
                 subnet_hosts(base_ip)?,
-                self.local_device.port,
+                target_port,
                 Some(within),
                 ScanStrategy::Register,
             )
@@ -502,9 +504,34 @@ impl HttpDiscovery {
         if !response.status().is_success() {
             return ProbeOutcome::Miss;
         }
-        let mut device: DeviceInfo = match response.json().await {
-            Ok(device) => device,
-            Err(_) => return ProbeOutcome::Miss,
+        let cert_fingerprint = if protocol == Protocol::Https {
+            let Some(certificate) = response
+                .extensions()
+                .get::<reqwest::tls::TlsInfo>()
+                .and_then(reqwest::tls::TlsInfo::peer_certificate)
+            else {
+                return ProbeOutcome::Miss;
+            };
+            Some(crate::crypto::hash::sha256_from_bytes(certificate))
+        } else {
+            None
+        };
+        let decoded = match cert_fingerprint {
+            Some(fingerprint) => {
+                let Ok(mut body) = response
+                    .json::<serde_json::Map<String, serde_json::Value>>()
+                    .await
+                else {
+                    return ProbeOutcome::Miss;
+                };
+                // HTTPS peers may omit the wire fingerprint. Their certificate supplies it.
+                body.insert("fingerprint".into(), fingerprint.into());
+                serde_json::from_value(body.into()).ok()
+            }
+            None => response.json().await.ok(),
+        };
+        let Some(mut device): Option<DeviceInfo> = decoded else {
+            return ProbeOutcome::Miss;
         };
         device.ip = Some(ip.to_string());
         device.port = port;
@@ -622,8 +649,12 @@ fn build_discovery_client(
         // 20.4 s on macOS on 2026-08-22, which a scan of 254 hosts pays before
         // the first probe leaves.
         .no_proxy()
+        // Discovery results describe the endpoint probed. A register redirect
+        // can also send local device metadata to a different endpoint.
+        .redirect(reqwest::redirect::Policy::none())
         .tls_backend_rustls()
         .danger_accept_invalid_certs(true)
+        .tls_info(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT);
     if let Some(source_address) = source_address {
@@ -950,75 +981,47 @@ mod tests {
     #[tokio::test]
     async fn register_scan_finds_a_register_only_peer() {
         use crate::{DeviceInfo, Protocol};
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use axum::{Json, Router, routing::post};
+        use std::time::{Duration, SystemTime};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind register-only peer");
         let port = listener.local_addr().expect("peer address").port();
+        let local_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("reserve the scanner's advertised port");
+        let local_port = local_listener.local_addr().expect("scanner address").port();
         let mut peer = DeviceInfo::new("register-only subnet peer".into(), port, Protocol::Http);
         peer.fingerprint = "register-only-subnet-fingerprint".into();
-        let served = peer.clone();
-
+        let routes = Router::new().route(
+            "/api/localsend/v2/register",
+            post(move |Json(posted): Json<DeviceInfo>| {
+                let peer = peer.clone();
+                async move {
+                    assert_eq!(posted.alias, "register-first scanner");
+                    assert_eq!(posted.port, local_port);
+                    assert!(!posted.fingerprint.is_empty());
+                    Json(peer)
+                }
+            }),
+        );
         let server_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept register probe");
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            let header_end = loop {
-                let length = stream.read(&mut chunk).await.expect("read register probe");
-                if length == 0 {
-                    break None;
-                }
-                request.extend_from_slice(&chunk[..length]);
-                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break Some(index + 4);
-                }
-            }
-            .expect("register request headers");
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            assert!(
-                headers.starts_with("POST /api/localsend/v2/register"),
-                "register-first scan must not depend on /info: {headers}"
-            );
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().expect("valid content length"))
-                })
-                .expect("register request content length");
-            while request.len() < header_end + content_length {
-                let length = stream.read(&mut chunk).await.expect("read register body");
-                assert_ne!(length, 0, "register body ended early");
-                request.extend_from_slice(&chunk[..length]);
-            }
-            let posted: DeviceInfo =
-                serde_json::from_slice(&request[header_end..header_end + content_length])
-                    .expect("decode posted local device");
-            assert_eq!(posted.alias, "register-first scanner");
-            assert!(!posted.fingerprint.is_empty());
-
-            let body = serde_json::to_vec(&served).expect("encode peer");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
+            axum::serve(listener, routes)
                 .await
-                .expect("write response headers");
-            stream.write_all(&body).await.expect("write response body");
+                .expect("serve register peer");
         });
 
-        let discovery = HttpDiscovery::new("register-first scanner".into(), port, Protocol::Http)
-            .expect("build discovery");
+        let discovery =
+            HttpDiscovery::new("register-first scanner".into(), local_port, Protocol::Http)
+                .expect("build discovery");
+        let scan_started = SystemTime::now();
         let outcome = discovery
-            .scan_subnet_register_within("127.0.0.2", Duration::from_secs(10))
+            .scan_subnet_register_within("127.0.0.2", port, Duration::from_secs(10))
             .await
             .expect("register subnet scan");
+        let scan_finished = SystemTime::now();
 
         let found = outcome
             .devices
@@ -1028,12 +1031,42 @@ mod tests {
         assert_eq!(found.device.alias, "register-only subnet peer");
         assert_eq!(found.device.ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(found.device.port, port);
+        assert!(found.observed_at >= scan_started && found.observed_at <= scan_finished);
         assert!(outcome.complete, "the small loopback scan should complete");
 
-        tokio::time::timeout(Duration::from_secs(1), server_task)
-            .await
-            .expect("server task did not finish")
-            .expect("server task failed");
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_redirect_does_not_confirm_registration() {
+        use crate::Protocol;
+        use axum::{
+            Json, Router,
+            response::Redirect,
+            routing::{get, post},
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/api/localsend/v2/register",
+                post(|| async { Redirect::to("/description") }),
+            )
+            .route(
+                "/description",
+                get(|| async {
+                    Json(json!({"alias": "Web description", "version": "2.2", "fingerprint": "example"}))
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let discovery = HttpDiscovery::new("scanner".into(), port, Protocol::Http).unwrap();
+        assert!(discovery.probe_peer("127.0.0.1", port).await.is_none());
+
+        server.abort();
     }
 
     #[cfg(feature = "https")]
@@ -1346,9 +1379,6 @@ mod tests {
             .expect("bind test server");
         let port = listener.local_addr().expect("server address").port();
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let mut peer = DeviceInfo::new("mTLS register peer".into(), port, Protocol::Https);
-        peer.fingerprint = server_certificate.fingerprint.clone();
-
         let server_task = tokio::spawn(async move {
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.expect("accept probe");
@@ -1357,7 +1387,10 @@ mod tests {
                 let length = stream.read(&mut request).await.expect("read request");
                 let request = String::from_utf8_lossy(&request[..length]);
                 let (status, body) = if request.starts_with("POST /api/localsend/v2/register") {
-                    ("200 OK", serde_json::to_vec(&peer).expect("encode peer"))
+                    (
+                        "200 OK",
+                        br#"{"alias":"mTLS register peer","version":"2.2"}"#.to_vec(),
+                    )
                 } else {
                     ("404 Not Found", Vec::new())
                 };
@@ -1381,23 +1414,17 @@ mod tests {
         )
         .expect("build interface-bound mTLS discovery client");
         let found = discovery
-            .scan_hosts(
-                vec!["127.0.0.1".into()],
-                port,
-                None,
-                ScanStrategy::Info {
-                    allow_register_fallback: true,
-                },
-            )
+            .scan_ips(vec!["127.0.0.1".into()])
             .await
-            .devices;
+            .expect("scan the mTLS peer");
 
         let found_peer = found
             .iter()
-            .find(|observed| observed.device.fingerprint == server_certificate.fingerprint)
-            .expect("the peer must be found through /register");
-        assert_eq!(found_peer.device.alias, "mTLS register peer");
-        assert_eq!(found_peer.device.protocol, Protocol::Https);
+            .find(|device| device.fingerprint == server_certificate.fingerprint)
+            .expect("the peer must be found by certificate fingerprint");
+        assert_eq!(found_peer.alias, "mTLS register peer");
+        assert_eq!(found_peer.port, port);
+        assert_eq!(found_peer.protocol, Protocol::Https);
         server_task.await.expect("test server completed");
     }
 
