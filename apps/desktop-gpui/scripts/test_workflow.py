@@ -38,6 +38,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("gh release create", release)
         self.assertIn("needs.version.outputs.tag", macos)
 
+    def test_release_signing_exposes_the_temporary_keychain_to_codesign(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        workflow = (repository / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        macos = workflow.split("\n  macos-app:\n", 1)[1].split("\n  release:\n", 1)[0]
+        search_list = macos.find('security list-keychains -d user -s "$KEYCHAIN_PATH"')
+        codesign = macos.find("codesign --force --deep")
+        self.assertGreaterEqual(search_list, 0, "temporary keychain must be searchable")
+        self.assertGreater(codesign, search_list, "configure search list before signing")
+
     def test_manual_check_uses_the_package_version_not_the_branch_name(self) -> None:
         repository = Path(__file__).resolve().parents[3]
         workflow = (repository / ".github/workflows/release.yml").read_text(

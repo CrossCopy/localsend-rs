@@ -203,6 +203,7 @@ jobs:
             -S apple-tool:,apple: \
             -k "$KEYCHAIN_PASSWORD" \
             "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
 
           codesign --force --deep --options runtime --timestamp \
             --keychain "$KEYCHAIN_PATH" \
