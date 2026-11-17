@@ -1006,6 +1006,13 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
+        // Linux CI often lists docker0 first. Docker's MASQUERADE rules can
+        // rewrite that bridge address on the way to loopback, so the peer sees
+        // the rewritten address rather than the socket's requested source. A
+        // distinct 127/8 address exercises the same real bind without NAT.
+        #[cfg(target_os = "linux")]
+        let source_address = Ipv4Addr::new(127, 0, 0, 2);
+        #[cfg(not(target_os = "linux"))]
         let source_address = super::local_ipv4_interfaces()
             .expect("list local interfaces")
             .first()
