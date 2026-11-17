@@ -2,11 +2,12 @@
 //! not infer idleness from events that may not have reached an embedder yet.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures_util::stream;
+use localsend_rs::core::{AtomicFileSink, PendingReceive, ReceiveSink, SinkError};
 use localsend_rs::server::{
     CrossCopyAuthorizedPrepare, CrossCopyAuthorizedUpload, CrossCopyAuthorizedUploadError,
     CrossCopyAuthorizedUploadGate, CrossCopyAuthorizedUploadOwner,
@@ -14,6 +15,7 @@ use localsend_rs::server::{
 };
 use localsend_rs::{DeviceInfo, DeviceType, LocalSendClient, Protocol, build_file_metadata};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -525,14 +527,35 @@ async fn protected_upload_stays_busy_until_terminal_events_unblock_its_response(
     server.stop_for_update().await.unwrap();
 }
 
+#[derive(Default)]
+struct PausedCreateSink {
+    entered: Notify,
+    release: Notify,
+}
+
+#[async_trait::async_trait]
+impl ReceiveSink for PausedCreateSink {
+    async fn create(
+        &self,
+        directory: &Path,
+        name: &str,
+    ) -> Result<Box<dyn PendingReceive>, SinkError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        AtomicFileSink.create(directory, name).await
+    }
+}
+
 #[tokio::test]
 async fn an_admitted_upload_remains_busy_after_remote_cancel_clears_its_session() {
     let save_dir = tempfile::tempdir().unwrap();
+    let sink = Arc::new(PausedCreateSink::default());
     let (mut server, _events) = LocalSendServer::builder()
         .port(0)
         .save_dir(save_dir.path())
         .protocol(Protocol::Http)
         .auto_accept(true)
+        .sink(sink.clone())
         .build()
         .await
         .unwrap();
@@ -560,25 +583,17 @@ async fn an_admitted_upload_remains_busy_after_remote_cancel_clears_its_session(
         file_id,
         token
     );
-    let (started_tx, started_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel::<Bytes>();
-    let body = reqwest::Body::wrap_stream(stream::once(async move {
-        let _ = started_tx.send(());
-        Ok::<_, std::io::Error>(release_rx.await.expect("test releases upload body"))
-    }));
     let upload = tokio::spawn(async move {
         reqwest::Client::new()
             .post(upload_url)
-            .header(reqwest::header::CONTENT_LENGTH, b"still receiving".len())
-            .body(body)
+            .body("still receiving")
             .send()
             .await
             .unwrap()
     });
-    tokio::time::timeout(Duration::from_secs(3), started_rx)
+    tokio::time::timeout(Duration::from_secs(3), sink.entered.notified())
         .await
-        .expect("the server should begin polling the active upload")
-        .unwrap();
+        .expect("the admitted upload should reach the paused sink");
 
     let cancelled = reqwest::Client::new()
         .post(format!(
@@ -596,9 +611,7 @@ async fn an_admitted_upload_remains_busy_after_remote_cancel_clears_its_session(
         "an admitted upload still owns cleanup even after its session slot was cleared"
     );
 
-    release_tx
-        .send(Bytes::from_static(b"still receiving"))
-        .unwrap();
+    sink.release.notify_one();
     let response = tokio::time::timeout(Duration::from_secs(3), upload)
         .await
         .expect("cancelled upload should settle")
