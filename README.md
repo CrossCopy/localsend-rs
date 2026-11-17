@@ -46,7 +46,17 @@ localsend-rs --help        # CLI mode
 localsend-rs tui           # Launch TUI (if installed with --features tui)
 ```
 
-### Option 2: Build from Source
+### Option 2: Install prebuilt binaries or the desktop app with Homebrew
+
+```bash
+brew install HuakunShen/tap/localsend-rs-cli      # the localsend-rs CLI
+brew install --cask HuakunShen/tap/localsend-rs   # the signed macOS desktop app
+```
+
+See [docs/release/homebrew.md](docs/release/homebrew.md) for how releases render
+the tap files and how to verify them.
+
+### Option 3: Build from Source
 
 Ensure you have Rust and Cargo installed. Clone the repository and build from source:
 

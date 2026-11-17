@@ -323,3 +323,40 @@ jobs:
           || gh release upload "$GITHUB_REF_NAME" \
             dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/MACOS-ARTIFACT-STATUS.txt \
             --repo "$GITHUB_REPOSITORY" --clobber
+
+  homebrew:
+    if: github.event_name == 'push'
+    name: Render Homebrew tap files
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the archives Homebrew installs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist/homebrew
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir dist/homebrew \
+            --pattern 'localsend-gpui-*-apple-darwin-*.tar.gz' \
+            --pattern 'localsend-rs-*-v*.tar.gz'
+
+      - name: Render with the published checksums
+        working-directory: apps/desktop-gpui
+        run: |
+          python3 scripts/homebrew.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --assets-dir "$GITHUB_WORKSPACE/dist/homebrew"
+
+      - name: Attach the rendered tap files to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            packaging/homebrew/Casks/localsend-rs.rb \
+            packaging/homebrew/Formula/localsend-rs-cli.rb \
+            --repo "$GITHUB_REPOSITORY" --clobber

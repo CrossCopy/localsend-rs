@@ -166,5 +166,31 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
 
 
+    def test_homebrew_job_renders_from_published_archives_and_never_pushes_the_tap(
+        self,
+    ) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        workflow = (repository / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        start = workflow.find("\n  homebrew:\n")
+        self.assertGreaterEqual(start, 0, "homebrew job must exist")
+        body = start + len("\n  homebrew:\n")
+        next_job = re.search(r"(?m)^  [A-Za-z0-9_-]+:\s*$", workflow[body:])
+        end = body + next_job.start() if next_job is not None else len(workflow)
+        job = workflow[start:end]
+
+        self.assertIn("needs: [release]", job)
+        self.assertIn("--pattern 'localsend-gpui-*-apple-darwin-*.tar.gz'", job)
+        self.assertIn("--pattern 'localsend-rs-*-v*.tar.gz'", job)
+        self.assertIn("python3 scripts/homebrew.py", job)
+        self.assertIn("packaging/homebrew/Casks/localsend-rs.rb", job)
+        self.assertIn("packaging/homebrew/Formula/localsend-rs-cli.rb", job)
+        # The owner copies the rendered files into the tap; CI must not push
+        # with a repository token that could rewrite unrelated tap casks.
+        self.assertNotIn("git push", job)
+        self.assertNotIn("homebrew-tap", job)
+
+
 if __name__ == "__main__":
     unittest.main()
