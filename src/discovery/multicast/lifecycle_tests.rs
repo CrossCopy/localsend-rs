@@ -1,9 +1,10 @@
 use super::{ANNOUNCEMENT_REGISTER_TIMEOUT, DiscoveryRun, MulticastConfig, MulticastDiscovery};
 use crate::discovery::Discovery;
+use crate::{DeviceInfo, Protocol};
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
@@ -62,8 +63,7 @@ async fn stop_and_wait_joins_pending_receive_and_response_work_across_clones() {
         MulticastDiscovery::respond_to_announcement(
             &target,
             &local,
-            &response_socket,
-            (Ipv4Addr::LOCALHOST, 53317).into(),
+            Some((&response_socket, (Ipv4Addr::LOCALHOST, 53317).into())),
             &response_run,
             #[cfg(feature = "https")]
             None,
@@ -149,8 +149,7 @@ async fn stop_and_wait_bounds_a_peer_that_never_answers_registration() {
         MulticastDiscovery::respond_to_announcement(
             &target,
             &local,
-            &response_socket,
-            (Ipv4Addr::LOCALHOST, 53317).into(),
+            Some((&response_socket, (Ipv4Addr::LOCALHOST, 53317).into())),
             &response_run,
             #[cfg(feature = "https")]
             None,
@@ -171,6 +170,69 @@ async fn stop_and_wait_bounds_a_peer_that_never_answers_registration() {
 
     close_peer.send(()).unwrap();
     peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn confirmation_finishing_during_shutdown_does_not_publish_the_peer() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer_port = listener.local_addr().unwrap().port();
+    let reservation = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+    let discovery_port = reservation.local_addr().unwrap().port();
+    let config = MulticastConfig {
+        port: discovery_port,
+        ..MulticastConfig::default()
+    };
+    let local = DeviceInfo {
+        fingerprint: "local".into(),
+        ..DeviceInfo::new("local".into(), discovery_port, Protocol::Http)
+    };
+    let mut discovery = MulticastDiscovery::new_with_device_and_config(local, config).unwrap();
+    discovery.set_require_http_confirmation(true);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    discovery.on_discovered(move |device| {
+        let _ = tx.send(device);
+    });
+    drop(reservation);
+    discovery.start().await.unwrap();
+
+    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let response = serde_json::json!({
+        "alias": "peer",
+        "version": crate::protocol::PROTOCOL_VERSION,
+        "fingerprint": "peer",
+        "port": peer_port,
+        "protocol": "http",
+        "announce": false,
+    });
+    sender
+        .send_to(
+            &serde_json::to_vec(&response).unwrap(),
+            (Ipv4Addr::LOCALHOST, discovery_port),
+        )
+        .await
+        .unwrap();
+    let (mut stream, _) = timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .expect("the discovery run should start HTTP confirmation")
+        .unwrap();
+    timeout(Duration::from_secs(1), stream.read_exact(&mut [0; 1]))
+        .await
+        .expect("the HTTP confirmation request should reach the peer")
+        .unwrap();
+
+    discovery.stop();
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    discovery.stop_and_wait().await;
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the stopped discovery callback should close"),
+        None,
+        "an in-flight registration must not publish a peer after shutdown"
+    );
 }
 
 #[tokio::test]
