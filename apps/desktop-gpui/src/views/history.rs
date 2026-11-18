@@ -1,11 +1,11 @@
 //! History: what arrived and what left, newest first, with the failures named.
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::empty::{
     Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
 };
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Sizable as _};
+use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon};
 use gpui_kit::*;
 use std::time::{Duration, SystemTime};
 
@@ -37,11 +37,8 @@ pub fn render(app: &DesktopApp, cx: &mut Context<DesktopApp>) -> AnyElement {
         )
         .child(div().flex_1())
         .child(
-            Button::new("clear-history")
+            crate::views::labelled_icon_button("clear-history", IconName::Delete, "Clear")
                 .ghost()
-                .small()
-                .icon(Icon::new(IconName::Delete).small())
-                .label("Clear")
                 .tooltip("Clear this list (files on disk are untouched)")
                 .disabled(entries.is_empty())
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -222,7 +219,7 @@ fn history_row(
         );
     }
     if let Some(path) = path {
-        summary = summary.child(reveal_button(("history-reveal", index), path));
+        summary = summary.child(reveal_button(("history-reveal", index), path, cx));
     }
 
     div()

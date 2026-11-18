@@ -289,6 +289,94 @@ fn an_offer_shows_and_the_accept_button_asks_the_service(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
+fn arriving_offers_raise_a_notification_and_answering_retracts_it(cx: &mut TestAppContext) {
+    let app = open(cx);
+    app.feed(cx, offer(11));
+
+    // The offer is visible from any pane, not only as a badge in the sidebar.
+    app.frame(cx, |window, _| {
+        assert!(
+            window.try_find(("offer-toast", 11u64)).is_some(),
+            "an arriving offer must post a notification"
+        );
+    });
+
+    // Answering through the ordinary card clears the offer, and the toast goes
+    // with it: a notification for an answered request would be stale.
+    app.click(cx, ("accept", 11u64));
+    app.feed(
+        cx,
+        ServiceEvent::OfferClosed {
+            id: 11,
+            accepted: true,
+        },
+    );
+    // Closing a toast runs its exit animation, so let the clock pass the
+    // animation before asking the tree whether the card is gone.
+    cx.background_executor
+        .advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    app.frame(cx, |window, _| {
+        assert!(
+            window.try_find(("offer-toast", 11u64)).is_none(),
+            "an answered offer must not leave its toast behind"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_offer_toast_answers_the_request_without_switching_panes(cx: &mut TestAppContext) {
+    let app = open(cx);
+    app.feed(cx, offer(13));
+    assert_eq!(app.phase(cx), Phase::Receive);
+
+    // The notification is answerable in place: the person does not have to find
+    // the pane first, which is the whole point of the card.
+    app.click(cx, ("offer-toast-accept", 13u64));
+    assert_eq!(
+        app.take_commands(cx),
+        vec![Command::Accept {
+            id: 13,
+            files: None
+        }]
+    );
+
+    cx.background_executor
+        .advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    app.frame(cx, |window, _| {
+        assert!(
+            window.try_find(("offer-toast", 13u64)).is_none(),
+            "answering the toast dismisses it"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_icon_actions_are_real_buttons_with_a_pointer_sized_target(cx: &mut TestAppContext) {
+    let app = open(cx);
+
+    app.frame(cx, |window, _| {
+        for (id, name) in [
+            ("toggle-sidebar", "sidebar"),
+            ("theme-toggle", "appearance"),
+        ] {
+            let snapshot = window.find(id);
+            assert_eq!(
+                snapshot.role(),
+                Some(gpui_kit::Role::Button),
+                "{name} must be a button, not a bare glyph"
+            );
+            assert!(
+                snapshot.bounds().size.width >= px(24.) && snapshot.bounds().size.height >= px(24.),
+                "{name} is {:#?} — too small to aim at",
+                snapshot.bounds().size
+            );
+        }
+    });
+}
+
+#[gpui_kit::test]
 fn declining_an_offer_sends_decline_and_clears_the_prompt(cx: &mut TestAppContext) {
     let app = open(cx);
     app.feed(cx, offer(9));

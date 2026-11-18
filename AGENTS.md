@@ -119,7 +119,7 @@ the library's CLI.
 cd apps/desktop-gpui
 cargo run --bin localsend-gpui              # the window
 cargo run --bin localsend-gpui -- send …    # the library CLI, same binary (see src/entry.rs)
-cargo test                                  # 96: 72 unit/bin + 7 MCP + 5 real-network + 12 headless window
+cargo test                                  # 173: 128 unit/bin + 7 MCP + 5 real-network + 15 headless window + 18 screenshot/theme/update
 cargo clippy --all-targets -- -D warnings && cargo fmt --check
 python3 assets/test_icon_grid.py
 ```
@@ -145,6 +145,14 @@ Two behaviours worth knowing before touching it:
 - **Window glass is GPUI's native `Blurred` appearance, not a custom AppKit layer.**
   `glass_enabled` toggles it; `surface_opacity` controls alpha on app-owned surfaces.
   GPUI does not expose blur radius, so don't promise or emulate an unsupported control.
+- **An arriving offer is announced, not just counted.** `DesktopApp` watches the store
+  (`cx.observe_in`) and posts one `Notification` per offer id (`in_app_and_system()`,
+  `autohide(false)`, Accept/Decline in the card), retracting it with
+  `remove_notification1` when the offer leaves the session. `announced_offers` is what
+  stops the same toast re-posting on every unrelated store update — don't post from
+  `apply_event` instead, it has no window. Icon-only actions go through
+  `theme::icon_button`, and its size must be `with_size(Size::Size(..))`: plain
+  `.size()` only moves the layout box and leaves the glyph at 12 pt.
 - **Zoom is one global factor, and every length must come from `theme::s()`.** GPUI has no
   UI-scale hook, so `theme::s(v)` (= `px(v * zoom())`) is the only way a size, gap, radius
   or font size enters a pane; gpui-kit's rem-based widgets follow `Theme::font_size`, which

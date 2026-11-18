@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Theme, ThemeMode};
 use gpui_kit::*;
 
@@ -197,26 +197,83 @@ pub fn window_background_appearance(glass_enabled: bool) -> WindowBackgroundAppe
     }
 }
 
+/// WCAG relative luminance of a color, from its sRGB channels.
+///
+/// Not the same as the theme's HSL lightness: amber `#C99401` sits at L 0.40 —
+/// "dark", so HSL would pick white — yet it carries 7.7:1 against black and only
+/// 2.7:1 against white. The weighting is what separates the two.
+fn relative_luminance(color: Hsla) -> f32 {
+    let rgb = color.to_rgb();
+    let linear = |channel: f32| {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b)
+}
+
+/// Ink that reads on a filled surface: near-black on a bright fill, near-white
+/// on a dark one. The theme's `*_foreground` tokens are not a contrast function —
+/// amber in particular ships white text in the light theme, which is what made
+/// the pending-offer badge unreadable.
+///
+/// The threshold is where black and white cross over (equal contrast, 4.6:1);
+/// anything above it is bright enough that dark ink is the readable choice.
+pub fn ink_on(fill: Hsla) -> Hsla {
+    if relative_luminance(fill) > 0.179 {
+        black()
+    } else {
+        white()
+    }
+}
+
+/// A single-glyph action rendered as a real button rather than a bare icon: a
+/// 28 pt square that stays quiet at rest and paints the theme's accent surface
+/// under the pointer. Every icon-only action uses this, so a folder, a star and
+/// a refresh all answer a hover the way a labelled button does.
+///
+/// The button's `Size::Size` makes gpui-component scale the glyph to 75 % of the
+/// square — 21 pt here, against the 12 pt a `small()` button would use. The
+/// square is the pointer target; the glyph inside a Lucide viewbox only inks
+/// ~70 % of it, which is why the old 12 pt icons read as specks.
+pub fn icon_button(id: impl Into<ElementId>, icon: impl Into<Icon>, cx: &App) -> Button {
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .color(cx.theme().transparent)
+                .foreground(cx.theme().muted_foreground)
+                .hover(cx.theme().accent)
+                .active(cx.theme().accent.opacity(0.75)),
+        )
+        // `with_size`, not `size`: `size` is the layout box, `with_size` is the
+        // button's own scale, and only the latter decides the glyph size.
+        .with_size(gpui_kit::component::Size::Size(s(28.)))
+        .icon(icon)
+}
+
 pub fn theme_toggle_button(cx: &App) -> Button {
     let dark = cx.theme().mode.is_dark();
-    Button::new("theme-toggle")
-        .ghost()
-        .small()
-        .accessibility_label("Switch appearance")
-        .tooltip(if dark {
-            "Switch to light appearance"
+    icon_button(
+        "theme-toggle",
+        Icon::new(if dark { IconName::Sun } else { IconName::Moon }),
+        cx,
+    )
+    .accessibility_label("Switch appearance")
+    .tooltip(if dark {
+        "Switch to light appearance"
+    } else {
+        "Switch to dark appearance"
+    })
+    .on_click(|_, _, cx| {
+        let mode = if cx.theme().mode.is_dark() {
+            ThemeMode::Light
         } else {
-            "Switch to dark appearance"
-        })
-        .icon(Icon::new(if dark { IconName::Sun } else { IconName::Moon }).small())
-        .on_click(|_, _, cx| {
-            let mode = if cx.theme().mode.is_dark() {
-                ThemeMode::Light
-            } else {
-                ThemeMode::Dark
-            };
-            apply_macos_theme(mode, cx);
-        })
+            ThemeMode::Dark
+        };
+        apply_macos_theme(mode, cx);
+    })
 }
 
 #[cfg(test)]
@@ -300,6 +357,31 @@ mod tests {
         assert_eq!(
             window_background_appearance(false),
             WindowBackgroundAppearance::Opaque
+        );
+    }
+
+    /// The badge is the one place the app paints text on a saturated fill, so
+    /// the ink has to be measured rather than inherited from the theme.
+    #[::core::prelude::v1::test]
+    fn badge_ink_is_readable_on_every_badge_fill() {
+        fn contrast(a: Hsla, b: Hsla) -> f32 {
+            let (a, b) = (relative_luminance(a), relative_luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
+
+        // Amber as the light theme ships it, near-black for a dark fill.
+        for fill in [Hsla::from(rgb(0xC99401)), Hsla::from(rgb(0x18181b))] {
+            let ink = ink_on(fill);
+            let ratio = contrast(ink, fill);
+            assert!(
+                ratio >= 4.5,
+                "ink {ink:?} on {fill:?} reaches only {ratio:.2}:1"
+            );
+        }
+        assert_eq!(
+            ink_on(Hsla::from(rgb(0xC99401))),
+            black(),
+            "amber needs dark ink"
         );
     }
 }

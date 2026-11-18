@@ -114,7 +114,10 @@ pub fn render(app: &DesktopApp, cx: &mut Context<DesktopApp>) -> AnyElement {
                                             .child(format!("{peer} · {size} · {when}")),
                                     ),
                             )
-                            .children(path.clone().map(|path| reveal_button(("reveal", id), path))),
+                            .children(
+                                path.clone()
+                                    .map(|path| reveal_button(("reveal", id), path, cx)),
+                            ),
                     ),
             );
         }
@@ -292,31 +295,34 @@ fn status_card(status: &ServerStatus, cx: &mut Context<DesktopApp>) -> impl Into
                         .gap(s(6.))
                         .child(chip("ONLINE", cx.theme().success))
                         .child(
-                            Button::new("open-save-folder")
-                                .ghost()
-                                .small()
-                                .icon(Icon::new(IconName::FolderOpen).size(s(13.)))
-                                .tooltip("Show the folder received files go to")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let ServerStatus::Listening { save_dir, .. } =
-                                        &this.store.read(cx).session().status
-                                    {
-                                        crate::views::reveal_in_file_manager(save_dir);
-                                    }
-                                })),
+                            crate::theme::icon_button(
+                                "open-save-folder",
+                                Icon::new(IconName::FolderOpen),
+                                cx,
+                            )
+                            .accessibility_label("Show the received-files folder")
+                            .tooltip("Show the folder received files go to")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let ServerStatus::Listening { save_dir, .. } =
+                                    &this.store.read(cx).session().status
+                                {
+                                    crate::views::reveal_in_file_manager(save_dir);
+                                }
+                            })),
                         )
                 })),
         );
 
     if matches!(status, ServerStatus::Failed { .. } | ServerStatus::Stopped) {
         card = card.child(
-            Button::new("status-open-settings")
-                .small()
-                .icon(Icon::new(IconName::Settings).small())
-                .label("Open Settings")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.select_phase(crate::app_state::Phase::Settings, cx)
-                })),
+            crate::views::labelled_icon_button(
+                "status-open-settings",
+                IconName::Settings,
+                "Open Settings",
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.select_phase(crate::app_state::Phase::Settings, cx)
+            })),
         );
     }
     card
@@ -419,11 +425,8 @@ fn offer_card(offer: &Offer, cx: &mut Context<DesktopApp>) -> impl IntoElement {
                         })),
                 )
                 .child(
-                    Button::new(("accept", id))
+                    crate::views::labelled_icon_button(("accept", id), IconName::Check, "Accept")
                         .primary()
-                        .small()
-                        .icon(Icon::new(IconName::Check).small())
-                        .label("Accept")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.store.read(cx).accept(id);
                             cx.notify();

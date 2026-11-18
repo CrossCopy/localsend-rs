@@ -42,6 +42,17 @@ to remember which of two binaries is which.
   cards that list each file with a kind tile and a total, live transfers with
   percentage/bytes/rate/ETA, and a "Recently received" list where each row leads
   with the file's kind icon and reveals in Finder.
+- **Arrivals** — a sender's request is not just a badge: it posts a notification
+  card at the top right (and a Notification Center banner when the window is in the
+  background, on macOS, for a bundled `.app`) naming the sender and the first file,
+  with **Accept**/**Decline** in the card. Answering anywhere retracts it; so does
+  the offer expiring. Clicking the card body brings the Receive pane forward.
+  The sidebar badge counts pending offers and paints dark ink on its amber fill —
+  the theme's own `warning.foreground` is white, which is unreadable on amber.
+- **Icon actions** — a folder, a star, a refresh, the trash and the appearance
+  toggle are real buttons from one helper (`theme::icon_button`: a 28 pt square,
+  quiet at rest, accent surface under the pointer), not bare glyphs. `s()` scales
+  the square, and `with_size` — not `size` — is what makes the glyph grow with it.
 - **Send** — nearby devices (UDP multicast announce, answered by `/register`; we
   re-announce), each with a device tile and a **star**. Picking one opens a stage
   panel: a kind tile per staged file, an optional PIN, Send, progress, cancel.
@@ -137,24 +148,26 @@ service to accept id 7" without a socket.
 ## Tests
 
 ```bash
-  cargo test            # 96 tests: 72 unit/bin + 7 MCP + 5 real-network + 12 window
+  cargo test            # 173 tests: 128 unit/bin + 45 integration (window, network, screenshot)
   cargo clippy --all-targets -- -D warnings
   cargo fmt --check
   python3 assets/test_icon_grid.py
 ```
 
-- `src/**` unit/bin tests (72) — the session state machine, formatting, settings
+- `src/**` unit/bin tests (128) — the session state machine, formatting, settings
   (including favorites round-trip, normalization and glass defaults), argv classification, the
   install/uninstall link logic, the bundle layout and its plist, the icon assets,
   and the zoom arithmetic (scaling, clamping, reset).
-- `tests/ui.rs` (12) — headless window tests: the sidebar switches panes, a
+- `tests/ui.rs` (15) — headless window tests: the sidebar switches panes, a
   listening status names its port/fingerprint/folder, an offer renders and
   Accept/Decline produce the right command, progress becomes history, staging a
   real temp file and pressing Send produces `Command::Send`, auto-accept flips
   live, Apply refuses a blank name, notices dismiss, stale peers are pruned, and
-  **starring a peer emits `SetFavorites` and flips the button** both ways, and
+  **starring a peer emits `SetFavorites` and flips the button** both ways,
   **`Cmd +` really scales the layout** (the status card grows, `Cmd 0` restores it
-  to the pixel).
+  to the pixel), **an arriving offer posts a notification that disappears when the
+  offer closes**, **the toast answers the request without leaving the pane**, and
+  **the icon actions are buttons of at least a pointer-sized target**.
 - `tests/service_e2e.rs` (5) — real-network tests over localhost: a
   `LocalSendClient` offers a file to our receiver (accept → bytes on disk, peer
   registered, an identity with no `ip` still works), our controller sends to a

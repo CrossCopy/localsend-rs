@@ -225,12 +225,16 @@ pub fn render(app: &DesktopApp, cx: &mut Context<DesktopApp>) -> AnyElement {
                                 .child(Input::new(&save_dir).aria_label("Receiving folder")),
                         )
                         .child(
-                            Button::new("choose-save-dir")
-                                .ghost()
-                                .small()
-                                .icon(Icon::new(IconName::FolderOpen).small())
-                                .tooltip("Choose a folder")
-                                .on_click(cx.listener(|this, _, window, cx| this.pick_save_dir(window, cx))),
+                            crate::theme::icon_button(
+                                "choose-save-dir",
+                                Icon::new(IconName::FolderOpen),
+                                cx,
+                            )
+                            .accessibility_label("Choose a folder")
+                            .tooltip("Choose a folder")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.pick_save_dir(window, cx)),
+                            ),
                         ),
                     cx,
                 ))

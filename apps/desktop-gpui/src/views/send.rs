@@ -206,18 +206,26 @@ fn peer_panel(
                                 ),
                         )
                         .child(
-                            Button::new(format!("favorite-{}", peer.node_id))
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::new(IconName::Star).size(s(13.)).text_color(starred))
-                                .tooltip(if favorite {
-                                    "Remove from favorites"
-                                } else {
-                                    "Add to favorites (quick save can accept from it)"
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            crate::theme::icon_button(
+                                format!("favorite-{}", peer.node_id),
+                                Icon::new(IconName::Star).text_color(starred),
+                                cx,
+                            )
+                            .accessibility_label(if favorite {
+                                "Remove from favorites"
+                            } else {
+                                "Add to favorites"
+                            })
+                            .tooltip(if favorite {
+                                "Remove from favorites"
+                            } else {
+                                "Add to favorites (quick save can accept from it)"
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     this.toggle_favorite(&fingerprint, cx);
-                                })),
+                                },
+                            )),
                         ),
                 ),
         );
@@ -238,10 +246,8 @@ fn peer_panel(
                 .child(chip(peers.len().to_string(), cx.theme().muted_foreground))
                 .child(div().flex_1())
                 .child(
-                    Button::new("refresh-peers")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::RefreshCw).size(s(12.)))
+                    crate::theme::icon_button("refresh-peers", Icon::new(IconName::RefreshCw), cx)
+                        .accessibility_label("Refresh nearby devices")
                         .tooltip("Choose how to refresh nearby devices")
                         .dropdown_menu({
                             let menu_view = view.clone();
@@ -428,14 +434,18 @@ fn detail_panel(app: &DesktopApp, peer: Option<&Peer>, cx: &mut Context<DesktopA
                                 ),
                         )
                         .child(
-                            Button::new(("unstage", index))
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::new(IconName::X).size(s(11.)))
-                                .tooltip(path.display().to_string())
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            crate::theme::icon_button(
+                                ("unstage", index),
+                                Icon::new(IconName::X),
+                                cx,
+                            )
+                            .accessibility_label("Remove from the send")
+                            .tooltip(path.display().to_string())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     this.unstage(index, cx);
-                                })),
+                                },
+                            )),
                         ),
                 ),
         );
@@ -504,12 +514,9 @@ fn detail_panel(app: &DesktopApp, peer: Option<&Peer>, cx: &mut Context<DesktopA
         )
         .child(files)
         .child(
-            Button::new("add-files")
+            crate::views::labelled_icon_button("add-files", IconName::Plus, "Add files…")
                 .ghost()
-                .small()
                 .w_full()
-                .icon(Icon::new(IconName::Plus).small())
-                .label("Add files…")
                 .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx))),
         )
         .child(div().flex_1())
@@ -535,19 +542,20 @@ fn detail_panel(app: &DesktopApp, peer: Option<&Peer>, cx: &mut Context<DesktopA
                 ),
         )
         .child(
-            Button::new("send-files")
-                .primary()
-                .small()
-                .w_full()
-                .h(s(32.))
-                .icon(Icon::new(IconName::Send).small())
-                .label(if can_send {
+            crate::views::labelled_icon_button(
+                "send-files",
+                IconName::Send,
+                if can_send {
                     format!("Send {} to {}", format::files(app.staged.len()), peer.alias)
                 } else {
                     "Send".to_string()
-                })
-                .disabled(!can_send)
-                .on_click(cx.listener(|this, _, _, cx| this.start_send(cx))),
+                },
+            )
+            .primary()
+            .w_full()
+            .h(s(32.))
+            .disabled(!can_send)
+            .on_click(cx.listener(|this, _, _, cx| this.start_send(cx))),
         )
         .into_any_element()
 }

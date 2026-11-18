@@ -13,7 +13,7 @@ pub mod settings;
 use std::time::SystemTime;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::empty::{
     Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
 };
@@ -61,7 +61,7 @@ pub fn file_icon(name: &str) -> IconName {
 /// with, so a list of names scans as kinds rather than as text.
 pub fn file_tile(name: &str, cx: &App) -> Div {
     h_flex()
-        .size(s(28.))
+        .size(s(30.))
         .flex_shrink_0()
         .items_center()
         .justify_center()
@@ -69,7 +69,7 @@ pub fn file_tile(name: &str, cx: &App) -> Div {
         .bg(cx.theme().muted)
         .child(
             Icon::new(file_icon(name))
-                .size(s(14.))
+                .size(s(18.))
                 .text_color(cx.theme().muted_foreground),
         )
 }
@@ -215,13 +215,31 @@ pub fn card(cx: &App) -> Div {
         .p(s(14.))
 }
 
-/// The reveal-in-Finder icon, shared by receive and history.
-pub fn reveal_button(id: impl Into<ElementId>, path: std::path::PathBuf) -> Button {
+/// A labelled button whose glyph is sized to the text rather than to the
+/// button's built-in icon slot (which is 12 pt even at `small()`). Written as a
+/// child row so the icon follows the app zoom and stays legible next to the
+/// label; the explicit accessibility label replaces the one `.label` would set.
+pub fn labelled_icon_button(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    label: impl Into<SharedString>,
+) -> Button {
+    let label = label.into();
     Button::new(id)
-        .ghost()
-        .xsmall()
-        .icon(Icon::new(IconName::FolderOpen).size(s(12.)))
-        .tooltip(path.display().to_string())
+        .small()
+        .accessibility_label(label.clone())
+        .child(
+            h_flex()
+                .gap(s(6.))
+                .child(Icon::new(icon).size(s(17.)))
+                .child(div().child(label)),
+        )
+}
+
+/// The reveal-in-Finder icon, shared by receive and history.
+pub fn reveal_button(id: impl Into<ElementId>, path: std::path::PathBuf, cx: &App) -> Button {
+    crate::theme::icon_button(id, Icon::new(IconName::FolderOpen), cx)
+        .tooltip(format!("Show in Finder — {}", path.display()))
         .on_click(move |_, _, _| reveal_in_file_manager(&path))
 }
 

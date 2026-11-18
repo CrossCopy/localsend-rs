@@ -5,6 +5,7 @@
 //! transfer state machine. The store owns the facts the service reports; this owns
 //! the choices the person makes.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::future::Future;
@@ -13,16 +14,19 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenu, SidebarMenuItem,
 };
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _, TitleBar};
+use gpui_kit::component::{
+    h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _, TitleBar, WindowExt as _,
+};
 use gpui_kit::*;
 
 use crate::branding;
 use crate::bridge::HostRuntime;
 use crate::service::{
-    NoticeLevel, ServerStatus, ServiceEvent, ServiceHandle, Settings, MAX_SURFACE_OPACITY,
+    NoticeLevel, Offer, ServerStatus, ServiceEvent, ServiceHandle, Settings, MAX_SURFACE_OPACITY,
 };
 use crate::store::TransferStore;
 use crate::theme;
@@ -560,6 +564,22 @@ impl Phase {
     }
 }
 
+/// One line naming what is on offer: the first file, how many others there are,
+/// and the total. A notification with only a count cannot be told apart from
+/// every other arriving transfer.
+fn offer_summary(offer: &Offer) -> String {
+    let total = crate::service::format::bytes(offer.total_bytes);
+    match offer.files.as_slice() {
+        [] => total,
+        [file] => format!("{} · {total}", file.name),
+        [first, ..] => format!(
+            "{} and {} more · {total}",
+            first.name,
+            offer.files.len().saturating_sub(1)
+        ),
+    }
+}
+
 pub struct DesktopApp {
     pub(crate) phase: Phase,
     pub(crate) store: Entity<TransferStore>,
@@ -575,8 +595,16 @@ pub struct DesktopApp {
     install_controls: Option<smol::channel::Sender<InstallControl>>,
     pub(crate) pin_input: Entity<gpui_kit::component::input::InputState>,
     sidebar_visible: bool,
+    /// Offers that already raised a notification, so the observer does not post
+    /// the same toast again on every unrelated store update.
+    announced_offers: HashSet<u64>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// The notification kind for a pending offer. Naming the type is what lets the
+/// observer retract a toast with `remove_notification1` once its offer is gone,
+/// whichever way it was answered.
+struct OfferNotification;
 
 impl DesktopApp {
     /// The real app: load settings, start the tokio service, wire the store to it.
@@ -641,7 +669,10 @@ impl DesktopApp {
         let pin_input =
             cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx).placeholder("PIN"));
         let subscriptions = vec![
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe_in(&store, window, |this, _, window, cx| {
+                this.sync_offer_notifications(window, cx);
+                cx.notify();
+            }),
             cx.observe(&settings_form, |_, _, cx| cx.notify()),
         ];
         Self {
@@ -657,6 +688,7 @@ impl DesktopApp {
             install_controls: None,
             pin_input,
             sidebar_visible: true,
+            announced_offers: HashSet::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -1067,6 +1099,103 @@ impl DesktopApp {
         cx.notify();
     }
 
+    /// Post a toast and an OS notification for every offer that has not been
+    /// announced yet, and retract the toast of any offer that is gone.
+    ///
+    /// The sidebar badge alone was not enough notice: it is a 10 pt number in
+    /// the corner of a window the person is not looking at. A new request now
+    /// arrives as a top-right card with Accept/Decline in the window and as a
+    /// notification in Notification Center when the app is in the background.
+    fn sync_offer_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let offers: Vec<Offer> = self.store.read(cx).session().offers.clone();
+        let live: HashSet<u64> = offers.iter().map(|offer| offer.id).collect();
+        for stale in self
+            .announced_offers
+            .difference(&live)
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            window.remove_notification1::<OfferNotification>(stale, cx);
+        }
+        self.announced_offers.retain(|id| live.contains(id));
+        for offer in offers {
+            if self.announced_offers.insert(offer.id) {
+                self.push_offer_notification(&offer, window, cx);
+            }
+        }
+    }
+
+    fn push_offer_notification(&self, offer: &Offer, window: &mut Window, cx: &mut Context<Self>) {
+        let id = offer.id;
+        let sender = offer.from.alias.clone();
+        let title = format!(
+            "{sender} wants to send you {}",
+            crate::service::format::files(offer.file_count())
+        );
+        let message = offer_summary(offer);
+        let app = cx.entity();
+        let accept_store = self.store.clone();
+        let decline_store = self.store.clone();
+
+        let notification = Notification::new()
+            .id1::<OfferNotification>(id)
+            .title(title)
+            .message(message)
+            .icon(Icon::new(IconName::ArrowDownToLine).text_color(cx.theme().primary))
+            .placement(Anchor::TopRight)
+            .in_app_and_system()
+            .autohide(false)
+            .on_click(move |_, _, cx| {
+                app.update(cx, |app, cx| {
+                    app.phase = Phase::Receive;
+                    cx.notify();
+                });
+            })
+            .content(move |_, _window, cx| {
+                let note = cx.entity();
+                let accept_note = note.clone();
+                let accept_store = accept_store.clone();
+                let decline_note = note.clone();
+                let decline_store = decline_store.clone();
+                h_flex()
+                    .id(("offer-toast", id))
+                    .test_support()
+                    .mt(s(10.))
+                    .gap(s(8.))
+                    .child(
+                        crate::views::labelled_icon_button(
+                            ("offer-toast-accept", id),
+                            IconName::Check,
+                            "Accept",
+                        )
+                        .primary()
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            accept_store.read(cx).accept(id);
+                            accept_note.update(cx, |note, cx| {
+                                note.dismiss(window, cx);
+                            });
+                        }),
+                    )
+                    .child(
+                        Button::new(("offer-toast-decline", id))
+                            .ghost()
+                            .small()
+                            .label("Decline")
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                decline_store.read(cx).decline(id);
+                                decline_note.update(cx, |note, cx| {
+                                    note.dismiss(window, cx);
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            });
+
+        window.push_notification(notification, cx);
+    }
+
     pub fn select_peer(&mut self, node_id: String, cx: &mut Context<Self>) {
         self.selected_peer = Some(node_id);
         cx.notify();
@@ -1304,11 +1433,8 @@ impl DesktopApp {
                     .flex_shrink_0()
                     .pl(s(18.))
                     .child(
-                        Button::new("toggle-sidebar")
-                            .ghost()
-                            .small()
+                        theme::icon_button("toggle-sidebar", IconName::PanelLeft, cx)
                             .accessibility_label("Toggle sidebar")
-                            .icon(IconName::PanelLeft)
                             .tooltip("Toggle sidebar")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.sidebar_visible = !this.sidebar_visible;
@@ -1410,21 +1536,34 @@ impl DesktopApp {
         .map(|(phase, count)| {
             let active = self.phase == phase;
             let mut item = SidebarMenuItem::new(phase.title())
-                .icon(Icon::new(phase.icon()))
+                .icon(Icon::new(phase.icon()).size(s(16.)))
                 .active(active)
                 .accessibility_label(phase.title())
                 .on_click(cx.listener(move |this, _, _, cx| this.select_phase(phase, cx)));
             if let Some(count) = count.filter(|count| *count > 0) {
                 item = item.suffix(move |_, cx| {
+                    let pending = phase == Phase::Receive;
+                    let background = if pending {
+                        cx.theme().warning
+                    } else {
+                        cx.theme().border
+                    };
                     div()
-                        .px(s(6.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(s(16.))
+                        .min_w(s(18.))
+                        .px(s(5.))
                         .rounded_full()
-                        .bg(if phase == Phase::Receive {
-                            cx.theme().warning
+                        .bg(background)
+                        .text_size(s(10.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if pending {
+                            crate::theme::ink_on(background)
                         } else {
-                            cx.theme().border
+                            cx.theme().muted_foreground
                         })
-                        .text_size(s(10.))
                         .child(count.to_string())
                 });
             }
@@ -1540,10 +1679,8 @@ impl DesktopApp {
                         .child(notice.message.clone()),
                 )
                 .child(
-                    Button::new("dismiss-notice")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::X).size(s(11.)))
+                    theme::icon_button("dismiss-notice", IconName::X, cx)
+                        .accessibility_label("Dismiss")
                         .tooltip("Dismiss")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.store.update(cx, |store, cx| {
